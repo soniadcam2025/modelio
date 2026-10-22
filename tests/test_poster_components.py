@@ -75,8 +75,8 @@ def test_parse_asset_handles_malformed_and_context():
     assert parse_asset({"resource_type": "image"}) is None
     assert parse_asset(raw("a", resource_type="audio")) is None
     assert parse_asset(raw("a", bytes="lots")) is None
-    parsed = parse_asset(raw("a", context={"custom": {"caption": "Hi"}}, tags=["x", 3]))
-    assert parsed.caption == "Hi" and parsed.tags == ("x",)
+    parsed = parse_asset(raw("a", context={"custom": {"caption": "Hi"}}, tags=["x", 3], width=800, height=600))
+    assert parsed.caption == "Hi" and parsed.tags == ("x",) and (parsed.width, parsed.height) == (800, 600)
 
 
 def no_sleep(_):
@@ -170,6 +170,11 @@ def test_classify_photo_video_and_skips():
     assert media.classify(asset("m", resource_type="video", fmt="mov"), cfg)[0] is None
     assert media.classify(asset("big", size=10 * 1024 * 1024 + 1), cfg)[0] is None
     assert media.classify(asset("bigv", resource_type="video", fmt="mp4", size=50 * 1024 * 1024 + 1), cfg)[0] is None
+    from dataclasses import replace as _replace
+
+    assert media.classify(_replace(asset("w"), width=9000, height=1500), cfg)[0] is None  # sides > 10000
+    assert media.classify(_replace(asset("n"), width=4200, height=200), cfg)[0] is None  # ratio > 20
+    assert media.classify(_replace(asset("ok"), width=4000, height=3000), cfg)[0] == "photo"
     private = asset("p")
     from dataclasses import replace
 
@@ -228,9 +233,13 @@ def test_rate_limit_is_retried():
 
 def test_bad_request_is_a_definite_failure():
     pub, requests = telegram(lambda r, n: httpx.Response(400, json={"ok": False, "description": "Bad Request: x"}))
-    with pytest.raises(PublishFailed):
+    with pytest.raises(PublishFailed) as err:
         pub.send_media("@chan", "photo", "a.jpg", b"img", "")
-    assert len(requests) == 1
+    assert len(requests) == 1 and err.value.rejected_request is True
+    pub, _ = telegram(lambda r, n: httpx.Response(403, json={"ok": False, "description": "Forbidden"}))
+    with pytest.raises(PublishFailed) as err:
+        pub.send_media("@chan", "photo", "a.jpg", b"img", "")
+    assert err.value.rejected_request is False
 
 
 def test_server_error_or_lost_response_is_uncertain_and_not_retried():

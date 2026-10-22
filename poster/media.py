@@ -10,6 +10,9 @@ from .config import PosterConfig
 PHOTO_FORMATS = {"jpg", "jpeg", "png", "webp"}
 ANIMATION_FORMATS = {"gif"}
 VIDEO_FORMATS = {"mp4"}  # Telegram plays MPEG-4 inline; other formats would arrive as plain files
+# Telegram sendPhoto: width + height at most 10000, and width/height ratio at most 20.
+MAX_PHOTO_SIDES = 10000
+MAX_PHOTO_RATIO = 20
 
 
 class DownloadError(RuntimeError):
@@ -35,6 +38,11 @@ def classify(asset: Asset, cfg: PosterConfig) -> tuple[str | None, str]:
         return None, "unknown file size"
     if asset.bytes > limit:
         return None, f"{asset.bytes} bytes is over the {limit}-byte limit for a {kind}"
+    if kind == "photo" and asset.width and asset.height:
+        if asset.width + asset.height > MAX_PHOTO_SIDES:
+            return None, f"{asset.width}x{asset.height} is too large for a Telegram photo"
+        if max(asset.width, asset.height) / min(asset.width, asset.height) > MAX_PHOTO_RATIO:
+            return None, f"{asset.width}x{asset.height} is too narrow for a Telegram photo"
     return kind, "ok"
 
 

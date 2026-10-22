@@ -110,6 +110,7 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**. 
 | `tgbot_run_<number>` | The GitHub run that posted it. If a run is re-run, it sees this tag and doesn't post again. |
 | `tgbot_claim_<time>_<id>` | A temporary lock while a run is posting. Other runs skip the asset. It expires after 30 minutes if a run crashes. |
 | `tgbot_uncertain` | The upload may have reached Telegram, but no confirmation came back. Skipped so it's never double-posted. Check the channel, then either add `tgbot_posted` or remove `tgbot_uncertain` so it's posted again. |
+| `tgbot_rejected` | Telegram refused the file (for example, unsupported dimensions). Skipped so it doesn't block every later run. Remove the tag after fixing or replacing the file. |
 
 - An asset is marked posted **only after Telegram confirms**. A failed upload leaves no `tgbot_posted` tag, so the asset is tried again next time.
 - Only these `tgbot_` tags are ever added or removed. **Your own tags are never touched.**
@@ -120,7 +121,7 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**. 
 
 ### What gets posted, and the limits
 
-- **Photos** (jpg, png, webp) up to **10 MB** are sent as photos.
+- **Photos** (jpg, png, webp) up to **10 MB** are sent as photos. Telegram also requires width + height of at most 10,000 pixels, and the long side at most 20 times the short side. Photos outside that are skipped.
 - **MP4 videos** up to **50 MB** are sent as playable videos.
 - **GIFs** up to **50 MB** are sent as animations.
 - Anything else is skipped with a reason in the log: other formats (`.mov`, `.pdf`…), larger files, and private/authenticated assets.
@@ -154,12 +155,22 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**. 
 
 ## Part 2: Subscription bot (@ShakhiraVIPBot)
 
-| Plan | Price | How it works |
+> **This is not the bot that is running today.** The `@ShakhiraVIPBot` currently live in Telegram runs code that is not in this repository. The code here (`shakhira_bot/`) is a separate implementation, built from an earlier starter ZIP plus the plans and commands you described. It has **not been deployed**, and **never tested against real Telegram or real payments**. Its wording and menu are my reconstruction and may not match the live bot word for word.
+
+| Plan | Price | How it works in this code |
 |---|---|---|
 | 💎 VIP Monthly | 499 ⭐ / 30 days | Telegram's own channel subscription link. Telegram charges, renews every 30 days, and removes people who cancel or stop paying. |
-| ⏳ 3-day trial | 49 ⭐ once | Stars invoice. After the payment is verified, the bot sends a single-use invite link and removes the member when 3 days are up. It never removes admins or paying monthly subscribers. One trial per account. |
+| ⏳ 3-day trial | 49 ⭐ once | Stars invoice. After the payment is verified, the bot sends a single-use invite link and removes the member when 3 days are up. It never removes admins or paying monthly subscribers. |
 
-**Commands:** `/start`, `/subscribe`, `/status`, `/rules`, `/paysupport`.
+**Commands:** `/start`, `/subscribe`, `/status`, `/rules`, plus `/paysupport` (see below).
+
+**Waiting for your approval.** These are in the code but aren't part of the terms you described. Neither affects prices or durations.
+
+| Item | What the code does now | How to change it |
+|---|---|---|
+| One trial per account | On by default. A second trial purchase is refused before payment, and `/rules` shows "One trial per account." | Set `TRIAL_ONCE_PER_USER=false` in `.env`. Repeat trials then extend the current trial, and the `/rules` line disappears. |
+| `/paysupport` command | Added. It replies with the support contact. `/rules` and two error messages point to it. | Ask me to remove it. Telegram's payment rules appear to expect a way for buyers to reach payment support; I couldn't confirm the exact rule from this environment. |
+| Free channel / Support buttons in `/start` | Added under the two plan buttons | Ask me to remove them |
 
 **What the bot checks and protects against:**
 - **Payments:** checked before and after checkout (currency `XTR`, amount, invoice payload, buyer). Duplicate payment updates are ignored.
@@ -228,5 +239,6 @@ The tests use fake Telegram and Cloudinary services. They never charge Stars, po
 | Poster code, workflow, tests | Done. Tested with fakes only. |
 | Poster against the real Cloudinary account and channel | **Not verified yet.** Run Step 3. |
 | Bot admin rights in @yourshakhira | **Not verified.** The `check` mode verifies it. |
-| Subscription bot code and tests | Done. Tested with fakes only. |
-| Subscription bot live on a server | **Not deployed.** Needs an always-on host. |
+| Subscription bot code and tests (this repo) | Done. Tested with fakes only. **Not the code of the bot that is live today.** |
+| Subscription bot from this repo deployed | **No.** Needs an always-on host and your go-ahead. Your current live bot keeps running unchanged. |
+| One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (see Part 2). |

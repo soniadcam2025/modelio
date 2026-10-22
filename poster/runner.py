@@ -3,6 +3,7 @@
 Posting history lives in Cloudinary tags on each asset, so it survives between GitHub Actions runs:
   tgbot_posted              Telegram confirmed the post
   tgbot_uncertain           the upload may have gone through; skipped until you check and remove the tag
+  tgbot_rejected            Telegram refused the file; skipped until you remove the tag
   tgbot_run_<run id>        which GitHub Actions run posted it (stops a re-run from posting again)
   tgbot_claim_<time>_<id>   short-lived lock while a run is posting the asset
 Only these tags are added or removed; your own tags are never touched.
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 POSTED_TAG = "tgbot_posted"
 UNCERTAIN_TAG = "tgbot_uncertain"
+REJECTED_TAG = "tgbot_rejected"
 CLAIM_PREFIX = "tgbot_claim_"
 RUN_PREFIX = "tgbot_run_"
 MAX_CANDIDATES = 5
@@ -123,7 +125,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
 
     def eligible_list():
         return [(a, k) for a, k in supported
-                if POSTED_TAG not in a.tags and UNCERTAIN_TAG not in a.tags and not fresh_claims(a.tags, now, ttl)]
+                if not {POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(a.tags) and not fresh_claims(a.tags, now, ttl)]
 
     eligible = eligible_list()
     if not eligible:
@@ -161,7 +163,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             return Result("failed", asset=asset.name, detail=str(exc))
 
         others = [t for t in fresh_claims(current, clock(), ttl) if t != claim]
-        if POSTED_TAG in current or UNCERTAIN_TAG in current or others:
+        if {POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(current) or others:
             logger.info("%s is already posted or claimed by another run; trying the next asset", asset.name)
             _release(source, claim, asset)
             continue
@@ -178,6 +180,13 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             message_id = publisher.send_media(target, kind, media.filename(asset), content, caption_for(asset, cfg))
         except PublishFailed as exc:
             logger.error("Telegram did not publish %s: %s", asset.name, exc)
+            if exc.rejected_request and record_history:
+                # Without this the same file would be picked, and refused, on every run.
+                try:
+                    source.add_tag(REJECTED_TAG, [asset])
+                    logger.error("Tagged %s as %r; it will be skipped until you remove the tag", asset.name, REJECTED_TAG)
+                except SourceError:
+                    logger.error("Could not tag %s as rejected", asset.name)
             _release(source, claim, asset)
             return Result("failed", asset=asset.name, detail=str(exc))
         except PublishUncertain as exc:

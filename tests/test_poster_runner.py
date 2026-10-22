@@ -99,6 +99,14 @@ def test_failed_upload_is_not_marked_posted():
     assert go(source).status == "posted"  # still eligible next time
 
 
+def test_file_refused_by_telegram_is_quarantined_so_queue_moves_on():
+    source = FakeSource([asset("tgpub/bad", created="1"), asset("tgpub/good", created="2")])
+    result = go(source, FakePublisher(outcome="rejected"))
+    assert result.status == "failed"
+    assert source.tags_of("tgpub/bad") == [runner.REJECTED_TAG]  # not marked posted
+    assert go(source).asset == "image:tgpub/good"
+
+
 def test_uncertain_upload_is_quarantined_not_marked_posted():
     source = FakeSource([asset("tgpub/a"), asset("tgpub/b", created="9")])
     result = go(source, FakePublisher(outcome="uncertain"))

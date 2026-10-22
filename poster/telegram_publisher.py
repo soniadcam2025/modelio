@@ -16,6 +16,11 @@ MAX_RETRY_AFTER = 60
 class PublishFailed(RuntimeError):
     """Telegram definitely did not publish the post."""
 
+    def __init__(self, message: str, rejected_request: bool = False):
+        super().__init__(message)
+        # True for 400/413: Telegram refused this request (usually the file); retrying the same file will not help.
+        self.rejected_request = rejected_request
+
 
 class PublishUncertain(RuntimeError):
     """The request may have reached Telegram; the post may or may not exist."""
@@ -70,7 +75,7 @@ class TelegramPublisher:
                     self._sleep(2 * attempts)
                     continue
                 raise PublishUncertain(f"{method}: Telegram server error {response.status_code}: {description}")
-            raise PublishFailed(f"{method}: {description}")
+            raise PublishFailed(f"{method}: {description}", rejected_request=response.status_code in (400, 413))
 
     def check_channel(self, channel: str) -> list[str]:
         """Return problems that would stop the bot posting to `channel` (empty list = OK)."""

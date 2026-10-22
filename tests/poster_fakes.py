@@ -70,7 +70,7 @@ class FakeSource:
 class FakePublisher:
     def __init__(self, problems=None, outcome="ok"):
         self.problems = problems or []
-        self.outcome = outcome  # ok, failed, uncertain
+        self.outcome = outcome  # ok, failed, rejected, uncertain
         self.sent: list[dict] = []
 
     def check_channel(self, channel):
@@ -79,7 +79,9 @@ class FakePublisher:
     def send_media(self, channel, kind, name, content, caption):
         self.sent.append(dict(channel=channel, kind=kind, name=name, size=len(content), caption=caption))
         if self.outcome == "failed":
-            raise PublishFailed("sendPhoto: Bad Request")
+            raise PublishFailed("sendPhoto: Forbidden: bot was kicked from the channel chat")
+        if self.outcome == "rejected":
+            raise PublishFailed("sendPhoto: Bad Request: PHOTO_INVALID_DIMENSIONS", rejected_request=True)
         if self.outcome == "uncertain":
             raise PublishUncertain("sendPhoto: connection problem after sending")
         return 100 + len(self.sent)

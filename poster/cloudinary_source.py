@@ -31,6 +31,8 @@ class Asset:
     created_at: str
     tags: tuple[str, ...] = field(default_factory=tuple)
     caption: str = ""
+    width: int = 0
+    height: int = 0
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -72,6 +74,8 @@ def parse_asset(raw: dict) -> Asset | None:
             created_at=str(raw.get("created_at") or ""),
             tags=tuple(t for t in tags if isinstance(t, str)),
             caption=caption if isinstance(caption, str) else "",
+            width=int(raw.get("width") or 0),
+            height=int(raw.get("height") or 0),
         )
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
