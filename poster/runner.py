@@ -157,6 +157,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         try:
             source.add_tag(claim, [asset])
             current = source.get_tags(asset)
+            logger.info("Added claim tag %s to %s", claim, asset.name)
         except SourceError as exc:
             logger.error("Could not claim %s: %s", asset.name, exc)
             _release(source, claim, asset)
@@ -209,6 +210,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             source.add_tag(POSTED_TAG, [asset])
             if cfg.run_id:
                 source.add_tag(run_tag(cfg.run_id), [asset])
+            logger.info("Recorded %s as posted (tag %r)", asset.name, POSTED_TAG)
         except SourceError as exc:
             logger.error("POSTED %s but could not record it in Cloudinary: %s. Add the tag %r to it by hand.",
                          asset.name, exc, POSTED_TAG)
@@ -227,5 +229,6 @@ def _without_tag(asset: Asset, tag: str) -> Asset:
 def _release(source: CloudinarySource, claim: str, asset: Asset) -> None:
     try:
         source.remove_tag(claim, [asset])
+        logger.info("Removed claim tag %s from %s", claim, asset.name)
     except SourceError:
         logger.warning("Could not remove claim tag from %s; it expires on its own", asset.name)

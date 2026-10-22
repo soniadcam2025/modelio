@@ -1,10 +1,12 @@
 name: Post to public channel
 
 on:
-  schedule:
-    # GitHub cron uses UTC. India Standard Time = UTC + 5:30.
-    - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
-    - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+  # Automatic posting is OFF until the manual tests in README.md ("Step 3") pass.
+  # To turn it on, remove the "# " in front of the next four lines (keep the indentation).
+  # GitHub cron uses UTC. India Standard Time = UTC + 5:30.
+  # schedule:
+  #   - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+  #   - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
   workflow_dispatch:
     inputs:
       mode:
@@ -50,7 +52,7 @@ jobs:
           PUBLIC_CHANNEL: ${{ vars.PUBLIC_CHANNEL || '@yourshakhira' }}
           CLOUDINARY_FOLDER: ${{ vars.CLOUDINARY_FOLDER || 'tgpub' }}
           POST_CAPTION: ${{ vars.POST_CAPTION }}
-          # Scheduled runs have no inputs, so they always post.
+          # Scheduled runs (once enabled) have no inputs, so they always post.
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'post' }}
           TEST_CHANNEL: ${{ inputs.channel }}
         run: |

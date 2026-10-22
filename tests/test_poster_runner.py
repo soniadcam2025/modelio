@@ -230,3 +230,14 @@ def test_asset_posted_by_another_run_meanwhile_is_skipped():
 
     source.on_get_tags = posted_elsewhere
     assert go(source).asset == "image:tgpub/b"
+
+
+def test_test_channel_run_logs_tag_add_and_remove(caplog):
+    caplog.set_level("INFO", logger="poster.runner")
+    source = FakeSource([asset("tgpub/a")])
+    go(source, channel="-1009999999999")
+    messages = [r.getMessage() for r in caplog.records]
+    order = [next(i for i, m in enumerate(messages) if m.startswith(prefix))
+             for prefix in ("Test target", "Added claim tag", "Posted ", "Removed claim tag")]
+    assert order == sorted(order)
+    assert not any(m.startswith("Recorded") for m in messages)

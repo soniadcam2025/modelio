@@ -5,7 +5,7 @@ This repo has two separate parts. A problem in one doesn't stop the other.
 | Part | What it does | Where it runs |
 |---|---|---|
 | **Subscription bot** (`shakhira_bot/`) | `@ShakhiraVIPBot`: sells VIP access to the private VIP channel with Telegram Stars | Must run **all the time** (a VPS or other always-on host). GitHub Actions can't host it. |
-| **Channel poster** (`poster/`) | Posts one photo/video from the Cloudinary `tgpub` folder to `@yourshakhira` | **GitHub Actions**, twice a day, on the free tier. Nothing to host. |
+| **Channel poster** (`poster/`) | Posts one photo/video from the Cloudinary `tgpub` folder to `@yourshakhira` | **GitHub Actions** on the free tier. Manual runs for now; a twice-daily schedule can be switched on after testing. Nothing to host. |
 
 Both use the same bot token. They don't share a database or files.
 
@@ -18,7 +18,7 @@ poster/         Cloudinary -> Telegram poster (python -m poster)
   telegram_publisher.py upload to Telegram, channel permission check
   runner.py             one posting run: pick, claim, post, record
 tests/          automated tests (no real Telegram or Cloudinary needed)
-.github/workflows/post-to-channel.yml   the twice-daily schedule
+.github/workflows/post-to-channel.yml   manual runs (twice-daily schedule ready but switched off)
 deploy/         systemd service for running the bot on a Linux server
 ```
 
@@ -66,35 +66,76 @@ The poster checks this at the start of every run. If anything is wrong, it stops
 
 **Captions:** if an asset has a `caption` field in its Cloudinary metadata (Media Library → asset → **Metadata/Context**), that caption is used. Otherwise `POST_CAPTION` is used. The poster never edits your media.
 
-### Step 3: Test safely before scheduled posting
+### Step 3: Test it by hand (automatic posting is off)
 
-Scheduled workflows only run from the **default branch** (`main`), so nothing posts on a schedule until this code is merged.
+**Automatic posting is switched off** in this version. The workflow only runs when you press **Run workflow**. Manual runs need the workflow on `main`, so merge first; merging alone posts nothing.
 
-1. Go to **Actions** → **Post to public channel** → **Run workflow**.
-2. Choose **mode: check**. This only confirms the bot can post to the channel. It should finish with a green tick.
-3. Run it again with **mode: dry-run**. The log shows how many assets were found and which one would be posted next. Nothing is posted or changed.
-4. Optional real test without touching the public channel:
-   1. Create a private test channel and add the bot as admin with **Post Messages**.
-   2. Give the channel a public username, or use its `-100…` ID.
-   3. Run with **mode: post** and **channel: @your_test_channel**.
+What each mode really tests:
 
-   Test-channel posts are **not** recorded, so that asset still goes to the public channel later.
-5. When you're happy, run **mode: post** with an empty channel to make the first real post. The schedule takes over after that.
+| Mode | Talks to | Proves | Does **not** prove |
+|---|---|---|---|
+| `check` | Telegram only (read-only) | The bot token works, the channel exists, and the bot is an admin there with **Post Messages** | Anything about Cloudinary. That an upload will succeed. |
+| `dry-run` | Telegram (same read-only check) and Cloudinary (read-only listing) | The Cloudinary credentials can **read** the folder. Which assets are found, which are skipped and why, and which one would be posted next. | That tags can be **written** (it adds none). That the file downloads or that Telegram accepts the upload. |
+| `post` to a test channel | Telegram (sends one post) and Cloudinary (adds and removes one temporary lock tag) | Download and upload of one real file. That the Cloudinary credentials can **add and remove** tags. | Writing `tgbot_posted` (test posts are not recorded). The public channel itself. |
+
+Run them in this order. Stop and fix anything that fails before moving on.
+
+1. **check:** **Actions** → **Post to public channel** → **Run workflow** → mode **check**, channel empty. Expect a green tick and the log line `Bot can post to @yourshakhira`.
+2. **dry-run:** same, mode **dry-run**. In the log, check:
+   - `Found N asset(s) in Cloudinary folder 'tgpub'`: N should match roughly what you see in Cloudinary.
+   - any `Skipping …` lines, with the reason
+   - `N eligible asset(s); next: …`
+3. **post to a private test channel:**
+   1. Create a new **private** channel only you can see.
+   2. Add **@ShakhiraVIPBot** as admin with **Post Messages**.
+   3. Get its numeric ID: open it at <https://web.telegram.org/a/> and copy the `-100…` number from the address bar.
+   4. Run mode **post**, channel `-100…` (your test channel's ID).
+4. **Verify the test post:**
+   - In Telegram: the test channel has one new photo or video, with the expected caption, playing or displaying properly.
+   - In the run log, in this order:
+     - `Test target …: posting history will NOT be recorded`
+     - `Added claim tag tgbot_claim_… to …`
+     - `Posted … (message …)`
+     - `Removed claim tag tgbot_claim_… from …`
+   - In Cloudinary (**Media Library** → that asset → tags): **no** `tgbot_…` tags remain, and your own tags are unchanged. A leftover `tgbot_claim_…` tag means removing tags failed. It expires harmlessly after 30 minutes, but tell me.
+   - `@yourshakhira` received nothing.
+5. Only after all of that, either:
+   - turn the schedule on (next section), or
+   - make one real post by hand with mode **post** and the channel empty. Afterwards that asset should carry `tgbot_posted` and `tgbot_run_…`.
 
 To run it on your own computer instead: copy `.env.example` to `.env`, fill it in, then:
 ```bash
 pip install -r requirements-poster.txt
 python -m poster --check
 python -m poster --dry-run
-python -m poster --channel @your_test_channel
+python -m poster --channel -100XXXXXXXXXX   # your private test channel's ID
 ```
 
-### Schedule
+### Schedule (currently OFF)
+
+The twice-daily schedule is written into the workflow but commented out:
 
 | UTC cron | India time (IST = UTC+5:30) |
 |---|---|
 | `30 4 * * *` | 10:00 AM |
 | `30 13 * * *` | 7:00 PM |
+
+**Turn it on only after every check in Step 3 passed:**
+1. On GitHub, open `.github/workflows/post-to-channel.yml` on `main` and click the pencil (Edit) icon.
+2. Find these lines near the top:
+   ```yaml
+     # schedule:
+     #   - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+     #   - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+   ```
+3. Delete only the `# ` at the start of those three lines. Keep the spaces before them, so they become:
+   ```yaml
+     schedule:
+       - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+       - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+   ```
+4. **Commit changes** directly to `main`. The next run happens at the next scheduled time. Scheduled runs always use mode **post** to `@yourshakhira`.
+5. To turn it off again, put the `# ` back, or use **Actions** → **Post to public channel** → **⋯** → **Disable workflow**.
 
 **The times are approximate.** GitHub often starts scheduled jobs 5–30 minutes late, sometimes more, and can skip a run when GitHub is very busy. Also, in a public repo GitHub **pauses schedules after 60 days with no commits**. It emails you, and you can re-enable the schedule on the Actions tab.
 
@@ -237,6 +278,7 @@ The tests use fake Telegram and Cloudinary services. They never charge Stars, po
 | | Status |
 |---|---|
 | Poster code, workflow, tests | Done. Tested with fakes only. |
+| Automatic twice-daily schedule | **Off.** Turn it on after Step 3 (see Schedule). |
 | Poster against the real Cloudinary account and channel | **Not verified yet.** Run Step 3. |
 | Bot admin rights in @yourshakhira | **Not verified.** The `check` mode verifies it. |
 | Subscription bot code and tests (this repo) | Done. Tested with fakes only. **Not the code of the bot that is live today.** |
