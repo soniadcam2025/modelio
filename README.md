@@ -223,7 +223,7 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**. 
 - An **always-on** process: a VPS (the `deploy/shakhira-bot.service` file sets this up) or any host that keeps a Python program running.
 - The bot as an **admin of the private VIP channel**, with **Invite Users via Link** and **Ban Users** on.
 - `.env` on that machine with:
-  - `TELEGRAM_BOT_TOKEN` (or `BOT_TOKEN`)
+  - `BOT_TOKEN`: the same bot token. The bot reads `BOT_TOKEN`; the poster reads `TELEGRAM_BOT_TOKEN`.
   - `VIP_CHANNEL_ID`: the private channel's **numeric ID**. Find it at <https://web.telegram.org/a/>: open the channel and copy the `-100…` number at the end of the address.
 - **Only one copy** of the bot may run at a time. Stop any older bot first.
 

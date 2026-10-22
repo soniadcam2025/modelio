@@ -43,10 +43,5 @@ def test_support_username_gets_at_sign():
     assert cfg.support_url == "https://t.me/helpdesk"
 
 
-def test_telegram_bot_token_name_also_accepted():
-    env = {"TELEGRAM_BOT_TOKEN": "123456:OTHER", "VIP_CHANNEL_ID": "-1001234567890"}
-    assert Config.from_env(env).bot_token == "123456:OTHER"
-
-
 def test_token_never_in_repr():
     assert "TEST-TOKEN" not in repr(Config.from_env(BASE))
