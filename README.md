@@ -1,94 +1,286 @@
-# CuteShakhira VIP bot (@ShakhiraVIPBot)
+# Modelio: CuteShakhira Telegram system
 
-Telegram bot that sells access to the private VIP channel with Telegram Stars.
+This repo has two separate parts. A problem in one doesn't stop the other.
 
-| Plan | Price | How it works |
+| Part | What it does | Where it runs |
+|---|---|---|
+| **Subscription bot** (`shakhira_bot/`) | `@ShakhiraVIPBot`: sells VIP access to the private VIP channel with Telegram Stars | Must run **all the time** (a VPS or other always-on host). GitHub Actions can't host it. |
+| **Channel poster** (`poster/`) | Posts one photo/video from the Cloudinary `tgpub` folder to `@yourshakhira` | **GitHub Actions** on the free tier. Manual runs for now; a twice-daily schedule can be switched on after testing. Nothing to host. |
+
+Both use the same bot token. They don't share a database or files.
+
+```
+shakhira_bot/   subscription bot (python -m shakhira_bot)
+poster/         Cloudinary -> Telegram poster (python -m poster)
+  config.py             settings and validation
+  cloudinary_source.py  find media in the folder, read/write posting-history tags
+  media.py              photo/video rules, size limits, safe download
+  telegram_publisher.py upload to Telegram, channel permission check
+  runner.py             one posting run: pick, claim, post, record
+tests/          automated tests (no real Telegram or Cloudinary needed)
+.github/workflows/post-to-channel.yml   manual runs (twice-daily schedule ready but switched off)
+deploy/         systemd service for running the bot on a Linux server
+```
+
+---
+
+## Part 1: Channel poster (Cloudinary → @yourshakhira)
+
+### Which secret is which
+
+| Name | What it is | Secret? |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | The bot's password, from @BotFather. Looks like `123456789:AA...` | **Yes** |
+| `CLOUDINARY_CLOUD_NAME` | Your Cloudinary account name (it appears in your media URLs) | Not really, but kept as a secret |
+| `CLOUDINARY_API_KEY` | Cloudinary API key (a number) | **Yes** |
+| `CLOUDINARY_API_SECRET` | Cloudinary API secret. Never share it. | **Yes** |
+| `PUBLIC_CHANNEL` | Where to post: a **username** like `@yourshakhira`, or a numeric **channel ID** like `-1001234567890` | No |
+
+**Where to find the Cloudinary values:** log in at <https://console.cloudinary.com> → **Settings** (gear icon) → **API Keys**. The page shows the cloud name, the API key, and the API secret (click the eye icon to reveal it).
+
+**Where to find the bot token:** Telegram → **@BotFather** → `/mybots` → **ShakhiraVIPBot** → **API Token**.
+
+Never paste these into a chat, a file in this repo, or an issue.
+
+### Step 1: Let the bot post in @yourshakhira
+
+1. In Telegram, open **@yourshakhira** → tap the channel name → **Edit** → **Administrators** → **Add Admin**.
+2. Pick **@ShakhiraVIPBot**.
+3. Turn on **Post Messages**. Everything else can stay off.
+4. Save.
+
+The poster checks this at the start of every run. If anything is wrong, it stops and tells you exactly what.
+
+### Step 2: Add the GitHub secrets
+
+1. Open <https://github.com/soniadcam2025/modelio> → **Settings** → **Secrets and variables** → **Actions**.
+2. Under **Secrets**, click **New repository secret** and add each of these with its value:
+   - `TELEGRAM_BOT_TOKEN`
+   - `CLOUDINARY_CLOUD_NAME`
+   - `CLOUDINARY_API_KEY`
+   - `CLOUDINARY_API_SECRET`
+3. Optional: on the **Variables** tab, add any of these (they aren't secret):
+   - `POST_CAPTION`: default caption. Empty means no caption.
+   - `PUBLIC_CHANNEL`: default `@yourshakhira`
+   - `CLOUDINARY_FOLDER`: default `tgpub`
+
+**Captions:** if an asset has a `caption` field in its Cloudinary metadata (Media Library → asset → **Metadata/Context**), that caption is used. Otherwise `POST_CAPTION` is used. The poster never edits your media.
+
+### Step 3: Test it by hand (automatic posting is off)
+
+**Automatic posting is switched off** in this version. The workflow only runs when you press **Run workflow**. Manual runs need the workflow on `main`, so merge first; merging alone posts nothing.
+
+What each mode really tests:
+
+| Mode | Talks to | Proves | Does **not** prove |
+|---|---|---|---|
+| `check` | Telegram only (read-only) | The bot token works, the channel exists, and the bot is an admin there with **Post Messages** | Anything about Cloudinary. That an upload will succeed. |
+| `dry-run` | Telegram (same read-only check) and Cloudinary (read-only listing) | The Cloudinary credentials can **read** the folder. Which assets are found, which are skipped and why, and which one would be posted next. | That tags can be **written** (it adds none). That the file downloads or that Telegram accepts the upload. |
+| `post` to a test channel | Telegram (sends one post) and Cloudinary (adds and removes one temporary lock tag) | Download and upload of one real file. That the Cloudinary credentials can **add and remove** tags. | Writing `tgbot_posted` (test posts are not recorded). The public channel itself. |
+
+Run them in this order. Stop and fix anything that fails before moving on.
+
+1. **check:** **Actions** → **Post to public channel** → **Run workflow** → mode **check**, channel empty. Expect a green tick and the log line `Bot can post to @yourshakhira`.
+2. **dry-run:** same, mode **dry-run**. In the log, check:
+   - `Found N asset(s) in Cloudinary folder 'tgpub'`: N should match roughly what you see in Cloudinary.
+   - any `Skipping …` lines, with the reason
+   - `N eligible asset(s); next: …`
+3. **post to a private test channel:**
+   1. Create a new **private** channel only you can see.
+   2. Add **@ShakhiraVIPBot** as admin with **Post Messages**.
+   3. Get its numeric ID: open it at <https://web.telegram.org/a/> and copy the `-100…` number from the address bar.
+   4. Run mode **post**, channel `-100…` (your test channel's ID).
+4. **Verify the test post:**
+   - In Telegram: the test channel has one new photo or video, with the expected caption, playing or displaying properly.
+   - In the run log, in this order:
+     - `Test target …: posting history will NOT be recorded`
+     - `Added claim tag tgbot_claim_… to …`
+     - `Posted … (message …)`
+     - `Removed claim tag tgbot_claim_… from …`
+   - In Cloudinary (**Media Library** → that asset → tags): **no** `tgbot_…` tags remain, and your own tags are unchanged. A leftover `tgbot_claim_…` tag means removing tags failed. It expires harmlessly after 30 minutes, but tell me.
+   - `@yourshakhira` received nothing.
+5. Only after all of that, either:
+   - turn the schedule on (next section), or
+   - make one real post by hand with mode **post** and the channel empty. Afterwards that asset should carry `tgbot_posted` and `tgbot_run_…`.
+
+To run it on your own computer instead: copy `.env.example` to `.env`, fill it in, then:
+```bash
+pip install -r requirements-poster.txt
+python -m poster --check
+python -m poster --dry-run
+python -m poster --channel -100XXXXXXXXXX   # your private test channel's ID
+```
+
+### Schedule (currently OFF)
+
+The twice-daily schedule is written into the workflow but commented out:
+
+| UTC cron | India time (IST = UTC+5:30) |
+|---|---|
+| `30 4 * * *` | 10:00 AM |
+| `30 13 * * *` | 7:00 PM |
+
+**Turn it on only after every check in Step 3 passed:**
+1. On GitHub, open `.github/workflows/post-to-channel.yml` on `main` and click the pencil (Edit) icon.
+2. Find these lines near the top:
+   ```yaml
+     # schedule:
+     #   - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+     #   - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+   ```
+3. Delete only the `# ` at the start of those three lines. Keep the spaces before them, so they become:
+   ```yaml
+     schedule:
+       - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+       - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+   ```
+4. **Commit changes** directly to `main`. The next run happens at the next scheduled time. Scheduled runs always use mode **post** to `@yourshakhira`.
+5. To turn it off again, put the `# ` back, or use **Actions** → **Post to public channel** → **⋯** → **Disable workflow**.
+
+**The times are approximate.** GitHub often starts scheduled jobs 5–30 minutes late, sometimes more, and can skip a run when GitHub is very busy. Also, in a public repo GitHub **pauses schedules after 60 days with no commits**. It emails you, and you can re-enable the schedule on the Actions tab.
+
+**To see runs and logs:** **Actions** tab → **Post to public channel** → click a run → **post** job → **Run poster** step.
+
+### How duplicate prevention works
+
+The posting history is stored **on the assets themselves, as Cloudinary tags**. It survives between GitHub runs, and you can see it in the Cloudinary Media Library.
+
+| Tag | Meaning |
+|---|---|
+| `tgbot_posted` | Telegram confirmed the post. Never picked again (unless rotation is set to `restart`). |
+| `tgbot_run_<number>` | The GitHub run that posted it. If a run is re-run, it sees this tag and doesn't post again. |
+| `tgbot_claim_<time>_<id>` | A temporary lock while a run is posting. Other runs skip the asset. It expires after 30 minutes if a run crashes. |
+| `tgbot_uncertain` | The upload may have reached Telegram, but no confirmation came back. Skipped so it's never double-posted. Check the channel, then either add `tgbot_posted` or remove `tgbot_uncertain` so it's posted again. |
+| `tgbot_rejected` | Telegram refused the file (for example, unsupported dimensions). Skipped so it doesn't block every later run. Remove the tag after fixing or replacing the file. |
+
+- An asset is marked posted **only after Telegram confirms**. A failed upload leaves no `tgbot_posted` tag, so the asset is tried again next time.
+- Only these `tgbot_` tags are ever added or removed. **Your own tags are never touched.**
+- Two runs can't post the same asset:
+  - GitHub runs one posting job at a time (`concurrency` in the workflow).
+  - Each run also claims an asset and re-reads its tags before posting. If another run claimed it too, it backs off.
+- When every asset has been posted, the poster stops posting and says so in the log. To start a new round automatically, set the variable `POST_WHEN_EXHAUSTED=restart`.
+
+### What gets posted, and the limits
+
+- **Photos** (jpg, png, webp) up to **10 MB** are sent as photos. Telegram also requires width + height of at most 10,000 pixels, and the long side at most 20 times the short side. Photos outside that are skipped.
+- **MP4 videos** up to **50 MB** are sent as playable videos.
+- **GIFs** up to **50 MB** are sent as animations.
+- Anything else is skipped with a reason in the log: other formats (`.mov`, `.pdf`…), larger files, and private/authenticated assets.
+- The 10 MB and 50 MB figures are the Telegram Bot API upload limits for bots. Files are downloaded from Cloudinary and uploaded to Telegram as real files.
+- Only assets **directly** in `tgpub` are used, not subfolders. This works with both Cloudinary folder modes:
+  - "dynamic folders", where the folder isn't part of the asset's ID
+  - older "fixed folders", where IDs start with `tgpub/`
+- The order is oldest upload first. Set `POST_SELECTION=random` for random order.
+
+### Free-tier usage
+
+- **GitHub Actions:** each run takes about 1 minute, so roughly 60 minutes a month. That's free for public repos and well inside the 2,000 free minutes for private repos.
+- **Cloudinary free plan:**
+  - Each run makes a few Admin API calls, far below the hourly limit.
+  - Each post downloads one original file, which counts toward your monthly bandwidth/credits. Large videos use more.
+  - Check usage in Cloudinary → **Dashboard**.
+
+### Troubleshooting
+
+| Log message | Fix |
+|---|---|
+| `Missing required environment variable(s): ...` | Add the named secret(s) in GitHub (Step 2). |
+| `not an admin of @yourshakhira` / `cannot post messages` | Step 1. |
+| `Telegram rejected the bot token` | The token is wrong or was revoked. Copy it again from @BotFather. |
+| `Cloudinary ... AuthorizationRequired` | Wrong Cloudinary API key or secret. |
+| `Cloudinary folder 'tgpub' is empty` | Check the folder name and casing in the Media Library, or set `CLOUDINARY_FOLDER`. |
+| `Every supported asset has already been posted` | Upload more media, or set `POST_WHEN_EXHAUSTED=restart`. |
+| `POSTED ... but could not record it` | The post worked but tagging failed. Add the tag `tgbot_posted` to that asset by hand. |
+
+---
+
+## Part 2: Subscription bot (@ShakhiraVIPBot)
+
+> **This is not the bot that is running today.** The `@ShakhiraVIPBot` currently live in Telegram runs code that is not in this repository. The code here (`shakhira_bot/`) is a separate implementation, built from an earlier starter ZIP plus the plans and commands you described. It has **not been deployed**, and **never tested against real Telegram or real payments**. Its wording and menu are my reconstruction and may not match the live bot word for word.
+
+| Plan | Price | How it works in this code |
 |---|---|---|
 | 💎 VIP Monthly | 499 ⭐ / 30 days | Telegram's own channel subscription link. Telegram charges, renews every 30 days, and removes people who cancel or stop paying. |
-| ⏳ 3-day trial | 49 ⭐ once | Bot invoice in Stars. After payment the bot sends a single-use invite link and removes the member when the 3 days are over (unless they are a paying monthly subscriber or an admin). |
+| ⏳ 3-day trial | 49 ⭐ once | Stars invoice. After the payment is verified, the bot sends a single-use invite link and removes the member when 3 days are up. It never removes admins or paying monthly subscribers. |
 
-Prices and the trial length come from `.env`. The defaults match the bot that is live today.
+**Commands:** `/start`, `/subscribe`, `/status`, `/rules`, plus `/paysupport` (see below).
 
-**Commands:** `/start` (welcome menu), `/subscribe` (choose a plan), `/status` (check membership), `/rules` (membership information), `/paysupport` (payment help).
+**Waiting for your approval.** These are in the code but aren't part of the terms you described. Neither affects prices or durations.
 
-**Menu buttons:** VIP Monthly, 3-day trial, My membership, Free channel (`@yourshakhira`), Support.
+| Item | What the code does now | How to change it |
+|---|---|---|
+| One trial per account | On by default. A second trial purchase is refused before payment, and `/rules` shows "One trial per account." | Set `TRIAL_ONCE_PER_USER=false` in `.env`. Repeat trials then extend the current trial, and the `/rules` line disappears. |
+| `/paysupport` command | Added. It replies with the support contact. `/rules` and two error messages point to it. | Ask me to remove it. Telegram's payment rules appear to expect a way for buyers to reach payment support; I couldn't confirm the exact rule from this environment. |
+| Free channel / Support buttons in `/start` | Added under the two plan buttons | Ask me to remove them |
 
-## Project layout
+**What the bot checks and protects against:**
+- **Payments:** checked before and after checkout (currency `XTR`, amount, invoice payload, buyer). Duplicate payment updates are ignored.
+- **Records:** payments and trials are saved in SQLite, so they survive restarts.
+- **Expired trials:** checked every 5 minutes.
 
-```
-shakhira_bot/
-  __main__.py   start the bot: python -m shakhira_bot
-  config.py     reads settings from .env
-  texts.py      every message the bot sends (edit wording here)
-  handlers.py   commands, buttons, payments, channel join/leave events
-  access.py     subscription link, trial links, status, trial expiry
-  payments.py   Stars invoice payload and payment checks
-  storage.py    SQLite database (payments, trials, events)
-  app.py        connects everything
-tests/          automated tests (no Telegram connection needed)
-deploy/         systemd service for a Linux server
-```
+### What the bot needs
 
-## Before you start (Telegram side)
+- An **always-on** process: a VPS (the `deploy/shakhira-bot.service` file sets this up) or any host that keeps a Python program running.
+- The bot as an **admin of the private VIP channel**, with **Invite Users via Link** and **Ban Users** on.
+- `.env` on that machine with:
+  - `BOT_TOKEN`: the same bot token. The bot reads `BOT_TOKEN`; the poster reads `TELEGRAM_BOT_TOKEN`.
+  - `VIP_CHANNEL_ID`: the private channel's **numeric ID**. Find it at <https://web.telegram.org/a/>: open the channel and copy the `-100…` number at the end of the address.
+- **Only one copy** of the bot may run at a time. Stop any older bot first.
 
-1. The VIP channel must be **private**, and `@ShakhiraVIPBot` must be an **admin** with:
-   - **Invite Users via Link**: needed to create the subscription and trial links.
-   - **Ban Users**: needed to remove members whose trial ended.
-2. Find the VIP channel's numeric ID:
-   1. On a computer, open <https://web.telegram.org/a/> and log in.
-   2. Open the VIP channel.
-   3. The address bar ends with something like `#-1001234567890`. That number (including `-100`) is `VIP_CHANNEL_ID`.
-   4. If it doesn't start with `-100`, put `100` right after the minus sign.
-3. **Only one program can run a bot at a time.** Stop the bot that is running now before you start this one. Otherwise Telegram returns a "Conflict" error. If the old bot used a webhook, starting this bot switches the bot to polling.
-
-## Run it on your computer (for testing)
-
-You need Python 3.10 or newer.
+### Run the bot
 
 ```bash
 python -m venv .venv
-# Windows PowerShell:  .venv\Scripts\Activate.ps1
-# macOS / Linux:       source .venv/bin/activate
+source .venv/bin/activate            # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+cp .env.example .env                 # then edit .env
+python -m shakhira_bot --check-config
+python -m shakhira_bot
 ```
 
-Copy `.env.example` to a new file named `.env` and fill in `BOT_TOKEN` and `VIP_CHANNEL_ID`. `.env` is ignored by Git: never commit it and never paste the token into a chat.
+### Run it 24/7 on an Ubuntu server
 
 ```bash
-python -m shakhira_bot --check-config   # checks .env without connecting to Telegram
-python -m shakhira_bot                  # starts the bot (Ctrl+C to stop)
+sudo adduser --system --group shakhira
+sudo git clone https://github.com/soniadcam2025/modelio /opt/shakhira-bot
+cd /opt/shakhira-bot
+sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt
+sudo cp .env.example .env && sudo nano .env
+sudo chown -R shakhira:shakhira /opt/shakhira-bot && sudo chmod 600 .env
+sudo cp deploy/shakhira-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now shakhira-bot
+sudo journalctl -u shakhira-bot -f
 ```
 
-## Run the tests
+Back up `data/shakhira_bot.db`: it holds the trial payment records.
+
+### Good to know
+
+- **Cancelling monthly:** members cancel in Telegram (Settings → My Stars). Telegram removes them when the paid period ends. The bot can't cancel or refund.
+- **Refunds:** not built into the bot.
+- **Trials sold by an older bot** aren't in this database, so they won't be removed automatically.
+- **Changing the monthly price** creates a new subscription link. Existing subscribers keep their old price.
+- **If you revoke the monthly link** in Telegram, run `python -m shakhira_bot --reset-monthly-link` and restart the bot.
+
+---
+
+## Tests
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-## Run 24/7 on a server (Ubuntu VPS)
+The tests use fake Telegram and Cloudinary services. They never charge Stars, post anything, or touch real members.
 
-```bash
-sudo adduser --system --group shakhira
-sudo git clone https://github.com/soniadcam2025/modelio /opt/shakhira-bot
-cd /opt/shakhira-bot
-sudo python3 -m venv .venv
-sudo .venv/bin/pip install -r requirements.txt
-sudo cp .env.example .env && sudo nano .env      # fill in the real values
-sudo chown -R shakhira:shakhira /opt/shakhira-bot && sudo chmod 600 .env
-sudo cp deploy/shakhira-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now shakhira-bot
-sudo journalctl -u shakhira-bot -f               # live logs
-```
+## Status
 
-The database lives in `data/shakhira_bot.db`. Back it up: it is the record of trial payments.
-
-## Good to know
-
-- **Cancelling monthly:** members cancel in Telegram (Settings → My Stars → their subscriptions). Telegram removes them when the paid period ends. The bot cannot cancel or refund for them.
-- **Existing monthly subscribers** who joined through an older link keep their subscription. `/status` reads it directly from Telegram.
-- **Trials sold by the old bot** are not in this bot's database, so this bot won't remove those people automatically.
-- **Changing the monthly price:** Telegram doesn't let you edit a subscription link's price. Change `VIP_MONTHLY_PRICE` and the bot makes a new link. People already subscribed keep their old price.
-- **If you revoke the monthly link** in Telegram, run `python -m shakhira_bot --reset-monthly-link` and restart. The bot makes a fresh link the next time someone taps VIP Monthly.
-- Logs never include the bot token: request logging from the HTTP library is turned down on purpose.
+| | Status |
+|---|---|
+| Poster code, workflow, tests | Done. Tested with fakes only. |
+| Automatic twice-daily schedule | **Off.** Turn it on after Step 3 (see Schedule). |
+| Poster against the real Cloudinary account and channel | **Not verified yet.** Run Step 3. |
+| Bot admin rights in @yourshakhira | **Not verified.** The `check` mode verifies it. |
+| Subscription bot code and tests (this repo) | Done. Tested with fakes only. **Not the code of the bot that is live today.** |
+| Subscription bot from this repo deployed | **No.** Needs an always-on host and your go-ahead. Your current live bot keeps running unchanged. |
+| One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (see Part 2). |

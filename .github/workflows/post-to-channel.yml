@@ -1,0 +1,67 @@
+name: Post to public channel
+
+on:
+  # Automatic posting is OFF until the manual tests in README.md ("Step 3") pass.
+  # To turn it on, remove the "# " in front of the next four lines (keep the indentation).
+  # GitHub cron uses UTC. India Standard Time = UTC + 5:30.
+  # schedule:
+  #   - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
+  #   - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = permissions only, dry-run = pick an asset without posting, post = really post"
+        type: choice
+        options: [check, dry-run, post]
+        default: dry-run
+      channel:
+        description: "Optional test channel (e.g. @my_test_channel). Empty = the public channel. Test posts are not recorded."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# Never run two posting jobs at the same time; a second one waits instead of being cancelled.
+concurrency:
+  group: post-to-public-channel
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-poster.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-poster.txt
+
+      - name: Run poster
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          PUBLIC_CHANNEL: ${{ vars.PUBLIC_CHANNEL || '@yourshakhira' }}
+          CLOUDINARY_FOLDER: ${{ vars.CLOUDINARY_FOLDER || 'tgpub' }}
+          POST_CAPTION: ${{ vars.POST_CAPTION }}
+          # Scheduled runs (once enabled) have no inputs, so they always post.
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'post' }}
+          TEST_CHANNEL: ${{ inputs.channel }}
+        run: |
+          args=()
+          case "$MODE" in
+            check) args+=(--check) ;;
+            dry-run) args+=(--dry-run) ;;
+            post) ;;
+            *) echo "Unknown mode: $MODE"; exit 2 ;;
+          esac
+          if [ -n "$TEST_CHANNEL" ]; then args+=(--channel "$TEST_CHANNEL"); fi
+          python -m poster "${args[@]}"
