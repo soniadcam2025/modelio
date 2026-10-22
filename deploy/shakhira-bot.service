@@ -1,0 +1,21 @@
+# systemd service that keeps the bot running 24/7 on a Linux server (VPS).
+# Install steps are in README.md ("Run 24/7 on a server").
+[Unit]
+Description=CuteShakhira VIP Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shakhira
+WorkingDirectory=/opt/shakhira-bot
+ExecStart=/opt/shakhira-bot/.venv/bin/python -m shakhira_bot
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
