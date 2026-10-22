@@ -4,8 +4,8 @@ on:
   # Automatic posting is ON (enabled after the manual tests in README.md "Step 3" passed).
   # GitHub cron uses UTC. India Standard Time = UTC + 5:30. Start times are approximate.
   schedule:
-    - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
-    - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
+    - cron: "30 16 * * *"  # 16:30 UTC = 10:00 PM IST
+    - cron: "30 23 * * *"  # 23:30 UTC = 5:00 AM IST (next day in India)
   workflow_dispatch:
     inputs:
       mode:
