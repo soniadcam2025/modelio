@@ -4,6 +4,8 @@ import os
 import sqlite3
 from dataclasses import dataclass
 
+SCHEMA_VERSION = 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY,
@@ -66,6 +68,9 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        # Schema version for future migrations (1 = the tables above).
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
     def close(self) -> None:

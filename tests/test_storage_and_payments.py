@@ -10,6 +10,18 @@ def test_duplicate_charge_id_is_recorded_once():
     assert store.record_payment("charge-1", 7, "trial", 49, "XTR", "p", 101) is False
 
 
+def test_database_survives_restart_and_records_schema_version(tmp_path):
+    path = str(tmp_path / "bot.db")
+    store = Storage(path)
+    store.record_payment("c1", 7, "trial", 49, "XTR", "p", 0)
+    store.create_trial(7, "c1", 0, 100)
+    store.close()
+    reopened = Storage(path)
+    assert reopened.has_used_trial(7)
+    assert reopened.active_trial(7, 50) is not None
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
 def test_trial_lifecycle_queries():
     store = Storage(":memory:")
     store.record_payment("c1", 7, "trial", 49, "XTR", "p", 0)

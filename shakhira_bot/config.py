@@ -47,7 +47,7 @@ class Config:
     def from_env(cls, env: dict | None = None) -> "Config":
         env = dict(os.environ if env is None else env)
 
-        token = env.get("BOT_TOKEN", "").strip()
+        token = env.get("BOT_TOKEN", "").strip() or env.get("TELEGRAM_BOT_TOKEN", "").strip()
         if not token or token == "put_your_bot_token_here":
             raise ConfigError("BOT_TOKEN is missing. Put it in your .env file (never in Git).")
 
