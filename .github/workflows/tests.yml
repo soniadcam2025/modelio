@@ -25,9 +25,10 @@ jobs:
             requirements.txt
             requirements-poster.txt
             requirements-dev.txt
+            requirements-dashboard.txt
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt pytest-cov
+        run: pip install -r requirements-dev.txt -r requirements-dashboard.txt pytest-cov
 
       - name: Run tests
-        run: pytest -q --cov=shakhira_bot --cov=poster --cov-report=term-missing
+        run: pytest -q --cov=shakhira_bot --cov=poster --cov=dashboard --cov=tools --cov-report=term-missing
