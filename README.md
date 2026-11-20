@@ -18,7 +18,13 @@ poster/         Cloudinary -> Telegram poster (python -m poster)
   runner.py             one posting run: pick, claim, post, record; folder inventory
   slots.py              which scheduled slot (5 AM / 10 PM) a run belongs to
   monitor.py            run summary, GitHub annotations, admin alerts, posting report
-shakhira_bot/   subscription bot (python -m shakhira_bot)
+shakhira_bot/   subscription bot (python -m shakhira_bot) and the send-only worker (--worker)
+  ops.py                content queue, captions, profiles, join requests, moderation, analytics data
+  scheduler.py          send-only engine: posts, polls/quizzes, paid media, reminders, admin actions
+  features.py           join requests, moderation, reactions, profiles, /admin (full bot only)
+dashboard/      web admin dashboard (python -m dashboard serve); holds no bot token
+tools/          identify_live_bot.py (read-only), export_cloudinary_history.py (read-only backup)
+DEPLOYMENT.md   feature matrix, live-bot identification, backups, rollout steps and rollback
 tests/          automated tests (fake Telegram and Cloudinary; nothing real is touched)
 .github/workflows/post-to-channel.yml   the posting schedule and manual runs
 .github/workflows/tests.yml             runs the tests on every pull request (no secrets)
@@ -62,7 +68,9 @@ Never paste these into a chat, a file in this repo, or an issue.
 | `LOW_STOCK_THRESHOLD` | `5` | Warn when fewer than this many unpublished files are left after a post. `0` = never warn. |
 | `POST_WHEN_EXHAUSTED` | `stop` | `stop` = when everything is posted, stop and alert. `restart` = **re-post old media** in a new round. Only set `restart` if you want recycling. |
 | `POST_CAPTION` | empty | Default caption. An asset's own `caption` (Cloudinary → asset → Metadata/Context) wins. |
-| `POST_SELECTION` | `oldest` | `oldest` first, or `random`. |
+| `POST_SELECTION` | `oldest` | `oldest` first, `random`, or `smart`: files tagged `tgpriority` first, then a different type (photo/video) than the last post, then oldest. |
+| `POST_CAPTIONS` | empty | Captions that rotate post by post, separated by `\|\|`. Supports `{date}`, `{weekday}`, `{channel}`. An asset's own caption still wins. |
+| `POST_FOOTER` | empty | Added under every caption (e.g. `💎 VIP: @ShakhiraVIPBot`), if it fits in 1,024 characters. |
 | `PUBLIC_CHANNEL` | `@yourshakhira` | Where to post. |
 | `CLOUDINARY_FOLDER` | `tgpub` | Which folder to post from. |
 
@@ -241,6 +249,31 @@ sudo journalctl -u shakhira-bot -f
 
 ---
 
+## Part 3: Admin dashboard and send-only worker
+
+A web dashboard to manage both channels, plus a worker that carries out what you schedule there.
+Built and tested; **not deployed**. See [DEPLOYMENT.md](DEPLOYMENT.md) for the feature matrix, Telegram limits and the step-by-step rollout.
+
+- **Dashboard** (`python -m dashboard serve`):
+  - Pages: overview; posts and polls; calendar; Cloudinary media library; subscribers (profiles, tags, notes, CSV); join requests; moderation rules; analytics; feature switches; activity log.
+  - Holds **no bot token**: it writes requests to the database, and the worker carries them out.
+  - Listens on `127.0.0.1:8080`; reach it with `ssh -L 8080:127.0.0.1:8080 you@server`.
+- **Worker** (`python -m shakhira_bot --worker`):
+  - Sends scheduled text, media, polls, quizzes, VIP promotions and paid media; closes polls and keeps their results; sends trial and renewal reminders; carries out dashboard actions.
+  - It **never receives updates**, so it runs safely next to the live bot.
+  - Every feature is off until switched on in the dashboard.
+  - With `PREVIEW_CHAT_ID` set, everything goes only to your private chat with the bot.
+
+Setup:
+
+```bash
+pip install -r requirements.txt -r requirements-poster.txt -r requirements-dashboard.txt
+python -m dashboard make-secret        # put the output in .env as DASHBOARD_SECRET
+python -m dashboard hash-password      # put the output in .env as DASHBOARD_PASSWORD_HASH
+python -m dashboard serve
+python -m shakhira_bot --worker        # in another terminal (or the systemd units in deploy/)
+```
+
 ## Tests
 
 ```bash
@@ -262,3 +295,5 @@ The tests use fake Telegram and Cloudinary services. They never charge Stars, po
 | Subscription bot code (this repo) | Security fixes done and tested with fakes. **Not deployed, not the live bot.** |
 | Live @ShakhiraVIPBot | Runs elsewhere; source and host not yet identified. |
 | One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (Part 2). |
+| Admin dashboard, send-only worker, new bot features | Built and tested with fakes (Part 3). **Not deployed.** See DEPLOYMENT.md. |
+| Smart rotation, caption pool and footer for the poster | Built, **off by default**. |
