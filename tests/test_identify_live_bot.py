@@ -69,3 +69,13 @@ def test_cloudinary_history_export_is_read_only():
     data = export(source, 1_800_000_000)
     assert data["assets"][0]["tgbot_tags"] == ["tgbot_posted", "tgbot_slot_20261120T1630Z"]
     assert source.log == []  # nothing tagged or untagged
+
+
+def test_public_log_mode_hides_ip_and_vip_channel():
+    from tools.identify_live_bot import mask_ip, public_safe
+
+    inspector, _ = fake_telegram("https://bot.example.com/hook/SECRET")
+    report = public_safe(inspect(inspector, "@yourshakhira", "-1001234567890"))
+    assert report["delivery"]["ip_address"] == "203.0.x.x" and "vip_channel" not in report
+    assert "203.0.113.5" not in render(report) and "SECRET" not in render(report)
+    assert mask_ip(None) == "unknown" and mask_ip("2001:db8:1::5").startswith("2001:db8:")

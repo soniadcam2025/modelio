@@ -101,6 +101,25 @@ def inspect(inspector: Inspector, public_channel: str = "@yourshakhira", vip_cha
     return report
 
 
+def mask_ip(ip: str | None) -> str:
+    """Keep only the network part of an IP for logs that others can read (e.g. a public repo's Actions logs)."""
+    if not ip:
+        return "unknown"
+    if ":" in ip:  # IPv6
+        return ":".join(ip.split(":")[:2]) + ":…"
+    parts = ip.split(".")
+    return ".".join(parts[:2] + ["x", "x"]) if len(parts) == 4 else "hidden"
+
+
+def public_safe(report: dict) -> dict:
+    """A copy without values that should not appear in a public log."""
+    if "delivery" not in report:
+        return report
+    safe = {**report, "delivery": {**report["delivery"], "ip_address": mask_ip(report["delivery"]["ip_address"])}}
+    safe.pop("vip_channel", None)
+    return safe
+
+
 def render(report: dict) -> str:
     if "error" in report:
         return report["error"]
@@ -129,12 +148,16 @@ def main(argv=None) -> int:
     parser.add_argument("--public-channel", default=os.getenv("PUBLIC_CHANNEL", "@yourshakhira"))
     parser.add_argument("--vip-channel", default=os.getenv("VIP_CHANNEL_ID"))
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--public-log", action="store_true",
+                        help="mask the IP and leave out the VIP channel (for logs others can read)")
     args = parser.parse_args(argv)
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
     if not token:
         print("Set TELEGRAM_BOT_TOKEN (never paste it into a chat or a file in the repo).", file=sys.stderr)
         return 2
-    report = inspect(Inspector(token), args.public_channel, args.vip_channel)
+    report = inspect(Inspector(token), args.public_channel, None if args.public_log else args.vip_channel)
+    if args.public_log:
+        report = public_safe(report)
     print(json.dumps(report, indent=2) if args.json else render(report))
     return 1 if "error" in report else 0
 

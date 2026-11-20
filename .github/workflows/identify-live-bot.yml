@@ -1,0 +1,29 @@
+name: Identify live bot (read-only)
+
+# Reports how the live @ShakhiraVIPBot receives updates (webhook host or long polling), using only
+# read-only Bot API methods. It never calls getUpdates and changes nothing. The log is public in a
+# public repository, so --public-log masks the IP and skips the private VIP channel.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/lucid-bell-pd50md]
+    paths: [.github/workflows/identify-live-bot.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install httpx==0.28.1
+      - name: Inspect (read-only)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PUBLIC_CHANNEL: ${{ vars.PUBLIC_CHANNEL || '@yourshakhira' }}
+        run: python tools/identify_live_bot.py --public-log
