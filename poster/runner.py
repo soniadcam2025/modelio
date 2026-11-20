@@ -15,6 +15,7 @@ import random
 import secrets
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -124,12 +125,49 @@ def inventory(cfg: PosterConfig, assets: list[Asset]) -> Inventory:
     )
 
 
-def caption_for(asset: Asset, cfg: PosterConfig) -> str:
-    text = (asset.caption or cfg.caption).strip()
+IST = timezone(timedelta(hours=5, minutes=30))
+PRIORITY_TAG = "tgpriority"  # add this tag in Cloudinary to post an asset sooner (smart selection)
+
+
+def render_caption(template: str, cfg: PosterConfig, now: float) -> str:
+    """Fill the few supported placeholders. Unknown {words} are left as they are."""
+    day = datetime.fromtimestamp(now, tz=IST)
+    return (template.replace("{date}", day.strftime("%d %b %Y")).replace("{weekday}", day.strftime("%A"))
+            .replace("{channel}", cfg.public_channel))
+
+
+def caption_for(asset: Asset, cfg: PosterConfig, now: float | None = None, index: int = 0) -> str:
+    """Caption priority: the asset's own Cloudinary caption, then the rotating POST_CAPTIONS pool,
+    then POST_CAPTION. POST_FOOTER is appended if it fits in Telegram's 1,024 characters."""
+    now = time.time() if now is None else now
+    base = asset.caption or (cfg.caption_pool[index % len(cfg.caption_pool)] if cfg.caption_pool else "") or cfg.caption
+    text = render_caption(base.strip(), cfg, now)
+    footer = render_caption(cfg.footer, cfg, now).strip()
+    if footer and len(text) + 2 + len(footer) <= TELEGRAM_CAPTION_LIMIT:
+        text = f"{text}\n\n{footer}" if text else footer
     if len(text) > TELEGRAM_CAPTION_LIMIT:
         logger.warning("Caption for %s is too long; using the default caption", asset.name)
-        text = cfg.caption
+        text = render_caption(cfg.caption, cfg, now)
     return text
+
+
+def last_posted_kind(supported: list[tuple[Asset, str]]) -> str | None:
+    """The media kind of the most recent slot-tagged post, for smart selection."""
+    latest = None
+    for asset, kind in supported:
+        for tag in asset.tags:
+            if tag.startswith(SLOT_PREFIX) and (latest is None or tag > latest[0]):
+                latest = (tag, kind)
+    return latest[1] if latest else None
+
+
+def smart_order(eligible: list[tuple[Asset, str]], last_kind: str | None) -> list[tuple[Asset, str]]:
+    """Priority-tagged first, then a different media kind than the last post, then oldest first."""
+    return sorted(eligible, key=lambda pair: (
+        PRIORITY_TAG not in pair[0].tags,
+        last_kind is not None and pair[1] == last_kind,
+        pair[0].created_at, pair[0].public_id,
+    ))
 
 
 def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublisher, http: httpx.Client, *,
@@ -213,6 +251,8 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
 
     if cfg.selection == "random":
         (rng or random.Random()).shuffle(eligible)
+    elif cfg.selection == "smart":
+        eligible = smart_order(eligible, last_posted_kind(supported))
     else:
         eligible.sort(key=lambda pair: (pair[0].created_at, pair[0].public_id))
     logger.info("%s eligible asset(s); next: %s", len(eligible), eligible[0][0].name)
@@ -220,6 +260,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
     if dry_run:
         return Result("dry_run", asset=eligible[0][0].name, remaining=len(eligible), slot=slot)
     remaining_after = len(eligible) - 1
+    posted_count = sum(POSTED_TAG in a.tags for a, _ in supported)  # rotates the caption pool
 
     for asset, kind in eligible[:MAX_CANDIDATES]:
         claim = make_claim_tag(now)
@@ -247,7 +288,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             continue
 
         try:
-            message_id = publisher.send_media(target, kind, media.filename(asset), content, caption_for(asset, cfg))
+            message_id = publisher.send_media(target, kind, media.filename(asset), content, caption_for(asset, cfg, now, posted_count))
         except PublishFailed as exc:
             logger.error("Telegram did not publish %s: %s", asset.name, exc)
             if exc.rejected_request and record_history:

@@ -265,3 +265,57 @@ def test_cli_report_is_read_only(fakes, capsys):
 
 def test_cli_bad_slot_is_a_config_error(fakes):
     assert cli.main(["--slot", "soon"], env=ENV) == 2
+
+
+# Smart rotation and captions (all opt-in; defaults unchanged)
+
+
+def test_default_selection_and_captions_are_unchanged():
+    cfg = PosterConfig.from_env({"TELEGRAM_BOT_TOKEN": "1:T", "CLOUDINARY_CLOUD_NAME": "c",
+                                 "CLOUDINARY_API_KEY": "k", "CLOUDINARY_API_SECRET": "s"})
+    assert cfg.selection == "oldest" and cfg.caption_pool == () and cfg.footer == ""
+    assert runner.caption_for(asset("tgpub/a"), cfg, NOW) == ""
+
+
+def test_smart_selection_prefers_priority_then_a_different_kind():
+    last = asset("tgpub/last", created="0", tags=[POSTED_TAG, "tgbot_slot_20261120T1630Z"])  # a photo
+    source = FakeSource([
+        last,
+        asset("tgpub/photo_old", created="1"),
+        asset("tgpub/video_new", resource_type="video", fmt="mp4", created="2"),
+        asset("tgpub/photo_pinned", created="3", tags=["tgpriority"]),
+    ])
+    cfg = make_cfg(selection="smart")
+    assert go(source, cfg=cfg).asset == "image:tgpub/photo_pinned"  # priority tag wins
+    source.tags[("image", "upload", "tgpub/photo_pinned")].append("tgbot_slot_20261121T1630Z")
+    assert go(source, cfg=cfg).asset == "video:tgpub/video_new"  # last post was a photo -> a video next
+
+
+def test_caption_pool_rotates_with_placeholders_and_footer():
+    cfg = make_cfg(caption_pool=("Good morning {weekday} ☀️", "Night vibes ✨"), footer="💎 VIP: @ShakhiraVIPBot")
+    sat = 1795000000  # a Saturday in IST
+    first = runner.caption_for(asset("tgpub/a"), cfg, sat, index=0)
+    assert first.startswith("Good morning ") and first.endswith("💎 VIP: @ShakhiraVIPBot") and "{" not in first
+    assert runner.caption_for(asset("tgpub/a"), cfg, sat, index=1).startswith("Night vibes")
+    assert runner.caption_for(asset("tgpub/a", caption="Own caption"), cfg, sat, index=0).startswith("Own caption")
+    long_cfg = make_cfg(caption_pool=("x" * 1020,), footer="footer")
+    assert runner.caption_for(asset("tgpub/a"), long_cfg, sat) == "x" * 1020  # footer dropped, never over the limit
+
+
+def test_caption_config_validation():
+    env = {"TELEGRAM_BOT_TOKEN": "1:T", "CLOUDINARY_CLOUD_NAME": "c", "CLOUDINARY_API_KEY": "k", "CLOUDINARY_API_SECRET": "s"}
+    cfg = PosterConfig.from_env({**env, "POST_CAPTIONS": "One || Two\\nlines ||  ", "POST_SELECTION": "smart"})
+    assert cfg.caption_pool == ("One", "Two\nlines") and cfg.selection == "smart"
+    with pytest.raises(ConfigError, match="POST_CAPTIONS"):
+        PosterConfig.from_env({**env, "POST_CAPTIONS": "x" * 1100})
+    with pytest.raises(ConfigError, match="POST_FOOTER"):
+        PosterConfig.from_env({**env, "POST_FOOTER": "x" * 300})
+
+
+def test_posted_captions_rotate_across_runs():
+    cfg = make_cfg(caption_pool=("A", "B"))
+    pub = FakePublisher()
+    source = library(3)
+    for _ in range(3):
+        go(source, pub, cfg=cfg)
+    assert [s["caption"] for s in pub.sent] == ["A", "B", "A"]

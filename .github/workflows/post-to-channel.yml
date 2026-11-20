@@ -57,6 +57,9 @@ jobs:
           CLOUDINARY_FOLDER: ${{ vars.CLOUDINARY_FOLDER || 'tgpub' }}
           POST_CAPTION: ${{ vars.POST_CAPTION }}
           POST_SELECTION: ${{ vars.POST_SELECTION }}
+          # Optional captions: a rotating pool (separate entries with ||) and a footer for every post.
+          POST_CAPTIONS: ${{ vars.POST_CAPTIONS }}
+          POST_FOOTER: ${{ vars.POST_FOOTER }}
           # Unset = stop when everything is posted. Recycling old posts only if you set this to "restart".
           POST_WHEN_EXHAUSTED: ${{ vars.POST_WHEN_EXHAUSTED }}
           LOW_STOCK_THRESHOLD: ${{ vars.LOW_STOCK_THRESHOLD }}

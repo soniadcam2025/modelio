@@ -66,6 +66,9 @@ class PosterConfig:
     admin_chat_id: str = ""
     # The UTC times of the daily schedule; must match the cron lines in the workflow.
     slot_times: tuple[tuple[int, int], ...] = ((16, 30), (23, 30))
+    # Optional rotating captions (POST_CAPTIONS, separated by ||) and a footer added to every caption.
+    caption_pool: tuple[str, ...] = ()
+    footer: str = ""
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "PosterConfig":
@@ -84,6 +87,14 @@ class PosterConfig:
         except SlotError as exc:
             raise ConfigError(str(exc)) from None
 
+        caption_pool = tuple(c.replace("\\n", "\n").strip() for c in (env.get("POST_CAPTIONS") or "").split("||")
+                             if c.strip())
+        if any(len(c) > TELEGRAM_CAPTION_LIMIT for c in caption_pool):
+            raise ConfigError(f"Every POST_CAPTIONS entry must be at most {TELEGRAM_CAPTION_LIMIT} characters")
+        footer = (env.get("POST_FOOTER") or "").replace("\\n", "\n").strip()
+        if len(footer) > 200:
+            raise ConfigError("POST_FOOTER must be at most 200 characters")
+
         public_channel = normalize_channel(env.get("PUBLIC_CHANNEL") or "@yourshakhira")
         admin_chat_id = (env.get("ADMIN_CHAT_ID") or "").strip()
         if admin_chat_id:
@@ -100,7 +111,7 @@ class PosterConfig:
             folder=folder,
             folder_mode=_choice(env, "CLOUDINARY_FOLDER_MODE", "auto", {"auto", "dynamic", "fixed"}),
             caption=caption,
-            selection=_choice(env, "POST_SELECTION", "oldest", {"oldest", "random"}),
+            selection=_choice(env, "POST_SELECTION", "oldest", {"oldest", "random", "smart"}),
             when_exhausted=_choice(env, "POST_WHEN_EXHAUSTED", "stop", {"stop", "restart"}),
             max_photo_bytes=_int(env, "MAX_PHOTO_BYTES", TELEGRAM_PHOTO_LIMIT, 1, TELEGRAM_PHOTO_LIMIT),
             max_video_bytes=_int(env, "MAX_VIDEO_BYTES", TELEGRAM_FILE_LIMIT, 1, TELEGRAM_FILE_LIMIT),
@@ -109,6 +120,8 @@ class PosterConfig:
             low_stock_threshold=_int(env, "LOW_STOCK_THRESHOLD", 5, 0, 10_000),
             admin_chat_id=admin_chat_id,
             slot_times=slot_times,
+            caption_pool=caption_pool,
+            footer=footer,
         )
 
     def secrets(self) -> list[str]:
