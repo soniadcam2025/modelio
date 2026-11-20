@@ -1,0 +1,22 @@
+# SEND-ONLY worker: scheduled posts, polls, reminders and dashboard actions.
+# It never receives Telegram updates, so it can run next to the live bot (like the GitHub poster).
+# Every feature it runs is off until switched on in the dashboard. Install only with the owner's approval.
+[Unit]
+Description=Shakhira send-only worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shakhira
+WorkingDirectory=/opt/shakhira-bot
+ExecStart=/opt/shakhira-bot/.venv/bin/python -m shakhira_bot --worker
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

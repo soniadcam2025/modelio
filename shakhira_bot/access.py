@@ -1,14 +1,17 @@
-"""VIP channel access: subscription link, trial links, membership status and trial expiry."""
+"""VIP channel access: subscription link, trial links, membership status, removals and trial expiry."""
 
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from telegram import ChatMember
+from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
+from . import texts
+from .alerts import NO_ALERTS, AdminAlerts
 from .config import Config
-from .storage import Storage, Trial
+from .payments import check_payment
+from .storage import REJECTED, Storage, Trial
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +19,20 @@ logger = logging.getLogger(__name__)
 SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60
 # How long a trial invite link stays usable (it is also single-use).
 TRIAL_LINK_TTL_SECONDS = 24 * 60 * 60
+# Most invite links one trial can ever receive (the first one plus re-issues from /status).
+MAX_TRIAL_LINKS = 3
+# Unban attempts before the admin is told that a removed member is still banned.
+UNBAN_ALERT_AFTER = 3
 MONTHLY_LINK_KEY = "monthly_link:"
+TRIAL_LINK_NAME_PREFIX = "trial "
+
+
+class TrialLinkLimitReached(Exception):
+    """The trial already received MAX_TRIAL_LINKS links."""
+
+
+class TrialLinkRevokeFailed(Exception):
+    """An earlier link could not be revoked, so no new link was issued (it could otherwise be shared)."""
 
 
 @dataclass(frozen=True)
@@ -63,42 +79,165 @@ async def get_membership(bot, cfg: Config, user_id: int) -> Membership:
     return Membership(in_channel=False)
 
 
+# Trial invite links
+
+
+async def revoke_trial_links(bot, store: Storage, cfg: Config, trial: Trial, now: int) -> bool:
+    """Revoke every link of this trial that is not revoked yet. Returns False if a live link survived.
+
+    A link whose own expiry date has passed is dead anyway, so failing to revoke it is not a problem.
+    """
+    all_dead = True
+    for link in store.unrevoked_trial_links(trial.id):
+        try:
+            await bot.revoke_chat_invite_link(chat_id=cfg.vip_channel_id, invite_link=link.invite_link)
+        except TelegramError:
+            if link.expires_at is not None and link.expires_at <= now:
+                logger.info("Trial %s link already expired; marking it revoked", trial.id)
+            else:
+                logger.warning("Could not revoke a link of trial %s", trial.id)
+                all_dead = False
+                continue
+        store.mark_link_revoked(link.invite_link, now)
+    return all_dead
+
+
 async def issue_trial_link(bot, store: Storage, cfg: Config, trial: Trial, now: int) -> str:
-    """Create a single-use invite link for a paid trial."""
+    """Create a single-use invite link for a paid trial, revoking any earlier link first.
+
+    Raises TrialLinkLimitReached after MAX_TRIAL_LINKS links, TrialLinkRevokeFailed if an earlier
+    link may still work, and TelegramError if Telegram refuses to create the link.
+    """
+    if store.trial_link_count(trial.id) >= MAX_TRIAL_LINKS:
+        raise TrialLinkLimitReached()
+    if not await revoke_trial_links(bot, store, cfg, trial, now):
+        raise TrialLinkRevokeFailed()
     expire = min(trial.expires_at, now + TRIAL_LINK_TTL_SECONDS)
     link = await bot.create_chat_invite_link(
         chat_id=cfg.vip_channel_id,
         expire_date=expire,
         member_limit=1,
-        name=f"trial {trial.user_id}"[:32],
+        name=f"{TRIAL_LINK_NAME_PREFIX}{trial.user_id}"[:32],
     )
-    store.set_trial_link(trial.id, link.invite_link)
+    store.add_trial_link(trial, link.invite_link, now, expire)
     return link.invite_link
 
 
-async def start_trial(bot, store: Storage, cfg: Config, user_id: int, charge_id: str, now: int) -> tuple[Trial, str | None]:
-    """Create the trial record for a verified payment and try to issue its invite link.
-
-    The trial is saved before any Telegram call, so a failed link can be re-issued later from /status.
-    """
-    current = store.active_trial(user_id, now)
-    starts_at = max(now, current.expires_at) if current else now
-    trial = store.create_trial(user_id, charge_id, starts_at, starts_at + cfg.trial_days * 86400)
+async def send_first_trial_link(bot, store: Storage, cfg: Config, trial: Trial, now: int,
+                                alerts: AdminAlerts = NO_ALERTS) -> str | None:
+    """Issue the first link for a newly paid trial. None if it failed (the user can retry from /status)."""
     try:
-        link = await issue_trial_link(bot, store, cfg, trial, now)
-    except TelegramError:
-        logger.exception("Trial paid but invite link failed (user %s, trial %s)", user_id, trial.id)
-        link = None
-    return trial, link
+        return await issue_trial_link(bot, store, cfg, trial, now)
+    except (TelegramError, TrialLinkLimitReached, TrialLinkRevokeFailed):
+        logger.exception("Trial paid but invite link failed (user %s, trial %s)", trial.user_id, trial.id)
+        await alerts.send(
+            bot,
+            f"Trial {trial.id} for user {trial.user_id} is paid, but its invite link could not be created. "
+            "The user can retry from /status. If this repeats, check the bot's admin rights in the VIP channel.",
+            key="trial-link-failed",
+        )
+        return None
 
 
-async def remove_from_channel(bot, cfg: Config, user_id: int) -> None:
-    """Remove a member without a permanent ban, so they can rejoin later by paying."""
+# Removing members
+
+
+async def remove_from_channel(bot, store: Storage, cfg: Config, user_id: int, now: int,
+                              alerts: AdminAlerts = NO_ALERTS) -> None:
+    """Remove a member without a permanent ban, so they can rejoin later by paying.
+
+    Raises TelegramError if the ban fails (the member is still in the channel; the caller retries).
+    If only the unban fails, the member is out but still banned: they are queued in pending_unbans
+    and retry_pending_unbans() keeps trying until the ban is lifted.
+    """
     await bot.ban_chat_member(chat_id=cfg.vip_channel_id, user_id=user_id)
-    await bot.unban_chat_member(chat_id=cfg.vip_channel_id, user_id=user_id, only_if_banned=True)
+    for _ in range(2):
+        try:
+            await bot.unban_chat_member(chat_id=cfg.vip_channel_id, user_id=user_id, only_if_banned=True)
+            store.clear_pending_unban(user_id)
+            return
+        except TelegramError:
+            logger.warning("Unban of user %s failed", user_id)
+    store.add_pending_unban(user_id, now)
+    logger.error("User %s was removed but is still banned; queued for unban retry", user_id)
 
 
-async def expire_trials(bot, store: Storage, cfg: Config, now: int) -> list[tuple[int, str]]:
+async def retry_pending_unbans(bot, store: Storage, cfg: Config, now: int,
+                               alerts: AdminAlerts = NO_ALERTS) -> list[int]:
+    """Retry every queued unban. Returns the user IDs that were unbanned now."""
+    done = []
+    for user_id, attempts in store.pending_unbans():
+        try:
+            await bot.unban_chat_member(chat_id=cfg.vip_channel_id, user_id=user_id, only_if_banned=True)
+        except TelegramError:
+            store.add_pending_unban(user_id, now)
+            if attempts + 1 == UNBAN_ALERT_AFTER:
+                await alerts.send(
+                    bot,
+                    f"User {user_id} was removed from the VIP channel but is still BANNED after "
+                    f"{attempts + 1} unban attempts, so they cannot rejoin even by paying. The bot keeps "
+                    "retrying; you can also unban them by hand in the channel's Removed users list.",
+                    key=f"unban-{user_id}",
+                )
+            continue
+        store.clear_pending_unban(user_id)
+        logger.info("Pending unban for user %s completed", user_id)
+        done.append(user_id)
+    return done
+
+
+# Joins through trial links
+
+
+async def handle_trial_link_join(bot, store: Storage, cfg: Config, user_id: int, invite_link: str,
+                                 link_name: str | None, is_admin: bool, now: int,
+                                 alerts: AdminAlerts = NO_ALERTS) -> str:
+    """Decide what to do when someone joins the VIP channel through a trial-style link.
+
+    Returns one of: joined_trial, admin, unknown_trial_link, unauthorized_removed, unauthorized_remove_failed.
+    """
+    trial = store.trial_for_link(invite_link)
+    if trial is None:
+        # Not a link this bot made (for example one from the older bot). Never remove on a guess.
+        await alerts.send(
+            bot, f"User {user_id} joined the VIP channel with a trial link this bot has no record of "
+            f"({link_name!r}). Nothing was changed; check it if unexpected.", key="unknown-trial-link",
+        )
+        return "unknown_trial_link"
+
+    own_active = trial.user_id == user_id and trial.status == "active" and trial.expires_at > now
+    if own_active:
+        store.mark_trial_joined(invite_link, user_id, now)
+        return "joined_trial"
+    if is_admin:
+        return "admin"
+
+    # Someone used another buyer's link, or a link of a trial that already ended.
+    reason = "another user's trial link" if trial.user_id != user_id else "a link of an ended trial"
+    if store.active_trial(user_id, now):
+        # The joiner has their own paid trial; let expiry handle them as usual.
+        await alerts.send(bot, f"User {user_id} joined via {reason} (trial {trial.id}) but has their own "
+                          "active trial, so they were not removed.")
+        return "joined_trial"
+    try:
+        await remove_from_channel(bot, store, cfg, user_id, now, alerts)
+    except TelegramError:
+        logger.exception("Could not remove unauthorized member %s", user_id)
+        await alerts.send(bot, f"User {user_id} joined the VIP channel via {reason} (trial {trial.id}) "
+                          "and could NOT be removed automatically. Please remove them by hand.")
+        return "unauthorized_remove_failed"
+    await revoke_trial_links(bot, store, cfg, trial, now)
+    logger.warning("Removed user %s who joined via %s (trial %s)", user_id, reason, trial.id)
+    await alerts.send(bot, f"Removed user {user_id}: they joined the VIP channel via {reason} "
+                      f"(trial {trial.id}, bought by user {trial.user_id}).", key=f"unauthorized-{trial.id}")
+    return "unauthorized_removed"
+
+
+# Trial expiry
+
+
+async def expire_trials(bot, store: Storage, cfg: Config, now: int,
+                        alerts: AdminAlerts = NO_ALERTS) -> list[tuple[int, str]]:
     """End every trial whose time is up. Returns (user_id, outcome) for each processed trial.
 
     A user is only removed when they have no newer trial, are not an admin, and have no
@@ -119,7 +258,7 @@ async def expire_trials(bot, store: Storage, cfg: Config, now: int) -> list[tupl
             elif membership.subscription_until and membership.subscription_until > now:
                 outcome = "converted"
             elif membership.in_channel:
-                await remove_from_channel(bot, cfg, user_id)
+                await remove_from_channel(bot, store, cfg, user_id, now, alerts)
                 outcome = "removed"
             else:
                 outcome = "not_in_channel"
@@ -131,9 +270,39 @@ async def expire_trials(bot, store: Storage, cfg: Config, now: int) -> list[tupl
             logger.exception("Could not end trial %s for user %s; will retry", trial.id, user_id)
             continue
 
-        if trial.invite_link and not trial.joined_at:
-            try:
-                await bot.revoke_chat_invite_link(chat_id=cfg.vip_channel_id, invite_link=trial.invite_link)
-            except TelegramError:
-                logger.warning("Could not revoke unused trial link for trial %s", trial.id)
+        await revoke_trial_links(bot, store, cfg, trial, now)
     return results
+
+
+# Recovery
+
+
+async def recover_unprocessed_payments(bot, store: Storage, cfg: Config, now: int,
+                                       alerts: AdminAlerts = NO_ALERTS) -> list[int]:
+    """Give a trial to any accepted trial payment that has none (e.g. data from before the atomic save).
+
+    Returns the user IDs that received a recovered trial.
+    """
+    recovered = []
+    for payment in store.trial_payments_without_trial():
+        if payment.status is None:  # saved by an older version: check it now
+            reason = check_payment(cfg, payment.currency, payment.amount, payment.payload, payment.user_id)
+            if reason:
+                store.set_payment_status(payment.charge_id, REJECTED)
+                await alerts.send(bot, f"Old payment from user {payment.user_id} ({payment.amount} {payment.currency}) "
+                                  f"did not match an offer ({reason}); no trial given. Consider a refund.")
+                continue
+        trial = store.create_trial_for_payment(payment, now, cfg.trial_days * 86400)
+        if trial is None:
+            continue
+        link = await send_first_trial_link(bot, store, cfg, trial, now, alerts)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Join VIP", url=link)]]) if link else None
+        try:
+            await bot.send_message(chat_id=trial.user_id, text=texts.trial_recovered(trial.expires_at, bool(link)),
+                                   reply_markup=markup)
+        except TelegramError:
+            logger.warning("Could not message user %s about their recovered trial", trial.user_id)
+        await alerts.send(bot, f"Recovered a paid trial for user {trial.user_id} (trial {trial.id}) "
+                          "that had no access recorded.")
+        recovered.append(trial.user_id)
+    return recovered

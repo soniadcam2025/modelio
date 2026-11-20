@@ -6,13 +6,18 @@ on:
   schedule:
     - cron: "30 16 * * *"  # 16:30 UTC = 10:00 PM IST
     - cron: "30 23 * * *"  # 23:30 UTC = 5:00 AM IST (next day in India)
+  # Manual runs, and the optional on-time external trigger (README: "On-time posting").
   workflow_dispatch:
     inputs:
       mode:
-        description: "check = permissions only, dry-run = pick an asset without posting, post = really post"
+        description: "check = permissions only, dry-run = pick an asset without posting, report = what is left, post = really post"
         type: choice
-        options: [check, dry-run, post]
+        options: [check, dry-run, report, post]
         default: dry-run
+      slot:
+        description: "post only: 'auto' = the 5 AM / 10 PM slot due now, posted at most once. Empty = a one-off extra post."
+        type: string
+        default: ""
       channel:
         description: "Optional test channel (e.g. @my_test_channel). Empty = the public channel. Test posts are not recorded."
         type: string
@@ -20,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: read  # read-only: look up when older GitHub runs posted an asset (for the 30-day reuse cooldown)
 
 # Never run two posting jobs at the same time; a second one waits instead of being cancelled.
 concurrency:
@@ -51,7 +57,23 @@ jobs:
           PUBLIC_CHANNEL: ${{ vars.PUBLIC_CHANNEL || '@yourshakhira' }}
           CLOUDINARY_FOLDER: ${{ vars.CLOUDINARY_FOLDER || 'tgpub' }}
           POST_CAPTION: ${{ vars.POST_CAPTION }}
-          # Scheduled runs (once enabled) have no inputs, so they always post.
+          POST_SELECTION: ${{ vars.POST_SELECTION }}
+          # Optional captions: a rotating pool (separate entries with ||) and a footer for every post.
+          POST_CAPTIONS: ${{ vars.POST_CAPTIONS }}
+          POST_FOOTER: ${{ vars.POST_FOOTER }}
+          # Unset = reuse: when no new media is left, repost the asset posted longest ago, but only after
+          # REUSE_COOLDOWN_DAYS (default 30). Set POST_WHEN_EXHAUSTED=stop to never repeat a post.
+          POST_WHEN_EXHAUSTED: ${{ vars.POST_WHEN_EXHAUSTED }}
+          REUSE_COOLDOWN_DAYS: ${{ vars.REUSE_COOLDOWN_DAYS }}
+          # Read-only token for the run-time lookup above (repository-scoped, expires with the job).
+          GITHUB_TOKEN: ${{ github.token }}
+          LOW_STOCK_THRESHOLD: ${{ vars.LOW_STOCK_THRESHOLD }}
+          # Optional: your Telegram user ID (or a private admin chat) for alerts. Never the public channel.
+          ADMIN_CHAT_ID: ${{ vars.ADMIN_CHAT_ID }}
+          # Which schedule line started this run; it identifies the slot so each slot is posted once.
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          POST_SLOT: ${{ inputs.slot }}
+          # Scheduled runs have no inputs, so they always post.
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'post' }}
           TEST_CHANNEL: ${{ inputs.channel }}
         run: |
@@ -59,6 +81,7 @@ jobs:
           case "$MODE" in
             check) args+=(--check) ;;
             dry-run) args+=(--dry-run) ;;
+            report) args+=(--report) ;;
             post) ;;
             *) echo "Unknown mode: $MODE"; exit 2 ;;
           esac

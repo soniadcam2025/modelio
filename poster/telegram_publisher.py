@@ -102,6 +102,11 @@ class TelegramPublisher:
             problems.append(f"@{me.get('username')} is an admin of {channel} but cannot post messages")
         return problems
 
+    def send_message(self, chat_id: str, text: str) -> int:
+        """Send a plain text message (used for admin alerts) and return its message ID."""
+        result = self._request("sendMessage", data={"chat_id": chat_id, "text": text[:4000]}, safe_to_repeat=True)
+        return result.get("message_id") if isinstance(result, dict) else 0
+
     def send_media(self, channel: str, kind: str, name: str, content: bytes, caption: str) -> int:
         """Upload the file and return the new message ID."""
         method = SEND_METHODS[kind]

@@ -35,7 +35,7 @@ def test_missing_secrets_are_named_without_values():
 def test_config_defaults_and_repr():
     cfg = PosterConfig.from_env(ENV)
     assert cfg.public_channel == "@yourshakhira" and cfg.folder == "tgpub" and cfg.folder_mode == "auto"
-    assert cfg.caption == "" and cfg.when_exhausted == "stop"
+    assert cfg.caption == "" and cfg.when_exhausted == "reuse" and cfg.reuse_cooldown_days == 30
     for secret in ENV.values():
         if secret != "demo":
             assert secret not in repr(cfg)

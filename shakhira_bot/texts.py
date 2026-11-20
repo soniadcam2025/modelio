@@ -159,3 +159,63 @@ def checkout_rejected() -> str:
 
 def generic_error() -> str:
     return "Sorry, something went wrong. Please try again."
+
+
+def trial_link_limit() -> str:
+    return (
+        "You've already received the maximum number of access links for this trial. "
+        "If you still can't get in, please use /paysupport."
+    )
+
+
+def trial_link_retry_later() -> str:
+    return "I couldn't replace your old access link just now. Please try again in a few minutes or use /paysupport."
+
+
+def trial_recovered(expires_at: int, has_link: bool) -> str:
+    text = (
+        "✅ Your earlier trial payment has now been activated.\n\n"
+        f"Your trial runs until {fmt_date(expires_at)}.\n"
+    )
+    if has_link:
+        return text + "Tap below to join. This link works once and only for you."
+    return text + "Send /status in a minute to get your access link."
+
+
+def trial_ending(expires_at: int, cfg: Config, monthly_link: str | None) -> str:
+    text = (
+        f"⏳ Your VIP trial ends on {fmt_date(expires_at)}.\n\n"
+        f"To keep your access, continue with VIP Monthly — {cfg.monthly_price} ⭐ every 30 days."
+    )
+    return text + (f"\n{monthly_link}" if monthly_link else "\nSend /subscribe to continue.")
+
+
+def renewal_coming(until: int) -> str:
+    return (
+        f"💎 Your VIP Monthly renews on {fmt_date(until)}.\n\n"
+        "Telegram renews it automatically with Stars. Make sure you have enough Stars, or cancel any time in "
+        "Telegram: Settings → My Stars."
+    )
+
+
+def admin_stats(stats: dict) -> str:
+    return (
+        "📊 VIP bot status\n\n"
+        f"Stars received (30 days): {stats['stars_total']}\n"
+        f"Trials started (30 days): {stats['trials']['started']}, converted: {stats['trials']['converted']}\n"
+        f"Scheduled posts waiting: {stats['scheduled']}\n"
+        f"Pending join requests: {stats['join_pending']}\n"
+        f"Queued admin actions: {stats['actions_queued']}"
+    )
+
+
+def join_request_vip(cfg: Config) -> str:
+    return (
+        "Thanks for your interest in CuteShakhira VIP 💎\n\n"
+        f"{plans(cfg)}\n\n"
+        "Send /subscribe to choose a plan. Your request will be reviewed."
+    )
+
+
+def moderation_warning(name: str) -> str:
+    return f"{name}, your message was removed because it broke the group rules. Repeated breaks lead to a 24-hour mute."

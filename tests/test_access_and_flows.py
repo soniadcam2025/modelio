@@ -197,7 +197,7 @@ def test_status_messages():
 def test_application_builds_without_network():
     app = build_application(make_config(), Storage(":memory:"))
     commands = {c for h in app.handlers[0] for c in getattr(h, "commands", ())}
-    assert commands == {"start", "subscribe", "status", "rules", "paysupport"}
+    assert commands == {"start", "subscribe", "status", "rules", "paysupport", "admin"}  # /admin: admins only
     assert app.job_queue is not None
 
 

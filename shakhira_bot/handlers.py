@@ -14,7 +14,8 @@ from telegram import (
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
-from . import access, texts
+from . import access, backup, texts
+from .alerts import NO_ALERTS, AdminAlerts
 from .config import Config
 from .payments import STARS_CURRENCY, TRIAL_PLAN, check_payment, make_payload, parse_payload
 from .storage import Storage
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 def _deps(context: ContextTypes.DEFAULT_TYPE) -> tuple[Config, Storage]:
     return context.application.bot_data["config"], context.application.bot_data["storage"]
+
+
+def _alerts(context: ContextTypes.DEFAULT_TYPE) -> AdminAlerts:
+    return context.application.bot_data.get("alerts", NO_ALERTS)
 
 
 # Keyboards
@@ -117,32 +122,71 @@ async def trial_block_reason(bot, store: Storage, cfg: Config, user_id: int) -> 
 
 
 async def process_trial_payment(
-    bot, store: Storage, cfg: Config, user_id: int, payment: SuccessfulPayment, now: int
+    bot, store: Storage, cfg: Config, user_id: int, payment: SuccessfulPayment, now: int,
+    alerts: AdminAlerts = NO_ALERTS,
 ) -> tuple[str, InlineKeyboardMarkup | None] | None:
-    """Grant a trial for a verified Stars payment. Returns None for a duplicate payment update."""
+    """Grant a trial for a verified Stars payment.
+
+    The payment and its trial are saved in one transaction, so a crash cannot leave a paid trial
+    without access. Telegram re-sends the update after a crash; for that duplicate, the buyer gets
+    their first link if it was never issued. Any other duplicate returns None (nothing to send).
+    """
     reason = check_payment(cfg, payment.currency, payment.total_amount, payment.invoice_payload, user_id)
     parsed = parse_payload(payment.invoice_payload)
     plan = parsed[0] if parsed else "unknown"
-    is_new = store.record_payment(
-        payment.telegram_payment_charge_id,
-        user_id,
-        plan,
-        payment.total_amount,
-        payment.currency,
-        payment.invoice_payload,
-        now,
+    charge_id = payment.telegram_payment_charge_id
+    is_new, trial = store.record_trial_payment(
+        charge_id, user_id, plan, payment.total_amount, payment.currency, payment.invoice_payload, now,
+        accepted=reason is None, trial_seconds=cfg.trial_days * 86400,
     )
+
     if not is_new:
-        logger.warning("Duplicate payment update ignored (user %s)", user_id)
-        return None
-    if reason:
+        trial = store.trial_for_charge(charge_id)
+        if trial is None or trial.user_id != user_id or store.trial_link_count(trial.id) > 0:
+            logger.warning("Duplicate payment update ignored (user %s)", user_id)
+            return None
+        if trial.status != "active" or trial.expires_at <= now:
+            return None
+        logger.warning("Re-delivered payment for trial %s had no link yet; issuing it now", trial.id)
+    elif reason:
         logger.error("Payment from user %s did not match an offer (%s); access NOT granted", user_id, reason)
+        await alerts.send(
+            bot,
+            f"User {user_id} paid {payment.total_amount} {payment.currency} but the payment did not match an "
+            f"offer ({reason}), so NO access was given. Check it and consider a refund.",
+        )
         return texts.support(cfg), None
 
-    trial, link = await access.start_trial(bot, store, cfg, user_id, payment.telegram_payment_charge_id, now)
-    logger.info("Trial %s started for user %s until %s", trial.id, user_id, trial.expires_at)
+    logger.info("Trial %s for user %s runs until %s", trial.id, user_id, trial.expires_at)
+    link = await access.send_first_trial_link(bot, store, cfg, trial, now, alerts)
     if link is None:
         return texts.trial_paid_link_failed(), None
+    return texts.trial_paid(trial.expires_at), link_button("🔑 Join VIP", link)
+
+
+async def reissue_trial_link(bot, store: Storage, cfg: Config, user_id: int, now: int,
+                             ) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The "Get my access link" button: a new link only for a buyer who is not in the channel yet."""
+    trial = store.active_trial(user_id, now)
+    if trial is None:
+        return texts.status_none(), plans_menu(cfg)
+    try:
+        membership = await access.get_membership(bot, cfg, user_id)
+    except TelegramError:
+        logger.exception("Membership check failed for user %s", user_id)
+        return texts.status_unavailable(), None
+    if membership.in_channel:
+        return texts.status_trial(trial.expires_at), None
+    try:
+        link = await access.issue_trial_link(bot, store, cfg, trial, now)
+    except access.TrialLinkLimitReached:
+        logger.warning("Trial %s reached the link limit (user %s)", trial.id, user_id)
+        return texts.trial_link_limit(), None
+    except access.TrialLinkRevokeFailed:
+        return texts.trial_link_retry_later(), None
+    except TelegramError:
+        logger.exception("Could not re-issue trial link for user %s", user_id)
+        return texts.link_error(), None
     return texts.trial_paid(trial.expires_at), link_button("🔑 Join VIP", link)
 
 
@@ -206,16 +250,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif query.data == "status":
         text, markup = await build_status(bot, store, cfg, user_id, now)
     elif query.data == "trial_link":
-        trial = store.active_trial(user_id, now)
-        if trial is None:
-            text, markup = texts.status_none(), plans_menu(cfg)
-        else:
-            try:
-                link = await access.issue_trial_link(bot, store, cfg, trial, now)
-                text, markup = texts.trial_paid(trial.expires_at), link_button("🔑 Join VIP", link)
-            except TelegramError:
-                logger.exception("Could not re-issue trial link for user %s", user_id)
-                text, markup = texts.link_error(), None
+        text, markup = await reissue_trial_link(bot, store, cfg, user_id, now)
     elif query.data == "support":
         text, markup = texts.support(cfg), None
     else:
@@ -246,7 +281,8 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cfg, store = _deps(context)
     message = update.effective_message
     result = await process_trial_payment(
-        context.bot, store, cfg, update.effective_user.id, message.successful_payment, int(time.time())
+        context.bot, store, cfg, update.effective_user.id, message.successful_payment, int(time.time()),
+        _alerts(context),
     )
     if result:
         text, markup = result
@@ -262,38 +298,45 @@ def _in_channel(member: ChatMember) -> bool:
     return member.status == ChatMember.RESTRICTED and bool(getattr(member, "is_member", False))
 
 
-async def channel_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg, store = _deps(context)
-    change = update.chat_member
+async def process_member_change(bot, store: Storage, cfg: Config, change, now: int,
+                                alerts: AdminAlerts = NO_ALERTS) -> str | None:
+    """Log joins/leaves of the VIP channel and act on joins through trial links. Returns the event name."""
     if change is None or change.chat.id != cfg.vip_channel_id:
-        return
+        return None
     was_in, now_in = _in_channel(change.old_chat_member), _in_channel(change.new_chat_member)
     if was_in == now_in:
-        return
+        return None
 
     user_id = change.new_chat_member.user.id
-    now = int(time.time())
     invite = change.invite_link
-    if now_in:
-        until = access.to_ts(getattr(change.new_chat_member, "until_date", None))
-        event = "joined_subscription" if invite and invite.subscription_period else "joined"
-        if invite and invite.name and invite.name.startswith("trial "):
-            if store.mark_trial_joined(invite.invite_link, user_id, now):
-                event = "joined_trial"
-            else:
-                logger.warning("User %s joined with someone else's trial link %r", user_id, invite.name)
-        store.log_member_event(user_id, event, invite.name if invite else None, until, now)
-    else:
+    if not now_in:
         store.log_member_event(user_id, "left", None, None, now)
+        return "left"
+
+    until = access.to_ts(getattr(change.new_chat_member, "until_date", None))
+    event = "joined_subscription" if invite and invite.subscription_period else "joined"
+    if invite and invite.name and invite.name.startswith(access.TRIAL_LINK_NAME_PREFIX):
+        is_admin = change.new_chat_member.status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR)
+        event = await access.handle_trial_link_join(
+            bot, store, cfg, user_id, invite.invite_link, invite.name, is_admin, now, alerts
+        )
+    store.log_member_event(user_id, event, invite.name if invite else None, until, now)
+    return event
 
 
-# Scheduled trial expiry
-
-
-async def expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def channel_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg, store = _deps(context)
-    bot = context.bot
-    results = await access.expire_trials(bot, store, cfg, int(time.time()))
+    await process_member_change(context.bot, store, cfg, update.chat_member, int(time.time()), _alerts(context))
+
+
+# Scheduled jobs
+
+
+async def run_maintenance(bot, store: Storage, cfg: Config, now: int, alerts: AdminAlerts = NO_ALERTS) -> None:
+    """One maintenance pass: finish pending unbans, recover unprocessed payments, end expired trials."""
+    await access.retry_pending_unbans(bot, store, cfg, now, alerts)
+    await access.recover_unprocessed_payments(bot, store, cfg, now, alerts)
+    results = await access.expire_trials(bot, store, cfg, now, alerts)
     for user_id, outcome in results:
         if outcome not in ("removed", "not_in_channel"):
             continue
@@ -311,8 +354,37 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Could not send trial-ended message to user %s", user_id)
 
 
+async def expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg, store = _deps(context)
+    await run_maintenance(context.bot, store, cfg, int(time.time()), _alerts(context))
+
+
+async def worker_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled posts, polls, reminders and dashboard actions (each only if its feature is on)."""
+    from . import scheduler
+
+    cfg, store = _deps(context)
+    await scheduler.run_cycle(context.bot, store, cfg, int(time.time()), _alerts(context))
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg, store = _deps(context)
+    try:
+        backup.make_backup(store, cfg.backup_dir, cfg.backup_keep, time.time())
+    except Exception as exc:  # noqa: BLE001 - any failure must reach the admin, never crash the bot
+        logger.exception("Database backup failed")
+        await _alerts(context).send(context.bot, f"Database backup failed: {type(exc).__name__}: {exc}",
+                                    key="backup-failed")
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled error while processing an update", exc_info=context.error)
+    cfg, _ = _deps(context)
+    error = context.error
+    detail = f"{type(error).__name__}: {error}".replace(cfg.bot_token, "[REDACTED]")
+    await _alerts(context).send(
+        context.bot, f"Unhandled error: {detail}. Details are in the bot's log.", key=f"error-{type(error).__name__}"
+    )
     # Only reply in private chats, never inside the VIP channel.
     if isinstance(update, Update) and update.effective_chat and update.effective_chat.type == "private":
         try:

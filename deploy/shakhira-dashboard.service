@@ -1,0 +1,21 @@
+# Web admin dashboard. Listens on 127.0.0.1:8080 only; reach it with an SSH tunnel
+# (ssh -L 8080:127.0.0.1:8080 you@server) or put an HTTPS reverse proxy in front.
+# It holds no Telegram token: it only reads the database and queues requests for the worker.
+[Unit]
+Description=Shakhira admin dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=shakhira
+WorkingDirectory=/opt/shakhira-bot
+ExecStart=/opt/shakhira-bot/.venv/bin/python -m dashboard serve
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

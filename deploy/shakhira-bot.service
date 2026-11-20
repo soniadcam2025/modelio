@@ -1,3 +1,5 @@
+# FULL bot (receives updates). Only after the current live bot is retired: Telegram gives a token's
+# updates to one program, and this one also refuses to start while a webhook is set.
 # systemd service that keeps the bot running 24/7 on a Linux server (VPS).
 # Install steps are in README.md ("Run 24/7 on a server").
 [Unit]
