@@ -32,3 +32,11 @@ jobs:
 
       - name: Run tests
         run: pytest -q --cov=shakhira_bot --cov=poster --cov=dashboard --cov=tools --cov-report=term-missing
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cloudflare Worker tests (no network)
+        working-directory: cloudflare
+        run: npm test

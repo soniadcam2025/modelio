@@ -1,0 +1,13 @@
+{
+  "name": "shakhira-admin-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "deploy:staging": "node build.mjs && wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}

@@ -91,7 +91,7 @@ async function act(fn, success) {
 }
 
 const STATUS_CHIP = {
-  posted: "good", scheduled: "info", draft: "", sending: "warn", failed: "bad", uncertain: "warn", cancelled: "",
+  posted: "good", scheduled: "info", simulated: "info", draft: "", sending: "warn", failed: "bad", uncertain: "warn", cancelled: "",
   approved: "good", declined: "", pending: "warn", done: "good", queued: "info",
   monthly: "good", trial: "info", left: "", none: "",
 };
@@ -258,6 +258,9 @@ async function pageOverview(main) {
   const worker = o.worker_last_seen && Date.now() / 1000 - o.worker_last_seen < 600;
   put(main, 
     head("Overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
+    o.environment === "staging" ? h("div", { class: "banner warn" }, o.automation === "preview"
+      ? "STAGING: automation sends only to the private preview chat. Nothing reaches the channels or members."
+      : "STAGING: automation is simulated. Nothing is sent to Telegram.") : null,
     offCount === Object.keys(o.features).length
       ? h("div", { class: "banner warn" }, "All automated features are switched off. Turn them on one by one in Features & settings once the worker is running.")
       : null,
@@ -286,7 +289,7 @@ const kpi = (label, value, sub) => h("div", { class: "card kpi" }, h("div", { cl
 async function pageContent(main) {
   const filter = new URLSearchParams(location.hash.split("?")[1] || "").get("status") || "";
   const [items, captions] = await Promise.all([api("/api/content" + (filter ? `?status=${filter}` : "")), api("/api/captions")]);
-  const tabs = h("div", { class: "tabs", role: "tablist" }, ["", "scheduled", "draft", "posted", "failed", "uncertain"].map((st) =>
+  const tabs = h("div", { class: "tabs", role: "tablist" }, ["", "scheduled", "draft", "posted", "simulated", "failed", "uncertain"].map((st) =>
     h("button", { class: st === filter ? "active" : "", role: "tab", "aria-selected": String(st === filter),
       onclick: () => (location.hash = st ? `#content?status=${st}` : "#content") }, st ? st[0].toUpperCase() + st.slice(1) : "All")));
   put(main, 
