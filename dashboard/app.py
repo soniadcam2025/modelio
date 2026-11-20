@@ -389,7 +389,7 @@ def _load_poster(settings: Settings) -> dict:
     cfg = PosterConfig(telegram_bot_token="unused", cloud_name=c["cloud_name"], api_key=c["api_key"],
                        api_secret=c["api_secret"], folder=c["folder"], slot_times=settings.slot_times)
     assets = CloudinarySource(c["cloud_name"], c["api_key"], c["api_secret"], c["folder"]).list_assets()
-    inv = runner.inventory(cfg, assets)
+    inv = runner.inventory(cfg, assets, time.time())
     library = []
     for a in sorted(assets, key=lambda x: x.created_at, reverse=True)[:200]:
         kind, reason = media.classify(a, cfg)
@@ -400,5 +400,6 @@ def _load_poster(settings: Settings) -> dict:
                         "thumb": thumb, "bytes": a.bytes, "created_at": a.created_at, "caption": a.caption,
                         "note": "" if kind else reason})
     return {"folder": c["folder"], "inventory": {k: getattr(inv, k) for k in
-            ("total", "supported", "unsupported", "posted", "uncertain", "rejected", "remaining")},
+            ("total", "supported", "unsupported", "posted", "uncertain", "rejected", "remaining", "reusable_now",
+             "next_reuse_at", "unknown_time")},
             "recent_slots": [{"slot": s, "asset": n} for s, n in inv.slots[:20]], "library": library}

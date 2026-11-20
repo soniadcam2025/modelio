@@ -6,6 +6,12 @@ Posting history lives in Cloudinary tags on each asset, so it survives between G
   tgbot_rejected            Telegram refused the file; skipped until you remove the tag
   tgbot_run_<run id>        which GitHub Actions run posted it (stops a re-run from posting again)
   tgbot_slot_<slot>         which scheduled slot it was posted for (stops a second post in the same slot)
+  tgbot_at_<unix time>      when it was last posted successfully (only the latest is kept)
+
+Rotation: new (never posted) assets always come first. When none are left, the asset whose last
+post is the OLDEST is reused, but only once REUSE_COOLDOWN_DAYS (default 30) have passed since that
+post. Posting-history tags are never removed to start a new round. If nothing qualifies, the run
+posts nothing, fails, and the admin is alerted.
   tgbot_claim_<time>_<id>   short-lived lock while a run is posting the asset
 Only these tags are added or removed; your own tags are never touched.
 """
@@ -32,6 +38,7 @@ REJECTED_TAG = "tgbot_rejected"
 CLAIM_PREFIX = "tgbot_claim_"
 RUN_PREFIX = "tgbot_run_"
 SLOT_PREFIX = "tgbot_slot_"
+AT_PREFIX = "tgbot_at_"
 MAX_CANDIDATES = 5
 
 # Exit codes. A green workflow run now means a post was made (or was correctly not needed).
@@ -51,6 +58,7 @@ class Result:
     detail: str = ""
     remaining: int | None = None  # unpublished assets left after this run
     slot: str | None = None
+    reused: bool = False  # True when no new asset was left and an older post was repeated
 
     @property
     def exit_code(self) -> int:
@@ -94,6 +102,57 @@ def is_blocked(asset: Asset) -> bool:
     return bool({POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(asset.tags))
 
 
+def at_tag(timestamp: float) -> str:
+    return f"{AT_PREFIX}{int(timestamp)}"
+
+
+def tagged_time(tags) -> int | None:
+    """The newest tgbot_at_ timestamp in these tags."""
+    times = []
+    for tag in tags:
+        if tag.startswith(AT_PREFIX):
+            try:
+                times.append(int(tag[len(AT_PREFIX):]))
+            except ValueError:
+                pass
+    return max(times) if times else None
+
+
+def history_time(tags, run_time=None) -> tuple[int | None, str]:
+    """When an asset was last posted, and how that is known.
+
+    1. tgbot_at_<time> (written on every post since smart rotation),
+    2. the newest tgbot_slot_<slot> (the scheduled time of a slot-guarded post),
+    3. the GitHub run in tgbot_run_<id>, looked up with run_time(id) (posts made before either tag existed).
+    Unknown -> (None, "unknown"): such an asset is never reused.
+    """
+    from .slots import slot_time
+
+    at = tagged_time(tags)
+    if at is not None:
+        return at, "tag"
+    slots = sorted(t[len(SLOT_PREFIX):] for t in tags if t.startswith(SLOT_PREFIX))
+    if slots:
+        try:
+            return int(slot_time(slots[-1]).timestamp()), "slot"
+        except ValueError:
+            pass
+    if run_time is not None:
+        found = [run_time(t[len(RUN_PREFIX):]) for t in tags if t.startswith(RUN_PREFIX)]
+        found = [f for f in found if f]
+        if found:
+            return max(found), "run"
+    return None, "unknown"
+
+
+def reusable(asset: Asset, now: float, cooldown_seconds: int, run_time=None) -> tuple[bool, int | None]:
+    """(can be reposted now, last posted time). Uncertain/rejected assets are never reused."""
+    if POSTED_TAG not in asset.tags or {UNCERTAIN_TAG, REJECTED_TAG} & set(asset.tags):
+        return False, None
+    last, _ = history_time(asset.tags, run_time)
+    return (last is not None and now - last >= cooldown_seconds), last
+
+
 @dataclass(frozen=True)
 class Inventory:
     total: int
@@ -104,11 +163,26 @@ class Inventory:
     rejected: int
     remaining: int  # supported and not posted, uncertain or rejected
     slots: tuple[tuple[str, str], ...]  # (slot ID, asset name), newest first
+    reusable_now: int = 0  # posted assets past the reuse cooldown
+    next_reuse_at: int | None = None  # when the next posted asset leaves its cooldown
+    unknown_time: int = 0  # posted assets whose last posting time is unknown (never reused)
 
 
-def inventory(cfg: PosterConfig, assets: list[Asset]) -> Inventory:
-    """Read-only summary of the folder: what was posted and what is left."""
+def inventory(cfg: PosterConfig, assets: list[Asset], now: float | None = None, run_time=None) -> Inventory:
+    """Read-only summary of the folder: what was posted, what is left, and what can be reused when."""
+    now = time.time() if now is None else now
+    cooldown = cfg.reuse_cooldown_days * 86400
     supported = [a for a in assets if media.classify(a, cfg)[0] is not None]
+    reuse_now, waiting, unknown = 0, [], 0
+    for a in supported:
+        ok, last = reusable(a, now, cooldown, run_time)
+        if ok:
+            reuse_now += 1
+        elif POSTED_TAG in a.tags and not {UNCERTAIN_TAG, REJECTED_TAG} & set(a.tags):
+            if last is None:
+                unknown += 1
+            else:
+                waiting.append(last + cooldown)
     slots = sorted(
         ((t[len(SLOT_PREFIX):], a.name) for a in assets for t in a.tags if t.startswith(SLOT_PREFIX)),
         reverse=True,
@@ -122,6 +196,9 @@ def inventory(cfg: PosterConfig, assets: list[Asset]) -> Inventory:
         rejected=sum(REJECTED_TAG in a.tags for a in supported),
         remaining=sum(not is_blocked(a) for a in supported),
         slots=tuple(slots),
+        reusable_now=reuse_now,
+        next_reuse_at=min(waiting) if waiting else None,
+        unknown_time=unknown,
     )
 
 
@@ -172,7 +249,7 @@ def smart_order(eligible: list[tuple[Asset, str]], last_kind: str | None) -> lis
 
 def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublisher, http: httpx.Client, *,
         dry_run: bool = False, channel: str | None = None, clock=time.time, rng: random.Random | None = None,
-        slot: str | None = None) -> Result:
+        slot: str | None = None, run_time=None) -> Result:
     target = channel or cfg.public_channel
     record_history = target == cfg.public_channel
     ttl = cfg.claim_ttl_minutes * 60
@@ -223,43 +300,65 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         return Result("no_content", detail="no supported media", remaining=0, slot=slot)
 
     now = clock()
+    cooldown = cfg.reuse_cooldown_days * 86400
+    writes = record_history and not dry_run
 
-    def eligible_list():
-        return [(a, k) for a, k in supported
-                if not is_blocked(a) and not fresh_claims(a.tags, now, ttl)]
-
-    eligible = eligible_list()
-    if not eligible:
-        all_posted = [a for a, _ in supported if POSTED_TAG in a.tags]
-        if cfg.when_exhausted == "restart" and all_posted and not dry_run and record_history:
-            logger.info("All %s assets were posted; starting a new rotation", len(all_posted))
-            try:
-                source.remove_tag(POSTED_TAG, all_posted)
-            except SourceError as exc:
-                logger.error("Could not start a new rotation: %s", exc)
-                return Result("failed", detail=str(exc))
-            supported = [(_without_tag(a, POSTED_TAG), k) for a, k in supported]
-            eligible = eligible_list()
-        if not eligible:
-            in_use = [a for a, _ in supported if not is_blocked(a)]
-            if in_use:
-                logger.error("All %s unpublished asset(s) are claimed by another run right now", len(in_use))
-                return Result("nothing_to_post", detail="all remaining assets in use", slot=slot)
-            logger.error("Every supported asset has already been posted; nothing new to post. "
-                         "Upload new media to %r (recycling old posts is off).", cfg.folder)
-            return Result("no_content", detail="all posted", remaining=0, slot=slot)
-
-    if cfg.selection == "random":
-        (rng or random.Random()).shuffle(eligible)
-    elif cfg.selection == "smart":
-        eligible = smart_order(eligible, last_posted_kind(supported))
+    # 1. New, never-posted content always comes first.
+    eligible = [(a, k) for a, k in supported if not is_blocked(a) and not fresh_claims(a.tags, now, ttl)]
+    reusing = False
+    if eligible:
+        if cfg.selection == "random":
+            (rng or random.Random()).shuffle(eligible)
+        elif cfg.selection == "smart":
+            eligible = smart_order(eligible, last_posted_kind(supported))
+        else:
+            eligible.sort(key=lambda pair: (pair[0].created_at, pair[0].public_id))
     else:
-        eligible.sort(key=lambda pair: (pair[0].created_at, pair[0].public_id))
-    logger.info("%s eligible asset(s); next: %s", len(eligible), eligible[0][0].name)
+        in_use = [a for a, _ in supported if not is_blocked(a)]
+        if in_use:
+            logger.error("All %s unpublished asset(s) are claimed by another run right now", len(in_use))
+            return Result("nothing_to_post", detail="all remaining assets in use", slot=slot)
+        if cfg.when_exhausted == "stop":
+            logger.error("Every supported asset has already been posted; nothing new to post. "
+                         "Upload new media to %r (reuse of old posts is off).", cfg.folder)
+            return Result("no_content", detail="all posted", remaining=0, slot=slot)
+        # 2. No new content: reuse the asset posted longest ago, once it is past the cooldown.
+        if writes:
+            _backfill_times(source, supported, run_time)
+        timed = []
+        waiting = []
+        unknown = 0
+        for a, k in supported:
+            if fresh_claims(a.tags, now, ttl):
+                continue
+            ok, last = reusable(a, now, cooldown, run_time)
+            if ok:
+                timed.append((last, a, k))
+            elif last is not None and POSTED_TAG in a.tags:
+                waiting.append(last + cooldown)
+            elif POSTED_TAG in a.tags and not {UNCERTAIN_TAG, REJECTED_TAG} & set(a.tags):
+                unknown += 1
+        if not timed:
+            detail = f"all posted; none is past the {cfg.reuse_cooldown_days}-day reuse cooldown yet"
+            if waiting:
+                detail += "; next one qualifies " + datetime.fromtimestamp(min(waiting), tz=IST).strftime(
+                    "%d %b %Y %H:%M IST")
+            if unknown:
+                detail += f"; {unknown} posted asset(s) have no known posting time and are never reused"
+            logger.error("Nothing to post: %s. Upload new media to %r.", detail, cfg.folder)
+            return Result("no_content", detail=detail, remaining=0, slot=slot)
+        timed.sort(key=lambda t: (t[0], t[1].created_at, t[1].public_id))
+        eligible = [(a, k) for _, a, k in timed]
+        reusing = True
+        logger.info("No new content left; reusing the oldest post past the %s-day cooldown",
+                    cfg.reuse_cooldown_days)
 
+    logger.info("%s eligible asset(s); next: %s%s", len(eligible), eligible[0][0].name,
+                " (reuse)" if reusing else "")
     if dry_run:
-        return Result("dry_run", asset=eligible[0][0].name, remaining=len(eligible), slot=slot)
-    remaining_after = len(eligible) - 1
+        return Result("dry_run", asset=eligible[0][0].name, remaining=0 if reusing else len(eligible), slot=slot,
+                      reused=reusing)
+    remaining_after = 0 if reusing else len(eligible) - 1
     posted_count = sum(POSTED_TAG in a.tags for a, _ in supported)  # rotates the caption pool
 
     for asset, kind in eligible[:MAX_CANDIDATES]:
@@ -274,7 +373,13 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             return Result("failed", asset=asset.name, detail=str(exc), slot=slot)
 
         others = [t for t in fresh_claims(current, clock(), ttl) if t != claim]
-        if {POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(current) or others:
+        if reusing:
+            # Re-check with fresh tags: another run may have reposted it, or it may be marked bad now.
+            still_ok = reusable(replace(asset, tags=tuple(current)), clock(), cooldown, run_time)[0]
+            taken = not still_ok
+        else:
+            taken = bool({POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(current))
+        if taken or others:
             logger.info("%s is already posted or claimed by another run; trying the next asset", asset.name)
             _release(source, claim, asset)
             continue
@@ -316,27 +421,54 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         if not record_history:
             _release(source, claim, asset)
             return Result("posted", asset=asset.name, message_id=message_id, detail="test target, not recorded",
-                          remaining=remaining_after)
+                          remaining=remaining_after, reused=reusing)
+        posted_at = int(clock())
         try:
             source.add_tag(POSTED_TAG, [asset])
+            source.add_tag(at_tag(posted_at), [asset])
             if cfg.run_id:
                 source.add_tag(run_tag(cfg.run_id), [asset])
             if slot:
                 source.add_tag(slot_tag(slot), [asset])
-            logger.info("Recorded %s as posted (tag %r)", asset.name, POSTED_TAG)
+            logger.info("Recorded %s as posted at %s (tag %r)", asset.name, posted_at, POSTED_TAG)
         except SourceError as exc:
             logger.error("POSTED %s but could not record it in Cloudinary: %s. Add the tag %r to it by hand.",
                          asset.name, exc, POSTED_TAG)
             return Result("unrecorded", asset=asset.name, message_id=message_id, detail=str(exc), slot=slot)
+        # Keep only the newest posting time on the asset (older tgbot_at_ tags are superseded, not history).
+        for old in {t for t in current if t.startswith(AT_PREFIX) and t != at_tag(posted_at)}:
+            try:
+                source.remove_tag(old, [asset])
+            except SourceError:
+                logger.warning("Could not remove the superseded tag %s from %s", old, asset.name)
         _release(source, claim, asset)
-        return Result("posted", asset=asset.name, message_id=message_id, remaining=remaining_after, slot=slot)
+        return Result("posted", asset=asset.name, message_id=message_id, remaining=remaining_after, slot=slot,
+                      detail="reused an older post (no new content left)" if reusing else "", reused=reusing)
 
     logger.error("No asset could be posted this run (downloads failed or assets were taken by another run)")
     return Result("nothing_to_post", detail="candidates unavailable", slot=slot)
 
 
-def _without_tag(asset: Asset, tag: str) -> Asset:
-    return replace(asset, tags=tuple(t for t in asset.tags if t != tag))
+def _backfill_times(source: CloudinarySource, supported: list[tuple[Asset, str]], run_time) -> None:
+    """Save a tgbot_at_ tag on posted assets that don't have one yet (posts from before smart rotation).
+
+    The time comes from their slot tag or from the GitHub run that posted them. Best effort: an asset
+    whose time can't be found is left alone and is simply never reused.
+    """
+    by_time: dict[int, list[Asset]] = {}
+    for asset, _ in supported:
+        if POSTED_TAG in asset.tags and tagged_time(asset.tags) is None:
+            last, how = history_time(asset.tags, run_time)
+            if last is not None:
+                by_time.setdefault(last, []).append(asset)
+    for timestamp, assets in by_time.items():
+        try:
+            source.add_tag(at_tag(timestamp), assets)
+        except SourceError as exc:
+            logger.warning("Could not save posting times for %s asset(s): %s", len(assets), exc)
+            continue
+    if by_time:
+        logger.info("Saved the last posting time on %s older asset(s)", sum(map(len, by_time.values())))
 
 
 def _release(source: CloudinarySource, claim: str, asset: Asset) -> None:

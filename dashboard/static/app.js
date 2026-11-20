@@ -457,7 +457,7 @@ async function pageMedia(main) {
   const inv = p.inventory;
   main.append(
     inv.remaining < 5 ? h("div", { class: "banner " + (inv.remaining ? "warn" : "bad") }, inv.remaining ? `Only ${inv.remaining} unpublished files left. Upload more to “${p.folder}”.` : `Nothing left to post. Upload new media to “${p.folder}”.`) : null,
-    h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), `in “${p.folder}”`), kpi("Posted", num(inv.posted), "by the automatic poster"),
+    h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), `in “${p.folder}”`), kpi("Posted", num(inv.posted), `${num(inv.reusable_now)} reusable now (30+ days old)`),
       kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"), kpi("Unsupported", num(inv.unsupported), "format or size")),
     h("section", { class: "card", style: null }, h("h2", {}, "Files"), h("div", { class: "media-grid" }, p.library.map((m) => h("div", { class: "media-tile" },
       m.thumb ? h("img", { src: m.thumb, alt: m.name, loading: "lazy" }) : h("div", { class: "ph" }, m.kind),

@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 
 import httpx
 from dotenv import find_dotenv, load_dotenv
@@ -26,6 +27,34 @@ from .config import ConfigError, PosterConfig, normalize_channel
 from .logs import setup_logging
 from .slots import SlotError, resolve_slot
 from .telegram_publisher import TelegramPublisher
+
+
+def github_run_time(http: httpx.Client, repository: str, token: str):
+    """A function run_id -> start time (unix) of that GitHub Actions run, or None if unavailable.
+
+    Used only for posts made before tgbot_at_ tags existed. Read-only, cached per run.
+    """
+    if not repository or not token:
+        return None
+    cache: dict[str, int | None] = {}
+
+    def lookup(run_id: str) -> int | None:
+        if not run_id.isdigit():
+            return None
+        if run_id not in cache:
+            cache[run_id] = None
+            try:
+                response = http.get(f"https://api.github.com/repos/{repository}/actions/runs/{run_id}",
+                                    headers={"Authorization": f"Bearer {token}",
+                                             "Accept": "application/vnd.github+json"}, timeout=15)
+                if response.status_code == 200:
+                    started = response.json().get("run_started_at") or response.json().get("created_at")
+                    cache[run_id] = int(datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+            except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+                logging.getLogger("poster").warning("Could not look up GitHub run %s", run_id)
+        return cache[run_id]
+
+    return lookup
 
 
 def main(argv: list[str] | None = None, env: dict | None = None) -> int:
@@ -53,7 +82,8 @@ def main(argv: list[str] | None = None, env: dict | None = None) -> int:
         logging.getLogger("poster").error("Configuration problem: %s", exc)
         return 2
 
-    setup_logging(cfg.secrets(), env.get("LOG_LEVEL", "INFO"))
+    github_token = (env.get("GITHUB_TOKEN") or "").strip()
+    setup_logging(cfg.secrets() + ([github_token] if github_token else []), env.get("LOG_LEVEL", "INFO"))
     log = logging.getLogger("poster")
     if slot:
         log.info("Posting slot %s", slot)
@@ -69,9 +99,10 @@ def main(argv: list[str] | None = None, env: dict | None = None) -> int:
             return 1 if problems else 0
 
         source = CloudinarySource(cfg.cloud_name, cfg.api_key, cfg.api_secret, cfg.folder, cfg.folder_mode)
+        run_time = github_run_time(http, env.get("GITHUB_REPOSITORY", ""), github_token)
         if args.report:
             try:
-                inv = runner.inventory(cfg, source.list_assets())
+                inv = runner.inventory(cfg, source.list_assets(), time.time(), run_time)
             except SourceError as exc:
                 log.error("%s", exc)
                 return 1
@@ -82,7 +113,8 @@ def main(argv: list[str] | None = None, env: dict | None = None) -> int:
                          text, env)
             return 0
 
-        result = runner.run(cfg, source, publisher, http, dry_run=args.dry_run, channel=channel, slot=slot)
+        result = runner.run(cfg, source, publisher, http, dry_run=args.dry_run, channel=channel, slot=slot,
+                            run_time=run_time)
         target = channel or cfg.public_channel
         production = not args.dry_run and target == cfg.public_channel
         monitor.report_result(result, cfg, target, publisher, production=production, env=env)

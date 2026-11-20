@@ -19,7 +19,7 @@ approval. No new bots, channels, groups or discussion groups are created anywher
 |---|---|---|---|
 | Automated media posting | `poster/` | GitHub Actions (live) | Supported. 5 AM / 10 PM IST from Cloudinary `tgpub`. |
 | Automated text, media, poll, quiz posts to either channel | Dashboard → `content_items` → `scheduler.publish_due` | Worker | Supported. Media by https link: photos ≤ 5 MB, other files ≤ 20 MB (Telegram's limits for URLs). |
-| Smart content rotation | `POST_SELECTION=smart` (poster); caption library rotation (worker) | Poster / worker | Supported. Priority tag `tgpriority`, then a different media type than the last post, then oldest. Recycling stays off unless `POST_WHEN_EXHAUSTED=restart`. |
+| Smart content rotation | Poster `runner.py`; caption library rotation (worker) | Poster / worker | Supported:<br>• new media always first<br>• then the asset posted longest ago, after a `REUSE_COOLDOWN_DAYS` (30) cooldown<br>• posting time saved per asset (`tgbot_at_`)<br>• history tags never removed<br>• nothing qualifies → skip and alert<br>Optional `POST_SELECTION=smart`: priority tag `tgpriority`, then a different media type than the last post. |
 | Captions | Asset caption → `POST_CAPTIONS` pool (with `{date}`, `{weekday}`, `{channel}`) → `POST_CAPTION`; `POST_FOOTER`; dashboard caption library | Poster / worker | Supported. 1,024-character limit enforced. |
 | Polls and quizzes | Dashboard; auto-close and results via `stopPoll` | Worker | Supported. Channel polls are always anonymous, so the bot sees totals, not voters. |
 | Channel engagement and analytics | Poll results, reaction counts, revenue, trial conversion | Worker / full bot | Partly. Telegram gives bots **no view counts** for channel posts. Reaction totals need the full bot (`message_reaction_count` updates, bot must be admin). |
@@ -71,10 +71,14 @@ Then collect:
 **Step A: merge the pull request.** It changes only the poster's behaviour on GitHub Actions:
 - alerts when content runs out
 - once-per-slot guard
-- optional captions and smart rotation
+- smart rotation: reuse of the oldest post after 30 days, never removing history
+- optional captions
 
-Defaults are unchanged; the schedule lines are unchanged.
-*Check:* the next scheduled run shows a red "No content to post" until media is uploaded, then "Posted".
+The schedule lines are unchanged.
+*Check:*
+- Until about 22 Nov (30 days after the first post), runs are red with "No content to post … next one qualifies <date>".
+- After that, they are green "Reposted" runs.
+- New media in `tgpub` is posted first, as soon as it is uploaded.
 *Rollback:* revert the merge commit on `main` (GitHub → the PR → Revert). Cloudinary tags stay valid.
 
 **Step B: VPS with dashboard and send-only worker, in PREVIEW mode.**

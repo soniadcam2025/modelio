@@ -42,13 +42,14 @@ def test_workflow_schedule_is_still_5am_and_10pm_ist():
     assert sorted(cron_time(c) for c in crons) == list(make_cfg().slot_times)  # slot guard matches the cron
 
 
-def test_workflow_never_recycles_unless_variable_is_set():
+def test_workflow_passes_rotation_settings_and_defaults_are_safe_reuse():
     text = WORKFLOW.read_text()
     assert "POST_WHEN_EXHAUSTED: ${{ vars.POST_WHEN_EXHAUSTED }}" in text
-    assert "restart" not in text.split("POST_WHEN_EXHAUSTED")[1].split("\n")[0]
-    assert PosterConfig.from_env({"TELEGRAM_BOT_TOKEN": "1:T", "CLOUDINARY_CLOUD_NAME": "c",
-                                  "CLOUDINARY_API_KEY": "k", "CLOUDINARY_API_SECRET": "s",
-                                  "POST_WHEN_EXHAUSTED": ""}).when_exhausted == "stop"
+    assert "REUSE_COOLDOWN_DAYS: ${{ vars.REUSE_COOLDOWN_DAYS }}" in text
+    cfg = PosterConfig.from_env({"TELEGRAM_BOT_TOKEN": "1:T", "CLOUDINARY_CLOUD_NAME": "c",
+                                 "CLOUDINARY_API_KEY": "k", "CLOUDINARY_API_SECRET": "s",
+                                 "POST_WHEN_EXHAUSTED": "", "REUSE_COOLDOWN_DAYS": ""})
+    assert (cfg.when_exhausted, cfg.reuse_cooldown_days) == ("reuse", 30)
 
 
 # Slots

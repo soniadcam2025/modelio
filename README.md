@@ -39,7 +39,8 @@ deploy/         systemd service for running the bot on a Linux server
 
 - **Schedule is ON:** `30 16 * * *` (10:00 PM IST) and `30 23 * * *` (5:00 AM IST).
 - 34 posts went out between 23 Oct and 8 Nov (messages 5 → 38), with no duplicates and no failed runs.
-- **Since 9 Nov nothing has been posted:** all 34 files in `tgpub` were used, and the old version reported "nothing to post" as a green run. This version turns that into a red run plus an alert. **Upload new media to `tgpub` to resume posting.**
+- **Since 9 Nov nothing has been posted:** all 34 files in `tgpub` were used, and the old version reported "nothing to post" as a green run. This version turns that into a red run plus an alert.
+- **With smart rotation** (this update), old posts are reused once they are 30 days old. The first of the 34 went out on 23 Oct, so reposting starts around **22 Nov** without any action. **Uploading new media resumes fresh posting at once.**
 - GitHub starts the scheduled runs **3 to 6.5 hours late** (see "On-time posting" below).
 
 ### Which secret is which
@@ -66,7 +67,8 @@ Never paste these into a chat, a file in this repo, or an issue.
 |---|---|---|
 | `ADMIN_CHAT_ID` | empty | **Recommended.** Your numeric Telegram user ID. Alerts (nothing left to post, low content, failures) are sent there. Get it from @userinfobot, then press **Start** in @ShakhiraVIPBot once so the bot is allowed to message you. Never the public channel. |
 | `LOW_STOCK_THRESHOLD` | `5` | Warn when fewer than this many unpublished files are left after a post. `0` = never warn. |
-| `POST_WHEN_EXHAUSTED` | `stop` | `stop` = when everything is posted, stop and alert. `restart` = **re-post old media** in a new round. Only set `restart` if you want recycling. |
+| `POST_WHEN_EXHAUSTED` | `reuse` | `reuse` = when no new media is left, repost the asset posted **longest ago**, once its cooldown has passed. `stop` = never repeat a post. (The old value `restart` now means `reuse`.) History tags are never removed in either mode. |
+| `REUSE_COOLDOWN_DAYS` | `30` | Minimum days between two posts of the same asset. |
 | `POST_CAPTION` | empty | Default caption. An asset's own `caption` (Cloudinary → asset → Metadata/Context) wins. |
 | `POST_SELECTION` | `oldest` | `oldest` first, `random`, or `smart`: files tagged `tgpriority` first, then a different type (photo/video) than the last post, then oldest. |
 | `POST_CAPTIONS` | empty | Captions that rotate post by post, separated by `\|\|`. Supports `{date}`, `{weekday}`, `{channel}`. An asset's own caption still wins. |
@@ -127,7 +129,8 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**.
 
 | Tag | Meaning |
 |---|---|
-| `tgbot_posted` | Telegram confirmed the post. Never picked again (unless `POST_WHEN_EXHAUSTED=restart`). |
+| `tgbot_posted` | Telegram confirmed the post. Never removed. |
+| `tgbot_at_<unix time>` | When it was **last** posted successfully. Only the newest is kept; it drives the reuse cooldown. |
 | `tgbot_slot_<YYYYMMDDTHHMMZ>` | The scheduled slot (UTC) it was posted for. Another run for the same slot won't post. |
 | `tgbot_run_<number>` | The GitHub run that posted it. A re-run doesn't post again. |
 | `tgbot_claim_<time>_<id>` | A temporary lock while a run is posting. Expires after 30 minutes if a run crashes. |
@@ -137,7 +140,13 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**.
 - An asset is marked posted **only after Telegram confirms**.
 - Only these `tgbot_` tags are ever added or removed. **Your own tags are never touched.**
 - Only one posting job runs at a time (`concurrency` in the workflow). Each run also claims its asset and re-checks before posting.
-- When everything has been posted, the poster **stops and alerts**. It never re-posts old media unless you set `POST_WHEN_EXHAUSTED=restart`.
+- **Smart rotation:**
+  1. New, never-posted media always comes first.
+  2. When none is left, the asset whose last post is the **oldest** is reposted, but only once `REUSE_COOLDOWN_DAYS` (30) have passed.
+  3. If nothing qualifies, the run posts nothing, turns red and alerts the admin, saying when the next asset qualifies.
+- **History is never removed** to start a new round. A reused asset keeps all its tags and gains new run, slot and time tags.
+- Posts made before `tgbot_at_` existed: their time is taken from the slot tag, or from the GitHub run that posted them (read-only lookup with the workflow's own token). It is then saved as a `tgbot_at_` tag. An asset whose time can't be found is never reused.
+- Uncertain or rejected assets are never reused.
 
 ### What gets posted, and the limits
 
@@ -160,7 +169,7 @@ The posting history is stored **on the assets themselves, as Cloudinary tags**.
 | `not an admin of @yourshakhira` / `cannot post messages` | Make the bot an admin with Post Messages. |
 | `Telegram rejected the bot token` | The token is wrong or was revoked. Copy it again from @BotFather. |
 | `Cloudinary ... AuthorizationRequired` | Wrong Cloudinary API key or secret. |
-| **No content to post** / `Every supported asset has already been posted` | Upload new media to `tgpub`. (Or, only if you want old posts repeated, set `POST_WHEN_EXHAUSTED=restart`.) |
+| **No content to post** / `none is past the 30-day reuse cooldown` | No new media, and every old post was posted less than 30 days ago. The message says when the next one qualifies. Upload new media to post sooner. |
 | **Low content** | Fewer than 5 unpublished files left. Upload more soon. |
 | **Posted but not recorded** | The post worked but tagging failed. Add the tag `tgbot_posted` to that asset by hand. |
 | No Telegram alerts arrive | Check `ADMIN_CHAT_ID` is your numeric ID and that you pressed **Start** in the bot. |
@@ -291,9 +300,9 @@ The tests use fake Telegram and Cloudinary services. They never charge Stars, po
 | Content in Cloudinary `tgpub` | **Used up since 9 Nov.** Upload new media. |
 | Exhaustion and low-content alerts, run summary, posting report, once-per-slot guard | Done in this update, tested with fakes. Alerts by Telegram need the `ADMIN_CHAT_ID` variable. |
 | On-time external trigger (cron-job.org) | **Proposed, not set up.** See "On-time posting". |
-| Content recycling | **Off.** Only with `POST_WHEN_EXHAUSTED=restart`. |
+| Smart rotation (new first, then oldest post after 30 days) | **Built; on by default once merged.** History tags are never removed. |
 | Subscription bot code (this repo) | Security fixes done and tested with fakes. **Not deployed, not the live bot.** |
 | Live @ShakhiraVIPBot | Runs elsewhere; source and host not yet identified. |
 | One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (Part 2). |
 | Admin dashboard, send-only worker, new bot features | Built and tested with fakes (Part 3). **Not deployed.** See DEPLOYMENT.md. |
-| Smart rotation, caption pool and footer for the poster | Built, **off by default**. |
+| `smart` selection order, caption pool and footer for the poster | Built, **off by default**. |

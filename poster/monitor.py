@@ -30,7 +30,12 @@ def assess(result: Result, cfg: PosterConfig) -> list[tuple[str, str, str]]:
     out = []
     where = f" Slot {result.slot}." if result.slot else ""
     if result.status == "posted":
-        out.append(("notice", "Posted", f"Posted {result.asset} (message {result.message_id}).{where}"))
+        if result.reused:
+            out.append(("notice", "Reposted",
+                        f"Reposted {result.asset} (message {result.message_id}): no new media was left, so the "
+                        f"asset posted longest ago (at least {cfg.reuse_cooldown_days} days ago) was used.{where}"))
+        else:
+            out.append(("notice", "Posted", f"Posted {result.asset} (message {result.message_id}).{where}"))
         if result.remaining is not None and result.remaining < cfg.low_stock_threshold:
             out.append(("warning", "Low content",
                         f"Only {result.remaining} unpublished asset(s) left in Cloudinary folder '{cfg.folder}'. "
@@ -41,8 +46,7 @@ def assess(result: Result, cfg: PosterConfig) -> list[tuple[str, str, str]]:
         out.append(("notice", "Dry run", f"Would post {result.asset}; {result.remaining} unpublished asset(s)."))
     elif result.status == "no_content":
         out.append(("error", "No content to post",
-                    f"Nothing was posted: {result.detail}. Upload new media to Cloudinary folder '{cfg.folder}'. "
-                    "Previously posted media is not reused unless you set POST_WHEN_EXHAUSTED=restart."))
+                    f"Nothing was posted: {result.detail}. Upload new media to Cloudinary folder '{cfg.folder}'."))
     elif result.status == "unrecorded":
         out.append(("error", "Posted but not recorded",
                     f"{result.asset} WAS posted (message {result.message_id}) but the tag could not be saved: "
@@ -87,6 +91,10 @@ def report_markdown(inv: Inventory, cfg: PosterConfig, now: float, days: int = 7
         f"| Supported photos/videos | {inv.supported} |",
         f"| Posted | {inv.posted} |",
         f"| **Unpublished (left to post)** | **{inv.remaining}** |",
+        f"| Reusable now (posted over {cfg.reuse_cooldown_days} days ago) | {inv.reusable_now} |",
+        f"| Next asset leaves the cooldown | "
+        f"{datetime.fromtimestamp(inv.next_reuse_at, tz=timezone.utc).strftime('%d %b %Y %H:%M UTC') if inv.next_reuse_at else '—'} |",
+        f"| Posted, time unknown (never reused) | {inv.unknown_time} |",
         f"| Uncertain (check by hand) | {inv.uncertain} |",
         f"| Rejected by Telegram | {inv.rejected} |",
         f"| Unsupported or too large | {inv.unsupported} |",

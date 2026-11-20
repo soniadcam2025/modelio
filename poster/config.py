@@ -55,7 +55,10 @@ class PosterConfig:
     folder_mode: str = "auto"  # auto, dynamic, fixed
     caption: str = ""
     selection: str = "oldest"  # oldest, random
-    when_exhausted: str = "stop"  # stop, restart
+    # reuse (default): when no new asset is left, repost the one posted longest ago, once it is past
+    # the cooldown. stop: never repeat a post. History tags are never removed in either mode.
+    when_exhausted: str = "reuse"
+    reuse_cooldown_days: int = 30
     max_photo_bytes: int = TELEGRAM_PHOTO_LIMIT
     max_video_bytes: int = TELEGRAM_FILE_LIMIT
     claim_ttl_minutes: int = 30
@@ -112,7 +115,10 @@ class PosterConfig:
             folder_mode=_choice(env, "CLOUDINARY_FOLDER_MODE", "auto", {"auto", "dynamic", "fixed"}),
             caption=caption,
             selection=_choice(env, "POST_SELECTION", "oldest", {"oldest", "random", "smart"}),
-            when_exhausted=_choice(env, "POST_WHEN_EXHAUSTED", "stop", {"stop", "restart"}),
+            # "restart" is accepted for older settings and now means the safe "reuse".
+            when_exhausted={"restart": "reuse"}.get(w := _choice(env, "POST_WHEN_EXHAUSTED", "reuse",
+                                                              {"reuse", "stop", "restart"}), w),
+            reuse_cooldown_days=_int(env, "REUSE_COOLDOWN_DAYS", 30, 1, 3650),
             max_photo_bytes=_int(env, "MAX_PHOTO_BYTES", TELEGRAM_PHOTO_LIMIT, 1, TELEGRAM_PHOTO_LIMIT),
             max_video_bytes=_int(env, "MAX_VIDEO_BYTES", TELEGRAM_FILE_LIMIT, 1, TELEGRAM_FILE_LIMIT),
             claim_ttl_minutes=_int(env, "CLAIM_TTL_MINUTES", 30, 5, 24 * 60),

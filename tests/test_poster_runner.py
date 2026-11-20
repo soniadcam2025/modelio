@@ -31,8 +31,8 @@ def test_second_run_posts_the_next_asset_not_the_same_one():
     source = FakeSource([asset("tgpub/a", created="1"), asset("tgpub/b", created="2")])
     assert go(source).asset == "image:tgpub/a"
     assert go(source).asset == "image:tgpub/b"
-    result = go(source)
-    assert result.status == "no_content" and result.detail == "all posted"
+    result = go(source)  # both were just posted: nothing is past the 30-day reuse cooldown
+    assert result.status == "no_content" and result.detail.startswith("all posted; none is past the 30-day")
     assert result.exit_code == runner.EXIT_NO_CONTENT  # exhausted folder makes the run fail (alert)
 
 
@@ -48,7 +48,7 @@ def test_video_is_sent_as_video_and_gif_as_animation():
 def test_user_tags_are_preserved():
     source = FakeSource([asset("tgpub/a", tags=["favourite", "summer"])])
     go(source)
-    assert source.tags_of("tgpub/a") == ["favourite", "summer", POSTED_TAG]
+    assert source.tags_of("tgpub/a") == ["favourite", "summer", POSTED_TAG, f"tgbot_at_{NOW}"]
 
 
 def test_caption_from_cloudinary_context_wins_over_default():
@@ -81,13 +81,13 @@ def test_rerun_of_same_workflow_run_does_not_post_again():
     assert "tgbot_run_987654" in source.tags_of("tgpub/a")
 
 
-def test_rotation_restart_only_when_configured():
+def test_old_restart_setting_now_means_safe_reuse():
+    # A posted asset with no known posting time is never reused, and its tags are never stripped.
     source = FakeSource([asset("tgpub/a", tags=[POSTED_TAG])])
-    assert go(source).status == "no_content"
-    assert source.tags_of("tgpub/a") == [POSTED_TAG]  # default never recycles old posts
     result = go(source, cfg=make_cfg(when_exhausted="restart"))
-    assert result.status == "posted"
+    assert result.status == "no_content" and "no known posting time" in result.detail
     assert source.tags_of("tgpub/a") == [POSTED_TAG]
+    assert make_cfg(when_exhausted="stop").when_exhausted == "stop"
 
 
 # Failures
