@@ -4,6 +4,8 @@ Other options:
   python -m shakhira_bot --check-config        validate .env without connecting to Telegram
   python -m shakhira_bot --reset-monthly-link  forget the saved VIP Monthly link (a new one is made on next use)
   python -m shakhira_bot --backup              write one database backup to BACKUP_DIR and exit
+  python -m shakhira_bot --worker              SEND-ONLY worker: scheduled posts, polls, reminders and dashboard
+                                               actions. Never receives updates, so it can run next to the live bot.
 """
 
 import argparse
@@ -73,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--reset-monthly-link", action="store_true")
     parser.add_argument("--backup", action="store_true", help="write one database backup and exit")
+    parser.add_argument("--worker", action="store_true",
+                        help="run only the send-only worker (safe next to the live bot)")
     parser.add_argument("--take-over-webhook", action="store_true",
                         help="start even if the token has a webhook (only after retiring the old bot)")
     args = parser.parse_args(argv)
@@ -107,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
 
         make_backup(store, cfg.backup_dir, cfg.backup_keep, time.time())
         return 0
+
+    if args.worker:
+        from .worker import main as worker_main
+
+        return worker_main(cfg, store)
 
     if not args.take_over_webhook:
         problem = asyncio.run(_check_webhook(cfg.bot_token))

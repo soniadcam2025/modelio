@@ -359,6 +359,14 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_maintenance(context.bot, store, cfg, int(time.time()), _alerts(context))
 
 
+async def worker_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled posts, polls, reminders and dashboard actions (each only if its feature is on)."""
+    from . import scheduler
+
+    cfg, store = _deps(context)
+    await scheduler.run_cycle(context.bot, store, cfg, int(time.time()), _alerts(context))
+
+
 async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg, store = _deps(context)
     try:

@@ -29,11 +29,18 @@ class FakeBot:
         self.calls: list[tuple[str, dict]] = []
         self._links = 0
         self.webhook_url = webhook_url
+        self.raise_on: dict = {}  # method name -> exception instance to raise (e.g. BadRequest("..."))
+        self.poll_votes = [3, 1]
 
     def _record(self, name: str, kwargs: dict) -> None:
         self.calls.append((name, kwargs))
+        if name in self.raise_on:
+            raise self.raise_on[name]
         if name in self.fail:
             raise TelegramError(f"{name} failed")
+
+    def _message(self):
+        return SimpleNamespace(message_id=1000 + len(self.calls))
 
     def called(self, name: str) -> list[dict]:
         return [kwargs for n, kwargs in self.calls if n == name]
@@ -65,7 +72,48 @@ class FakeBot:
 
     async def send_message(self, **kw):
         self._record("send_message", kw)
-        return SimpleNamespace(message_id=len(self.calls))
+        return self._message()
+
+    async def send_photo(self, **kw):
+        self._record("send_photo", kw)
+        return self._message()
+
+    async def send_video(self, **kw):
+        self._record("send_video", kw)
+        return self._message()
+
+    async def send_animation(self, **kw):
+        self._record("send_animation", kw)
+        return self._message()
+
+    async def send_poll(self, **kw):
+        self._record("send_poll", kw)
+        return self._message()
+
+    async def send_paid_media(self, **kw):
+        self._record("send_paid_media", kw)
+        return self._message()
+
+    async def stop_poll(self, **kw):
+        self._record("stop_poll", kw)
+        options = [SimpleNamespace(text=f"opt{i}", voter_count=v) for i, v in enumerate(self.poll_votes)]
+        return SimpleNamespace(total_voter_count=sum(self.poll_votes), options=options, correct_option_id=None)
+
+    async def approve_chat_join_request(self, **kw):
+        self._record("approve_chat_join_request", kw)
+        return True
+
+    async def decline_chat_join_request(self, **kw):
+        self._record("decline_chat_join_request", kw)
+        return True
+
+    async def delete_message(self, **kw):
+        self._record("delete_message", kw)
+        return True
+
+    async def restrict_chat_member(self, **kw):
+        self._record("restrict_chat_member", kw)
+        return True
 
     async def get_webhook_info(self, **kw):
         self._record("get_webhook_info", kw)

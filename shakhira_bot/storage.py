@@ -4,6 +4,8 @@ import os
 import sqlite3
 from dataclasses import dataclass
 
+from .ops import OPS_SCHEMA, Ops
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY,
@@ -108,10 +110,15 @@ class Storage:
     def __init__(self, path: str):
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # The dashboard and worker share this file: WAL lets readers and one writer work at once.
+        self.conn.execute("PRAGMA busy_timeout = 10000")
+        if path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(OPS_SCHEMA)
         self._migrate()
         self.conn.commit()
 
@@ -127,6 +134,10 @@ class Storage:
 
     def close(self) -> None:
         self.conn.close()
+
+    @property
+    def ops(self) -> Ops:
+        return Ops(self.conn)
 
     # Payments
 

@@ -47,6 +47,13 @@ class Config:
     backup_dir: str = "data/backups"
     backup_keep: int = 14
     backup_interval_hours: int = 24  # 0 turns automatic backups off
+    bot_username: str = "ShakhiraVIPBot"
+    # An EXISTING discussion group linked to the public channel, for moderation. Never created by the bot.
+    discussion_group_id: int | None = None
+    worker_interval_seconds: int = 30
+    # Preview mode: every scheduled item goes ONLY to this private chat (an admin's own user ID),
+    # never to the channels. For testing without publishing to production.
+    preview_chat_id: int | None = None
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "Config":
@@ -89,6 +96,24 @@ class Config:
             except ValueError:
                 raise ConfigError(f"ADMIN_CHAT_IDS must be numeric Telegram chat IDs, got {part!r}") from None
 
+        raw_group = env.get("DISCUSSION_GROUP_ID", "").strip()
+        discussion_group = None
+        if raw_group:
+            try:
+                discussion_group = int(raw_group)
+            except ValueError:
+                raise ConfigError("DISCUSSION_GROUP_ID must be the numeric group ID (starts with -100)") from None
+
+        raw_preview = env.get("PREVIEW_CHAT_ID", "").strip()
+        preview = None
+        if raw_preview:
+            try:
+                preview = int(raw_preview)
+            except ValueError:
+                raise ConfigError("PREVIEW_CHAT_ID must be your numeric Telegram user ID") from None
+            if preview <= 0:
+                raise ConfigError("PREVIEW_CHAT_ID must be a private chat (your user ID), never a channel or group")
+
         return cls(
             bot_token=token,
             vip_channel_id=channel_id,
@@ -104,6 +129,10 @@ class Config:
             backup_dir=env.get("BACKUP_DIR", "").strip() or "data/backups",
             backup_keep=_int(env, "BACKUP_KEEP", 14),
             backup_interval_hours=_int(env, "BACKUP_INTERVAL_HOURS", 24, minimum=0),
+            bot_username=(env.get("BOT_USERNAME", "").strip().lstrip("@") or "ShakhiraVIPBot"),
+            discussion_group_id=discussion_group,
+            worker_interval_seconds=_int(env, "WORKER_INTERVAL_SECONDS", 30, minimum=10),
+            preview_chat_id=preview,
         )
 
     @property
