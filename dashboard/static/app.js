@@ -456,7 +456,9 @@ async function pageMedia(main) {
   if (p.error) { main.append(h("div", { class: "banner bad" }, p.error)); return; }
   const inv = p.inventory;
   main.append(
-    inv.remaining < 5 ? h("div", { class: "banner " + (inv.remaining ? "warn" : "bad") }, inv.remaining ? `Only ${inv.remaining} unpublished files left. Upload more to “${p.folder}”.` : `Nothing left to post. Upload new media to “${p.folder}”.`) : null,
+    inv.remaining >= 5 ? null : inv.remaining ? h("div", { class: "banner warn" }, `Only ${inv.remaining} new files left. Upload more to “${p.folder}”.`)
+      : inv.reusable_now ? h("div", { class: "banner warn" }, `No new media: the poster is reposting the oldest posts (last posted 30+ days ago). ${num(inv.reusable_now)} can be reposted now. Upload new media to “${p.folder}” to post fresh content.`)
+      : h("div", { class: "banner bad" }, `Nothing can be posted: no new media, and every post is still inside its 30-day cooldown${inv.next_reuse_at ? `. Reposting resumes ${when(inv.next_reuse_at)}` : ""}. Upload new media to “${p.folder}” to post sooner.`),
     h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), `in “${p.folder}”`), kpi("Posted", num(inv.posted), `${num(inv.reusable_now)} reusable now (30+ days old)`),
       kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"), kpi("Unsupported", num(inv.unsupported), "format or size")),
     h("section", { class: "card", style: null }, h("h2", {}, "Files"), h("div", { class: "media-grid" }, p.library.map((m) => h("div", { class: "media-tile" },
