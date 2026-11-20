@@ -68,10 +68,18 @@ class FakeSource:
 
 
 class FakePublisher:
-    def __init__(self, problems=None, outcome="ok"):
+    def __init__(self, problems=None, outcome="ok", message_fails=False):
         self.problems = problems or []
         self.outcome = outcome  # ok, failed, rejected, uncertain
         self.sent: list[dict] = []
+        self.messages: list[tuple[str, str]] = []  # (chat_id, text) of admin alerts
+        self.message_fails = message_fails
+
+    def send_message(self, chat_id, text):
+        if self.message_fails:
+            raise PublishFailed("sendMessage: Forbidden: bot can't initiate conversation with a user")
+        self.messages.append((chat_id, text))
+        return 1
 
     def check_channel(self, channel):
         return list(self.problems)

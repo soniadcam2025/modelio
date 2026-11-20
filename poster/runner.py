@@ -5,6 +5,7 @@ Posting history lives in Cloudinary tags on each asset, so it survives between G
   tgbot_uncertain           the upload may have gone through; skipped until you check and remove the tag
   tgbot_rejected            Telegram refused the file; skipped until you remove the tag
   tgbot_run_<run id>        which GitHub Actions run posted it (stops a re-run from posting again)
+  tgbot_slot_<slot>         which scheduled slot it was posted for (stops a second post in the same slot)
   tgbot_claim_<time>_<id>   short-lived lock while a run is posting the asset
 Only these tags are added or removed; your own tags are never touched.
 """
@@ -29,19 +30,34 @@ UNCERTAIN_TAG = "tgbot_uncertain"
 REJECTED_TAG = "tgbot_rejected"
 CLAIM_PREFIX = "tgbot_claim_"
 RUN_PREFIX = "tgbot_run_"
+SLOT_PREFIX = "tgbot_slot_"
 MAX_CANDIDATES = 5
+
+# Exit codes. A green workflow run now means a post was made (or was correctly not needed).
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_NO_CONTENT = 3
 
 
 @dataclass(frozen=True)
 class Result:
-    status: str  # posted, dry_run, nothing_to_post, already_posted, failed, uncertain, unrecorded
+    # posted, dry_run, already_posted          -> success
+    # no_content                               -> nothing left to post (alert: add media)
+    # nothing_to_post, failed, uncertain, unrecorded -> something went wrong
+    status: str
     asset: str | None = None
     message_id: int | None = None
     detail: str = ""
+    remaining: int | None = None  # unpublished assets left after this run
+    slot: str | None = None
 
     @property
     def exit_code(self) -> int:
-        return 0 if self.status in ("posted", "dry_run", "nothing_to_post", "already_posted") else 1
+        if self.status in ("posted", "dry_run", "already_posted"):
+            return EXIT_OK
+        if self.status == "no_content":
+            return EXIT_NO_CONTENT
+        return EXIT_FAILED
 
 
 def make_claim_tag(now: float) -> str:
@@ -69,6 +85,45 @@ def run_tag(run_id: str) -> str:
     return RUN_PREFIX + "".join(c for c in run_id if c.isalnum())
 
 
+def slot_tag(slot: str) -> str:
+    return SLOT_PREFIX + "".join(c for c in slot if c.isalnum())
+
+
+def is_blocked(asset: Asset) -> bool:
+    return bool({POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(asset.tags))
+
+
+@dataclass(frozen=True)
+class Inventory:
+    total: int
+    supported: int
+    unsupported: int
+    posted: int
+    uncertain: int
+    rejected: int
+    remaining: int  # supported and not posted, uncertain or rejected
+    slots: tuple[tuple[str, str], ...]  # (slot ID, asset name), newest first
+
+
+def inventory(cfg: PosterConfig, assets: list[Asset]) -> Inventory:
+    """Read-only summary of the folder: what was posted and what is left."""
+    supported = [a for a in assets if media.classify(a, cfg)[0] is not None]
+    slots = sorted(
+        ((t[len(SLOT_PREFIX):], a.name) for a in assets for t in a.tags if t.startswith(SLOT_PREFIX)),
+        reverse=True,
+    )
+    return Inventory(
+        total=len(assets),
+        supported=len(supported),
+        unsupported=len(assets) - len(supported),
+        posted=sum(POSTED_TAG in a.tags for a in supported),
+        uncertain=sum(UNCERTAIN_TAG in a.tags for a in supported),
+        rejected=sum(REJECTED_TAG in a.tags for a in supported),
+        remaining=sum(not is_blocked(a) for a in supported),
+        slots=tuple(slots),
+    )
+
+
 def caption_for(asset: Asset, cfg: PosterConfig) -> str:
     text = (asset.caption or cfg.caption).strip()
     if len(text) > TELEGRAM_CAPTION_LIMIT:
@@ -78,7 +133,8 @@ def caption_for(asset: Asset, cfg: PosterConfig) -> str:
 
 
 def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublisher, http: httpx.Client, *,
-        dry_run: bool = False, channel: str | None = None, clock=time.time, rng: random.Random | None = None) -> Result:
+        dry_run: bool = False, channel: str | None = None, clock=time.time, rng: random.Random | None = None,
+        slot: str | None = None) -> Result:
     target = channel or cfg.public_channel
     record_history = target == cfg.public_channel
     ttl = cfg.claim_ttl_minutes * 60
@@ -103,7 +159,14 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         done = next((a for a in assets if tag in a.tags), None)
         if done:
             logger.info("This workflow run already posted %s; not posting again", done.name)
-            return Result("already_posted", asset=done.name)
+            return Result("already_posted", asset=done.name, detail="this run already posted")
+
+    if record_history and slot:
+        tag = slot_tag(slot)
+        done = next((a for a in assets if tag in a.tags), None)
+        if done:
+            logger.info("Slot %s was already posted (%s); not posting again", slot, done.name)
+            return Result("already_posted", asset=done.name, detail=f"slot {slot} already posted", slot=slot)
 
     supported: list[tuple[Asset, str]] = []
     skipped: dict[str, int] = {}
@@ -115,17 +178,17 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         else:
             supported.append((asset, kind))
     if not assets:
-        logger.warning("Cloudinary folder %r is empty; nothing to post", cfg.folder)
-        return Result("nothing_to_post", detail="folder empty")
+        logger.error("Cloudinary folder %r is empty; nothing to post", cfg.folder)
+        return Result("no_content", detail="folder empty", remaining=0, slot=slot)
     if not supported:
-        logger.warning("No supported photos/videos in %r (skipped: %s)", cfg.folder, skipped)
-        return Result("nothing_to_post", detail="no supported media")
+        logger.error("No supported photos/videos in %r (skipped: %s)", cfg.folder, skipped)
+        return Result("no_content", detail="no supported media", remaining=0, slot=slot)
 
     now = clock()
 
     def eligible_list():
         return [(a, k) for a, k in supported
-                if not {POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(a.tags) and not fresh_claims(a.tags, now, ttl)]
+                if not is_blocked(a) and not fresh_claims(a.tags, now, ttl)]
 
     eligible = eligible_list()
     if not eligible:
@@ -140,8 +203,13 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
             supported = [(_without_tag(a, POSTED_TAG), k) for a, k in supported]
             eligible = eligible_list()
         if not eligible:
-            logger.warning("Every supported asset has already been posted (or is in use); nothing new to post")
-            return Result("nothing_to_post", detail="all posted")
+            in_use = [a for a, _ in supported if not is_blocked(a)]
+            if in_use:
+                logger.error("All %s unpublished asset(s) are claimed by another run right now", len(in_use))
+                return Result("nothing_to_post", detail="all remaining assets in use", slot=slot)
+            logger.error("Every supported asset has already been posted; nothing new to post. "
+                         "Upload new media to %r (recycling old posts is off).", cfg.folder)
+            return Result("no_content", detail="all posted", remaining=0, slot=slot)
 
     if cfg.selection == "random":
         (rng or random.Random()).shuffle(eligible)
@@ -150,7 +218,8 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
     logger.info("%s eligible asset(s); next: %s", len(eligible), eligible[0][0].name)
 
     if dry_run:
-        return Result("dry_run", asset=eligible[0][0].name)
+        return Result("dry_run", asset=eligible[0][0].name, remaining=len(eligible), slot=slot)
+    remaining_after = len(eligible) - 1
 
     for asset, kind in eligible[:MAX_CANDIDATES]:
         claim = make_claim_tag(now)
@@ -161,7 +230,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
         except SourceError as exc:
             logger.error("Could not claim %s: %s", asset.name, exc)
             _release(source, claim, asset)
-            return Result("failed", asset=asset.name, detail=str(exc))
+            return Result("failed", asset=asset.name, detail=str(exc), slot=slot)
 
         others = [t for t in fresh_claims(current, clock(), ttl) if t != claim]
         if {POSTED_TAG, UNCERTAIN_TAG, REJECTED_TAG} & set(current) or others:
@@ -189,7 +258,7 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
                 except SourceError:
                     logger.error("Could not tag %s as rejected", asset.name)
             _release(source, claim, asset)
-            return Result("failed", asset=asset.name, detail=str(exc))
+            return Result("failed", asset=asset.name, detail=str(exc), slot=slot)
         except PublishUncertain as exc:
             logger.error("Upload of %s may or may not have been published: %s", asset.name, exc)
             if record_history:
@@ -198,28 +267,31 @@ def run(cfg: PosterConfig, source: CloudinarySource, publisher: TelegramPublishe
                 except SourceError:
                     logger.error("Could not tag %s as uncertain; its claim tag blocks it for %s minutes",
                                  asset.name, cfg.claim_ttl_minutes)
-                    return Result("uncertain", asset=asset.name, detail=str(exc))
+                    return Result("uncertain", asset=asset.name, detail=str(exc), slot=slot)
             _release(source, claim, asset)
-            return Result("uncertain", asset=asset.name, detail=str(exc))
+            return Result("uncertain", asset=asset.name, detail=str(exc), slot=slot)
 
         logger.info("Posted %s to %s (message %s)", asset.name, target, message_id)
         if not record_history:
             _release(source, claim, asset)
-            return Result("posted", asset=asset.name, message_id=message_id, detail="test target, not recorded")
+            return Result("posted", asset=asset.name, message_id=message_id, detail="test target, not recorded",
+                          remaining=remaining_after)
         try:
             source.add_tag(POSTED_TAG, [asset])
             if cfg.run_id:
                 source.add_tag(run_tag(cfg.run_id), [asset])
+            if slot:
+                source.add_tag(slot_tag(slot), [asset])
             logger.info("Recorded %s as posted (tag %r)", asset.name, POSTED_TAG)
         except SourceError as exc:
             logger.error("POSTED %s but could not record it in Cloudinary: %s. Add the tag %r to it by hand.",
                          asset.name, exc, POSTED_TAG)
-            return Result("unrecorded", asset=asset.name, message_id=message_id, detail=str(exc))
+            return Result("unrecorded", asset=asset.name, message_id=message_id, detail=str(exc), slot=slot)
         _release(source, claim, asset)
-        return Result("posted", asset=asset.name, message_id=message_id)
+        return Result("posted", asset=asset.name, message_id=message_id, remaining=remaining_after, slot=slot)
 
-    logger.warning("No asset could be posted this run")
-    return Result("nothing_to_post", detail="candidates unavailable")
+    logger.error("No asset could be posted this run (downloads failed or assets were taken by another run)")
+    return Result("nothing_to_post", detail="candidates unavailable", slot=slot)
 
 
 def _without_tag(asset: Asset, tag: str) -> Asset:

@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass
 
+from .slots import SlotError, parse_times
+
 REQUIRED = ("TELEGRAM_BOT_TOKEN", "CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET")
 
 # Telegram Bot API limits for files uploaded by a bot (multipart upload).
@@ -58,6 +60,12 @@ class PosterConfig:
     max_video_bytes: int = TELEGRAM_FILE_LIMIT
     claim_ttl_minutes: int = 30
     run_id: str = ""
+    # Warn when fewer than this many unpublished assets remain after a post (0 = never warn).
+    low_stock_threshold: int = 5
+    # Optional Telegram chat (your user ID, or a private admin group/channel) for alerts. Never the public channel.
+    admin_chat_id: str = ""
+    # The UTC times of the daily schedule; must match the cron lines in the workflow.
+    slot_times: tuple[tuple[int, int], ...] = ((16, 30), (23, 30))
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "PosterConfig":
@@ -71,12 +79,24 @@ class PosterConfig:
         if len(caption) > TELEGRAM_CAPTION_LIMIT:
             raise ConfigError(f"POST_CAPTION is longer than Telegram's {TELEGRAM_CAPTION_LIMIT}-character limit")
 
+        try:
+            slot_times = tuple(parse_times((env.get("POST_SLOTS_UTC") or "").strip() or "16:30,23:30"))
+        except SlotError as exc:
+            raise ConfigError(str(exc)) from None
+
+        public_channel = normalize_channel(env.get("PUBLIC_CHANNEL") or "@yourshakhira")
+        admin_chat_id = (env.get("ADMIN_CHAT_ID") or "").strip()
+        if admin_chat_id:
+            admin_chat_id = normalize_channel(admin_chat_id)
+            if admin_chat_id == public_channel:
+                raise ConfigError("ADMIN_CHAT_ID must not be the public channel")
+
         return cls(
             telegram_bot_token=env["TELEGRAM_BOT_TOKEN"].strip(),
             cloud_name=env["CLOUDINARY_CLOUD_NAME"].strip(),
             api_key=env["CLOUDINARY_API_KEY"].strip(),
             api_secret=env["CLOUDINARY_API_SECRET"].strip(),
-            public_channel=normalize_channel(env.get("PUBLIC_CHANNEL") or "@yourshakhira"),
+            public_channel=public_channel,
             folder=folder,
             folder_mode=_choice(env, "CLOUDINARY_FOLDER_MODE", "auto", {"auto", "dynamic", "fixed"}),
             caption=caption,
@@ -86,6 +106,9 @@ class PosterConfig:
             max_video_bytes=_int(env, "MAX_VIDEO_BYTES", TELEGRAM_FILE_LIMIT, 1, TELEGRAM_FILE_LIMIT),
             claim_ttl_minutes=_int(env, "CLAIM_TTL_MINUTES", 30, 5, 24 * 60),
             run_id=(env.get("GITHUB_RUN_ID") or "").strip(),
+            low_stock_threshold=_int(env, "LOW_STOCK_THRESHOLD", 5, 0, 10_000),
+            admin_chat_id=admin_chat_id,
+            slot_times=slot_times,
         )
 
     def secrets(self) -> list[str]:

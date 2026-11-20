@@ -32,7 +32,8 @@ def test_second_run_posts_the_next_asset_not_the_same_one():
     assert go(source).asset == "image:tgpub/a"
     assert go(source).asset == "image:tgpub/b"
     result = go(source)
-    assert result.status == "nothing_to_post" and result.detail == "all posted"
+    assert result.status == "no_content" and result.detail == "all posted"
+    assert result.exit_code == runner.EXIT_NO_CONTENT  # exhausted folder makes the run fail (alert)
 
 
 def test_video_is_sent_as_video_and_gif_as_animation():
@@ -82,7 +83,8 @@ def test_rerun_of_same_workflow_run_does_not_post_again():
 
 def test_rotation_restart_only_when_configured():
     source = FakeSource([asset("tgpub/a", tags=[POSTED_TAG])])
-    assert go(source).status == "nothing_to_post"
+    assert go(source).status == "no_content"
+    assert source.tags_of("tgpub/a") == [POSTED_TAG]  # default never recycles old posts
     result = go(source, cfg=make_cfg(when_exhausted="restart"))
     assert result.status == "posted"
     assert source.tags_of("tgpub/a") == [POSTED_TAG]
@@ -156,7 +158,7 @@ def test_download_failure_skips_to_next_asset():
 
 def test_empty_folder():
     result = go(FakeSource([]))
-    assert result.status == "nothing_to_post" and result.detail == "folder empty" and result.exit_code == 0
+    assert result.status == "no_content" and result.detail == "folder empty" and result.exit_code == 3
 
 
 def test_only_unsupported_or_oversized_media():
@@ -168,7 +170,7 @@ def test_only_unsupported_or_oversized_media():
     ])
     pub = FakePublisher()
     result = go(source, pub)
-    assert result.status == "nothing_to_post" and result.detail == "no supported media"
+    assert result.status == "no_content" and result.detail == "no supported media"
     assert pub.sent == []
 
 
