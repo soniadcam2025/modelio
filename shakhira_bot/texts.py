@@ -159,3 +159,24 @@ def checkout_rejected() -> str:
 
 def generic_error() -> str:
     return "Sorry, something went wrong. Please try again."
+
+
+def trial_link_limit() -> str:
+    return (
+        "You've already received the maximum number of access links for this trial. "
+        "If you still can't get in, please use /paysupport."
+    )
+
+
+def trial_link_retry_later() -> str:
+    return "I couldn't replace your old access link just now. Please try again in a few minutes or use /paysupport."
+
+
+def trial_recovered(expires_at: int, has_link: bool) -> str:
+    text = (
+        "✅ Your earlier trial payment has now been activated.\n\n"
+        f"Your trial runs until {fmt_date(expires_at)}.\n"
+    )
+    if has_link:
+        return text + "Tap below to join. This link works once and only for you."
+    return text + "Send /status in a minute to get your access link."

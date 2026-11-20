@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 
 from . import handlers
+from .alerts import AdminAlerts
 from .config import Config
 from .storage import Storage
 
@@ -27,6 +28,7 @@ def build_application(cfg: Config, store: Storage) -> Application:
     app = Application.builder().token(cfg.bot_token).build()
     app.bot_data["config"] = cfg
     app.bot_data["storage"] = store
+    app.bot_data["alerts"] = AdminAlerts(cfg.admin_chat_ids)
 
     private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("start", handlers.start, filters=private))
@@ -40,5 +42,8 @@ def build_application(cfg: Config, store: Storage) -> Application:
     app.add_handler(ChatMemberHandler(handlers.channel_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_error_handler(handlers.on_error)
 
+    # Also runs once ~30 s after start, which finishes any unban or payment left over from a crash.
     app.job_queue.run_repeating(handlers.expiry_job, interval=cfg.expiry_check_seconds, first=30)
+    if cfg.backup_interval_hours:
+        app.job_queue.run_repeating(handlers.backup_job, interval=cfg.backup_interval_hours * 3600, first=120)
     return app

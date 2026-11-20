@@ -42,6 +42,11 @@ class Config:
     trial_once_per_user: bool = True
     database_path: str = "data/shakhira_bot.db"
     expiry_check_seconds: int = 300
+    # Telegram chat IDs that receive admin alerts (your own user ID, or a private admin group/channel).
+    admin_chat_ids: tuple[int, ...] = ()
+    backup_dir: str = "data/backups"
+    backup_keep: int = 14
+    backup_interval_hours: int = 24  # 0 turns automatic backups off
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "Config":
@@ -74,6 +79,16 @@ class Config:
         if support and not support.startswith("@"):
             support = "@" + support
 
+        admin_ids = []
+        for part in env.get("ADMIN_CHAT_IDS", "").replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                admin_ids.append(int(part))
+            except ValueError:
+                raise ConfigError(f"ADMIN_CHAT_IDS must be numeric Telegram chat IDs, got {part!r}") from None
+
         return cls(
             bot_token=token,
             vip_channel_id=channel_id,
@@ -85,6 +100,10 @@ class Config:
             trial_once_per_user=_bool(env, "TRIAL_ONCE_PER_USER", True),
             database_path=env.get("DATABASE_PATH", "").strip() or "data/shakhira_bot.db",
             expiry_check_seconds=_int(env, "EXPIRY_CHECK_SECONDS", 300, minimum=30),
+            admin_chat_ids=tuple(admin_ids),
+            backup_dir=env.get("BACKUP_DIR", "").strip() or "data/backups",
+            backup_keep=_int(env, "BACKUP_KEEP", 14),
+            backup_interval_hours=_int(env, "BACKUP_INTERVAL_HOURS", 24, minimum=0),
         )
 
     @property

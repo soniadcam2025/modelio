@@ -23,11 +23,12 @@ def member(status: str = ChatMember.MEMBER, until: int | None = None, is_member:
 
 
 class FakeBot:
-    def __init__(self, members: dict | None = None, fail: set[str] | None = None):
+    def __init__(self, members: dict | None = None, fail: set[str] | None = None, webhook_url: str = ""):
         self.members = members or {}  # user_id -> member(...)
         self.fail = fail or set()  # method names that should raise TelegramError
         self.calls: list[tuple[str, dict]] = []
         self._links = 0
+        self.webhook_url = webhook_url
 
     def _record(self, name: str, kwargs: dict) -> None:
         self.calls.append((name, kwargs))
@@ -61,3 +62,26 @@ class FakeBot:
     async def unban_chat_member(self, **kw):
         self._record("unban_chat_member", kw)
         return True
+
+    async def send_message(self, **kw):
+        self._record("send_message", kw)
+        return SimpleNamespace(message_id=len(self.calls))
+
+    async def get_webhook_info(self, **kw):
+        self._record("get_webhook_info", kw)
+        return SimpleNamespace(url=self.webhook_url)
+
+
+def join_update(user_id: int, link: str | None, link_name: str | None, status: str = ChatMember.MEMBER,
+                chat_id: int = CHANNEL_ID, subscription_period: int | None = None):
+    """A ChatMemberUpdated-like object for someone joining the VIP channel."""
+    invite = None
+    if link:
+        invite = SimpleNamespace(invite_link=link, name=link_name, subscription_period=subscription_period)
+    user = SimpleNamespace(id=user_id)
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        old_chat_member=SimpleNamespace(status=ChatMember.LEFT, user=user, is_member=False),
+        new_chat_member=SimpleNamespace(status=status, user=user, until_date=None, is_member=True),
+        invite_link=invite,
+    )
