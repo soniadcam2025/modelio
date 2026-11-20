@@ -115,7 +115,11 @@ def public_safe(report: dict) -> dict:
     """A copy without values that should not appear in a public log."""
     if "delivery" not in report:
         return report
-    safe = {**report, "delivery": {**report["delivery"], "ip_address": mask_ip(report["delivery"]["ip_address"])}}
+    host = report["delivery"]["webhook_host"]
+    if host and host.count(".") >= 2:  # keep the provider (e.g. workers.dev), hide the account-specific labels
+        host = "…." + ".".join(host.split(".")[-2:])
+    safe = {**report, "delivery": {**report["delivery"], "ip_address": mask_ip(report["delivery"]["ip_address"]),
+                                   "webhook_host": host}}
     safe.pop("vip_channel", None)
     return safe
 

@@ -54,6 +54,8 @@ class Config:
     # Preview mode: every scheduled item goes ONLY to this private chat (an admin's own user ID),
     # never to the channels. For testing without publishing to production.
     preview_chat_id: int | None = None
+    # Safety lock for test servers: the worker refuses to start unless PREVIEW_CHAT_ID is set.
+    require_preview: bool = False
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "Config":
@@ -133,6 +135,7 @@ class Config:
             discussion_group_id=discussion_group,
             worker_interval_seconds=_int(env, "WORKER_INTERVAL_SECONDS", 30, minimum=10),
             preview_chat_id=preview,
+            require_preview=_bool(env, "WORKER_REQUIRE_PREVIEW", False),
         )
 
     @property

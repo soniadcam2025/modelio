@@ -416,3 +416,9 @@ def test_preview_mode_skips_actions_and_reminders(store):
     bot = FakeBot()
     run(scheduler.run_cycle(bot, store, make_config(preview_chat_id=777), NOW))
     assert bot.calls == [] and ops.queued_actions()  # left for the real run
+
+
+def test_worker_refuses_to_start_without_preview_when_locked(store):
+    from shakhira_bot.worker import main as worker_main
+
+    assert worker_main(make_config(require_preview=True), store) == 3

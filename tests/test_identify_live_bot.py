@@ -78,4 +78,5 @@ def test_public_log_mode_hides_ip_and_vip_channel():
     report = public_safe(inspect(inspector, "@yourshakhira", "-1001234567890"))
     assert report["delivery"]["ip_address"] == "203.0.x.x" and "vip_channel" not in report
     assert "203.0.113.5" not in render(report) and "SECRET" not in render(report)
+    assert report["delivery"]["webhook_host"] == "….example.com"
     assert mask_ip(None) == "unknown" and mask_ip("2001:db8:1::5").startswith("2001:db8:")
