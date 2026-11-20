@@ -4,27 +4,37 @@ This repo has two separate parts. A problem in one doesn't stop the other.
 
 | Part | What it does | Where it runs |
 |---|---|---|
-| **Subscription bot** (`shakhira_bot/`) | `@ShakhiraVIPBot`: sells VIP access to the private VIP channel with Telegram Stars | Must run **all the time** (a VPS or other always-on host). GitHub Actions can't host it. |
-| **Channel poster** (`poster/`) | Posts one photo/video from the Cloudinary `tgpub` folder to `@yourshakhira` | **GitHub Actions** on the free tier. Manual runs for now; a twice-daily schedule can be switched on after testing. Nothing to host. |
+| **Channel poster** (`poster/`) | Posts one photo/video from the Cloudinary `tgpub` folder to `@yourshakhira` | **GitHub Actions**, automatically at **5:00 AM and 10:00 PM IST**. Live since 23 Oct 2026. |
+| **Subscription bot** (`shakhira_bot/`) | Sells VIP access to the private VIP channel with Telegram Stars | **Not deployed.** The live `@ShakhiraVIPBot` runs other code (see Part 2). |
 
-Both use the same bot token. They don't share a database or files.
+Both use the same bot token. They don't share a database or files. The poster only *sends* messages, so it never competes with the live bot for updates.
 
 ```
-shakhira_bot/   subscription bot (python -m shakhira_bot)
 poster/         Cloudinary -> Telegram poster (python -m poster)
   config.py             settings and validation
   cloudinary_source.py  find media in the folder, read/write posting-history tags
   media.py              photo/video rules, size limits, safe download
-  telegram_publisher.py upload to Telegram, channel permission check
-  runner.py             one posting run: pick, claim, post, record
-tests/          automated tests (no real Telegram or Cloudinary needed)
-.github/workflows/post-to-channel.yml   manual runs (twice-daily schedule ready but switched off)
+  telegram_publisher.py upload to Telegram, channel permission check, admin alert messages
+  runner.py             one posting run: pick, claim, post, record; folder inventory
+  slots.py              which scheduled slot (5 AM / 10 PM) a run belongs to
+  monitor.py            run summary, GitHub annotations, admin alerts, posting report
+shakhira_bot/   subscription bot (python -m shakhira_bot)
+tests/          automated tests (fake Telegram and Cloudinary; nothing real is touched)
+.github/workflows/post-to-channel.yml   the posting schedule and manual runs
+.github/workflows/tests.yml             runs the tests on every pull request (no secrets)
 deploy/         systemd service for running the bot on a Linux server
 ```
 
 ---
 
 ## Part 1: Channel poster (Cloudinary → @yourshakhira)
+
+### Current state (checked 20 Nov 2026)
+
+- **Schedule is ON:** `30 16 * * *` (10:00 PM IST) and `30 23 * * *` (5:00 AM IST).
+- 34 posts went out between 23 Oct and 8 Nov (messages 5 → 38), with no duplicates and no failed runs.
+- **Since 9 Nov nothing has been posted:** all 34 files in `tgpub` were used, and the old version reported "nothing to post" as a green run. This version turns that into a red run plus an alert. **Upload new media to `tgpub` to resume posting.**
+- GitHub starts the scheduled runs **3 to 6.5 hours late** (see "On-time posting" below).
 
 ### Which secret is which
 
@@ -34,209 +44,170 @@ deploy/         systemd service for running the bot on a Linux server
 | `CLOUDINARY_CLOUD_NAME` | Your Cloudinary account name (it appears in your media URLs) | Not really, but kept as a secret |
 | `CLOUDINARY_API_KEY` | Cloudinary API key (a number) | **Yes** |
 | `CLOUDINARY_API_SECRET` | Cloudinary API secret. Never share it. | **Yes** |
-| `PUBLIC_CHANNEL` | Where to post: a **username** like `@yourshakhira`, or a numeric **channel ID** like `-1001234567890` | No |
 
-**Where to find the Cloudinary values:** log in at <https://console.cloudinary.com> → **Settings** (gear icon) → **API Keys**. The page shows the cloud name, the API key, and the API secret (click the eye icon to reveal it).
-
+**Where to find the Cloudinary values:** <https://console.cloudinary.com> → **Settings** (gear icon) → **API Keys**.
 **Where to find the bot token:** Telegram → **@BotFather** → `/mybots` → **ShakhiraVIPBot** → **API Token**.
 
 Never paste these into a chat, a file in this repo, or an issue.
 
-### Step 1: Let the bot post in @yourshakhira
+### Setup (already done for @yourshakhira)
 
-1. In Telegram, open **@yourshakhira** → tap the channel name → **Edit** → **Administrators** → **Add Admin**.
-2. Pick **@ShakhiraVIPBot**.
-3. Turn on **Post Messages**. Everything else can stay off.
-4. Save.
+1. **Bot is admin of the channel:** @yourshakhira → Edit → Administrators → @ShakhiraVIPBot with **Post Messages** on.
+2. **GitHub secrets:** <https://github.com/soniadcam2025/modelio> → **Settings** → **Secrets and variables** → **Actions** → **Secrets**: the four values above.
+3. **Optional GitHub variables** (same page, **Variables** tab; none of these are secret):
 
-The poster checks this at the start of every run. If anything is wrong, it stops and tells you exactly what.
+| Variable | Default | What it does |
+|---|---|---|
+| `ADMIN_CHAT_ID` | empty | **Recommended.** Your numeric Telegram user ID. Alerts (nothing left to post, low content, failures) are sent there. Get it from @userinfobot, then press **Start** in @ShakhiraVIPBot once so the bot is allowed to message you. Never the public channel. |
+| `LOW_STOCK_THRESHOLD` | `5` | Warn when fewer than this many unpublished files are left after a post. `0` = never warn. |
+| `POST_WHEN_EXHAUSTED` | `stop` | `stop` = when everything is posted, stop and alert. `restart` = **re-post old media** in a new round. Only set `restart` if you want recycling. |
+| `POST_CAPTION` | empty | Default caption. An asset's own `caption` (Cloudinary → asset → Metadata/Context) wins. |
+| `POST_SELECTION` | `oldest` | `oldest` first, or `random`. |
+| `PUBLIC_CHANNEL` | `@yourshakhira` | Where to post. |
+| `CLOUDINARY_FOLDER` | `tgpub` | Which folder to post from. |
 
-### Step 2: Add the GitHub secrets
+### Manual runs
 
-1. Open <https://github.com/soniadcam2025/modelio> → **Settings** → **Secrets and variables** → **Actions**.
-2. Under **Secrets**, click **New repository secret** and add each of these with its value:
-   - `TELEGRAM_BOT_TOKEN`
-   - `CLOUDINARY_CLOUD_NAME`
-   - `CLOUDINARY_API_KEY`
-   - `CLOUDINARY_API_SECRET`
-3. Optional: on the **Variables** tab, add any of these (they aren't secret):
-   - `POST_CAPTION`: default caption. Empty means no caption.
-   - `PUBLIC_CHANNEL`: default `@yourshakhira`
-   - `CLOUDINARY_FOLDER`: default `tgpub`
+**Actions** → **Post to public channel** → **Run workflow**, then pick a mode:
 
-**Captions:** if an asset has a `caption` field in its Cloudinary metadata (Media Library → asset → **Metadata/Context**), that caption is used. Otherwise `POST_CAPTION` is used. The poster never edits your media.
+| Mode | Changes anything? | Use it to |
+|---|---|---|
+| `check` | No | Confirm the bot can post to the channel. |
+| `dry-run` | No | See which file would be posted next and how many are left. |
+| `report` | No | See how many files are left, and which of the last 7 days' 5 AM / 10 PM slots got a post. |
+| `post` + a test channel ID | Posts to **that** channel only | Test an upload without touching @yourshakhira. Nothing is recorded. |
+| `post`, channel empty, slot empty | **Posts to @yourshakhira** | An extra one-off post. |
+| `post`, slot `auto` | **Posts to @yourshakhira** | Post for the slot due now; does nothing if that slot already has a post. Used by the on-time trigger below. |
 
-### Step 3: Test it by hand (automatic posting is off)
+To run it on your own computer: copy `.env.example` to `.env`, fill it in, `pip install -r requirements-poster.txt`, then `python -m poster --report` (or `--check`, `--dry-run`, `--channel -100…`).
 
-**Automatic posting is switched off** in this version. The workflow only runs when you press **Run workflow**. Manual runs need the workflow on `main`, so merge first; merging alone posts nothing.
+### Alerts and monitoring
 
-What each mode really tests:
+A green run now means **a post was made** (or that slot already had one). It no longer means "the job ran".
 
-| Mode | Talks to | Proves | Does **not** prove |
+| Run result | Run colour | Annotation on the run page | Telegram alert to `ADMIN_CHAT_ID` |
 |---|---|---|---|
-| `check` | Telegram only (read-only) | The bot token works, the channel exists, and the bot is an admin there with **Post Messages** | Anything about Cloudinary. That an upload will succeed. |
-| `dry-run` | Telegram (same read-only check) and Cloudinary (read-only listing) | The Cloudinary credentials can **read** the folder. Which assets are found, which are skipped and why, and which one would be posted next. | That tags can be **written** (it adds none). That the file downloads or that Telegram accepts the upload. |
-| `post` to a test channel | Telegram (sends one post) and Cloudinary (adds and removes one temporary lock tag) | Download and upload of one real file. That the Cloudinary credentials can **add and remove** tags. | Writing `tgbot_posted` (test posts are not recorded). The public channel itself. |
+| Posted | ✅ green | `Posted <file> (message N)` | Only if fewer than `LOW_STOCK_THRESHOLD` files are left: **Low content** |
+| Slot already posted | ✅ green | `Already posted` | — |
+| Nothing left to post / folder empty | ❌ red (exit 3) | **No content to post** | **No content to post** |
+| Upload failed, uncertain, or not recorded | ❌ red (exit 1) | The error | The error |
 
-Run them in this order. Stop and fix anything that fails before moving on.
+- Each run's **Summary** page shows a table: result, slot, file, Telegram message ID and **unpublished files left**.
+- GitHub also emails you when a scheduled run fails (GitHub → your avatar → **Settings** → **Notifications** → **Actions**: keep "Send notifications for failed workflows" on).
+- Alerts are only sent for real posting runs to the public channel. `check`, `dry-run`, `report` and test-channel runs never send alerts.
+- `report` mode lists **missed slots**: scheduled times in the last 7 days with no post. Slot tracking starts with the first scheduled post after this update.
 
-1. **check:** **Actions** → **Post to public channel** → **Run workflow** → mode **check**, channel empty. Expect a green tick and the log line `Bot can post to @yourshakhira`.
-2. **dry-run:** same, mode **dry-run**. In the log, check:
-   - `Found N asset(s) in Cloudinary folder 'tgpub'`: N should match roughly what you see in Cloudinary.
-   - any `Skipping …` lines, with the reason
-   - `N eligible asset(s); next: …`
-3. **post to a private test channel:**
-   1. Create a new **private** channel only you can see.
-   2. Add **@ShakhiraVIPBot** as admin with **Post Messages**.
-   3. Get its numeric ID: open it at <https://web.telegram.org/a/> and copy the `-100…` number from the address bar.
-   4. Run mode **post**, channel `-100…` (your test channel's ID).
-4. **Verify the test post:**
-   - In Telegram: the test channel has one new photo or video, with the expected caption, playing or displaying properly.
-   - In the run log, in this order:
-     - `Test target …: posting history will NOT be recorded`
-     - `Added claim tag tgbot_claim_… to …`
-     - `Posted … (message …)`
-     - `Removed claim tag tgbot_claim_… from …`
-   - In Cloudinary (**Media Library** → that asset → tags): **no** `tgbot_…` tags remain, and your own tags are unchanged. A leftover `tgbot_claim_…` tag means removing tags failed. It expires harmlessly after 30 minutes, but tell me.
-   - `@yourshakhira` received nothing.
-5. Only after all of that, either:
-   - turn the schedule on (next section), or
-   - make one real post by hand with mode **post** and the channel empty. Afterwards that asset should carry `tgbot_posted` and `tgbot_run_…`.
+### On-time posting (proposal, not switched on)
 
-To run it on your own computer instead: copy `.env.example` to `.env`, fill it in, then:
-```bash
-pip install -r requirements-poster.txt
-python -m poster --check
-python -m poster --dry-run
-python -m poster --channel -100XXXXXXXXXX   # your private test channel's ID
-```
+**What's going on:** GitHub runs scheduled workflows "best effort". In this repo the 10 PM run actually started between 12:40 AM and 5:10 AM IST, and the 5 AM run between 6:55 AM and 10:40 AM IST. GitHub's schedule can't be made punctual. Also, in a **public** repo GitHub **turns off** schedules after 60 days without a commit (from 22 Oct, that's about 21 Dec 2026). Merging this update resets that clock.
 
-### Schedule (currently OFF)
+**Free fix: an external scheduler triggers the workflow on time.** [cron-job.org](https://cron-job.org) (free) calls GitHub's API at exactly 5:00 and 22:00 IST. A manually triggered run starts within about a minute. GitHub's own schedule stays as a backup. Every post is tagged with its slot (`tgbot_slot_…`), so whichever run arrives first posts and the other one does nothing. Duplicates are impossible. External triggers also keep working if GitHub turns off the schedule after 60 days.
 
-The twice-daily schedule is written into the workflow but commented out:
+Setup, about 10 minutes, after this update is merged:
+1. GitHub → avatar → **Settings** → **Developer settings** → **Fine-grained tokens** → **Generate new token**. Repository access: **only `soniadcam2025/modelio`**. Permissions: **Actions: Read and write** (nothing else). Pick an expiry and put a reminder in your calendar to renew it.
+2. cron-job.org → **Create cronjob**, twice (one at 05:00, one at 22:00), time zone **Asia/Kolkata**:
+   - URL: `https://api.github.com/repos/soniadcam2025/modelio/actions/workflows/post-to-channel.yml/dispatches`
+   - Method **POST**. Headers: `Authorization: Bearer <your token>`, `Accept: application/vnd.github+json`, `Content-Type: application/json`
+   - Body: `{"ref":"main","inputs":{"mode":"post","slot":"auto"}}`
+3. The next morning, check **Actions**: one green "Posted" run at about 5:00, and GitHub's late run later shows "Already posted".
 
-| UTC cron | India time (IST = UTC+5:30) |
-|---|---|
-| `30 4 * * *` | 10:00 AM |
-| `30 13 * * *` | 7:00 PM |
-
-**Turn it on only after every check in Step 3 passed:**
-1. On GitHub, open `.github/workflows/post-to-channel.yml` on `main` and click the pencil (Edit) icon.
-2. Find these lines near the top:
-   ```yaml
-     # schedule:
-     #   - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
-     #   - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
-   ```
-3. Delete only the `# ` at the start of those three lines. Keep the spaces before them, so they become:
-   ```yaml
-     schedule:
-       - cron: "30 4 * * *"   # 04:30 UTC = 10:00 AM IST
-       - cron: "30 13 * * *"  # 13:30 UTC = 7:00 PM IST
-   ```
-4. **Commit changes** directly to `main`. The next run happens at the next scheduled time. Scheduled runs always use mode **post** to `@yourshakhira`.
-5. To turn it off again, put the `# ` back, or use **Actions** → **Post to public channel** → **⋯** → **Disable workflow**.
-
-**The times are approximate.** GitHub often starts scheduled jobs 5–30 minutes late, sometimes more, and can skip a run when GitHub is very busy. Also, in a public repo GitHub **pauses schedules after 60 days with no commits**. It emails you, and you can re-enable the schedule on the Actions tab.
-
-**To see runs and logs:** **Actions** tab → **Post to public channel** → click a run → **post** job → **Run poster** step.
+If the token expires, the external runs stop and GitHub's (late) schedule still posts, so nothing breaks.
 
 ### How duplicate prevention works
 
-The posting history is stored **on the assets themselves, as Cloudinary tags**. It survives between GitHub runs, and you can see it in the Cloudinary Media Library.
+The posting history is stored **on the assets themselves, as Cloudinary tags**.
 
 | Tag | Meaning |
 |---|---|
-| `tgbot_posted` | Telegram confirmed the post. Never picked again (unless rotation is set to `restart`). |
-| `tgbot_run_<number>` | The GitHub run that posted it. If a run is re-run, it sees this tag and doesn't post again. |
-| `tgbot_claim_<time>_<id>` | A temporary lock while a run is posting. Other runs skip the asset. It expires after 30 minutes if a run crashes. |
-| `tgbot_uncertain` | The upload may have reached Telegram, but no confirmation came back. Skipped so it's never double-posted. Check the channel, then either add `tgbot_posted` or remove `tgbot_uncertain` so it's posted again. |
-| `tgbot_rejected` | Telegram refused the file (for example, unsupported dimensions). Skipped so it doesn't block every later run. Remove the tag after fixing or replacing the file. |
+| `tgbot_posted` | Telegram confirmed the post. Never picked again (unless `POST_WHEN_EXHAUSTED=restart`). |
+| `tgbot_slot_<YYYYMMDDTHHMMZ>` | The scheduled slot (UTC) it was posted for. Another run for the same slot won't post. |
+| `tgbot_run_<number>` | The GitHub run that posted it. A re-run doesn't post again. |
+| `tgbot_claim_<time>_<id>` | A temporary lock while a run is posting. Expires after 30 minutes if a run crashes. |
+| `tgbot_uncertain` | The upload may have reached Telegram, but no confirmation came back. Skipped so it's never double-posted. Check the channel, then add `tgbot_posted` or remove `tgbot_uncertain`. |
+| `tgbot_rejected` | Telegram refused the file. Remove the tag after fixing or replacing the file. |
 
-- An asset is marked posted **only after Telegram confirms**. A failed upload leaves no `tgbot_posted` tag, so the asset is tried again next time.
+- An asset is marked posted **only after Telegram confirms**.
 - Only these `tgbot_` tags are ever added or removed. **Your own tags are never touched.**
-- Two runs can't post the same asset:
-  - GitHub runs one posting job at a time (`concurrency` in the workflow).
-  - Each run also claims an asset and re-reads its tags before posting. If another run claimed it too, it backs off.
-- When every asset has been posted, the poster stops posting and says so in the log. To start a new round automatically, set the variable `POST_WHEN_EXHAUSTED=restart`.
+- Only one posting job runs at a time (`concurrency` in the workflow). Each run also claims its asset and re-checks before posting.
+- When everything has been posted, the poster **stops and alerts**. It never re-posts old media unless you set `POST_WHEN_EXHAUSTED=restart`.
 
 ### What gets posted, and the limits
 
-- **Photos** (jpg, png, webp) up to **10 MB** are sent as photos. Telegram also requires width + height of at most 10,000 pixels, and the long side at most 20 times the short side. Photos outside that are skipped.
-- **MP4 videos** up to **50 MB** are sent as playable videos.
-- **GIFs** up to **50 MB** are sent as animations.
-- Anything else is skipped with a reason in the log: other formats (`.mov`, `.pdf`…), larger files, and private/authenticated assets.
-- The 10 MB and 50 MB figures are the Telegram Bot API upload limits for bots. Files are downloaded from Cloudinary and uploaded to Telegram as real files.
-- Only assets **directly** in `tgpub` are used, not subfolders. This works with both Cloudinary folder modes:
-  - "dynamic folders", where the folder isn't part of the asset's ID
-  - older "fixed folders", where IDs start with `tgpub/`
-- The order is oldest upload first. Set `POST_SELECTION=random` for random order.
+- **Photos** (jpg, png, webp) up to **10 MB**, width + height ≤ 10,000 px, long side ≤ 20 × short side.
+- **MP4 videos** up to **50 MB** (sent as playable videos). **GIFs** up to **50 MB** (sent as animations).
+- Anything else is skipped with a reason in the log.
+- Only assets **directly** in `tgpub` (not subfolders). Both Cloudinary folder modes work.
 
 ### Free-tier usage
 
-- **GitHub Actions:** each run takes about 1 minute, so roughly 60 minutes a month. That's free for public repos and well inside the 2,000 free minutes for private repos.
-- **Cloudinary free plan:**
-  - Each run makes a few Admin API calls, far below the hourly limit.
-  - Each post downloads one original file, which counts toward your monthly bandwidth/credits. Large videos use more.
-  - Check usage in Cloudinary → **Dashboard**.
+- **GitHub Actions:** about 1 minute per run, roughly 60 minutes a month. Free for public repos.
+- **Cloudinary:** a few Admin API calls per run, plus one original-file download per post. Check Cloudinary → **Dashboard**.
+- **cron-job.org** (if used): free.
 
 ### Troubleshooting
 
-| Log message | Fix |
+| Log message / alert | Fix |
 |---|---|
-| `Missing required environment variable(s): ...` | Add the named secret(s) in GitHub (Step 2). |
-| `not an admin of @yourshakhira` / `cannot post messages` | Step 1. |
+| `Missing required environment variable(s): ...` | Add the named secret(s) in GitHub. |
+| `not an admin of @yourshakhira` / `cannot post messages` | Make the bot an admin with Post Messages. |
 | `Telegram rejected the bot token` | The token is wrong or was revoked. Copy it again from @BotFather. |
 | `Cloudinary ... AuthorizationRequired` | Wrong Cloudinary API key or secret. |
-| `Cloudinary folder 'tgpub' is empty` | Check the folder name and casing in the Media Library, or set `CLOUDINARY_FOLDER`. |
-| `Every supported asset has already been posted` | Upload more media, or set `POST_WHEN_EXHAUSTED=restart`. |
-| `POSTED ... but could not record it` | The post worked but tagging failed. Add the tag `tgbot_posted` to that asset by hand. |
+| **No content to post** / `Every supported asset has already been posted` | Upload new media to `tgpub`. (Or, only if you want old posts repeated, set `POST_WHEN_EXHAUSTED=restart`.) |
+| **Low content** | Fewer than 5 unpublished files left. Upload more soon. |
+| **Posted but not recorded** | The post worked but tagging failed. Add the tag `tgbot_posted` to that asset by hand. |
+| No Telegram alerts arrive | Check `ADMIN_CHAT_ID` is your numeric ID and that you pressed **Start** in the bot. |
 
 ---
 
 ## Part 2: Subscription bot (@ShakhiraVIPBot)
 
-> **This is not the bot that is running today.** The `@ShakhiraVIPBot` currently live in Telegram runs code that is not in this repository. The code here (`shakhira_bot/`) is a separate implementation, built from an earlier starter ZIP plus the plans and commands you described. It has **not been deployed**, and **never tested against real Telegram or real payments**. Its wording and menu are my reconstruction and may not match the live bot word for word.
+> **This is not the bot that is running today.** The live `@ShakhiraVIPBot` runs code that is not in this repository, on a host that is not yet identified. The code here has **not been deployed** and has **never been tested against real Telegram or real payments**. Don't start it with the live token until the live bot has been identified and retired. The bot refuses to start if the token has a webhook (see below).
 
 | Plan | Price | How it works in this code |
 |---|---|---|
-| 💎 VIP Monthly | 499 ⭐ / 30 days | Telegram's own channel subscription link. Telegram charges, renews every 30 days, and removes people who cancel or stop paying. |
-| ⏳ 3-day trial | 49 ⭐ once | Stars invoice. After the payment is verified, the bot sends a single-use invite link and removes the member when 3 days are up. It never removes admins or paying monthly subscribers. |
+| 💎 VIP Monthly | 499 ⭐ / 30 days | Telegram's own channel subscription link. Telegram charges, renews and removes people who stop paying. |
+| ⏳ 3-day trial | 49 ⭐ once | Stars invoice. After the payment is verified, the bot sends a single-use invite link and removes the member when 3 days are up. Admins and paying monthly subscribers are never removed. |
 
-**Commands:** `/start`, `/subscribe`, `/status`, `/rules`, plus `/paysupport` (see below).
+**Commands:** `/start`, `/subscribe`, `/status`, `/rules`, `/paysupport`.
 
-**Waiting for your approval.** These are in the code but aren't part of the terms you described. Neither affects prices or durations.
+**Waiting for your approval** (in the code, but not part of the terms you described; none of them affect prices or durations): one trial per account (`TRIAL_ONCE_PER_USER`), the `/paysupport` command, and the Free channel / Support buttons in `/start`.
 
-| Item | What the code does now | How to change it |
-|---|---|---|
-| One trial per account | On by default. A second trial purchase is refused before payment, and `/rules` shows "One trial per account." | Set `TRIAL_ONCE_PER_USER=false` in `.env`. Repeat trials then extend the current trial, and the `/rules` line disappears. |
-| `/paysupport` command | Added. It replies with the support contact. `/rules` and two error messages point to it. | Ask me to remove it. Telegram's payment rules appear to expect a way for buyers to reach payment support; I couldn't confirm the exact rule from this environment. |
-| Free channel / Support buttons in `/start` | Added under the two plan buttons | Ask me to remove them |
+### Protections
 
-**What the bot checks and protects against:**
-- **Payments:** checked before and after checkout (currency `XTR`, amount, invoice payload, buyer). Duplicate payment updates are ignored.
-- **Records:** payments and trials are saved in SQLite, so they survive restarts.
-- **Expired trials:** checked every 5 minutes.
+| Risk | What the bot does |
+|---|---|
+| Trial buyer creates unlimited invite links | At most **3 links per trial**. A new link is only given to a buyer who is not in the channel, and **every older link is revoked first**. If an old link can't be revoked, no new one is made. |
+| Someone joins with another buyer's link, or with a link of an ended trial | **Removed** immediately (not permanently banned), the link is revoked, and admins are alerted. Admins, and users with their own paid trial, are left alone. Trial-style links the bot has no record of (for example from the older bot) are **never** acted on, only reported. |
+| Crash between payment and trial | Payment and trial are saved in **one database transaction**. When Telegram re-sends the payment after a restart, the buyer gets their link. Older records with a payment but no trial are found and fixed automatically. |
+| Payment that doesn't match an offer | Recorded, no access given, **admin alerted** (consider a refund). |
+| Unban after removal fails, so the member stays banned | The member is put in a retry queue. The bot retries every 5 minutes until the unban works, and alerts admins after 3 failures. |
+| Unexpected errors | Logged (the bot token is removed from logs) and sent to admins, at most once per 15 minutes per kind of error. |
+| Database loss | Automatic daily backups (see below). |
+| Starting this bot would take over the live bot's webhook | At startup the bot checks (read-only) whether the token has a webhook. If it does, it **refuses to start**. |
 
 ### What the bot needs
 
-- An **always-on** process: a VPS (the `deploy/shakhira-bot.service` file sets this up) or any host that keeps a Python program running.
+- An **always-on** process (a VPS; `deploy/shakhira-bot.service` sets it up).
 - The bot as an **admin of the private VIP channel**, with **Invite Users via Link** and **Ban Users** on.
-- `.env` on that machine with:
-  - `BOT_TOKEN`: the same bot token. The bot reads `BOT_TOKEN`; the poster reads `TELEGRAM_BOT_TOKEN`.
-  - `VIP_CHANNEL_ID`: the private channel's **numeric ID**. Find it at <https://web.telegram.org/a/>: open the channel and copy the `-100…` number at the end of the address.
-- **Only one copy** of the bot may run at a time. Stop any older bot first.
+- `.env` on that machine (see `.env.example`):
+  - `BOT_TOKEN`: the bot token. The poster's `TELEGRAM_BOT_TOKEN` is the same value.
+  - `VIP_CHANNEL_ID`: the private channel's numeric `-100…` ID.
+  - `ADMIN_CHAT_IDS`: your numeric Telegram user ID(s) for alerts. Press **Start** in the bot once.
+  - Optional: `BACKUP_DIR` (default `data/backups`), `BACKUP_KEEP` (14), `BACKUP_INTERVAL_HOURS` (24, `0` = off).
+- **Only one copy** of the bot may run per token. The old bot must be stopped first.
 
 ### Run the bot
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env                 # then edit .env
 python -m shakhira_bot --check-config
 python -m shakhira_bot
 ```
+
+If it says `Not starting: This bot token has a webhook set`, another program (probably the live bot) is using this token. Retire that first. Only then start with `python -m shakhira_bot --take-over-webhook`.
 
 ### Run it 24/7 on an Ubuntu server
 
@@ -252,15 +223,21 @@ sudo systemctl daemon-reload && sudo systemctl enable --now shakhira-bot
 sudo journalctl -u shakhira-bot -f
 ```
 
-Back up `data/shakhira_bot.db`: it holds the trial payment records.
+### Backups and restore
+
+- The bot writes a backup to `data/backups/` two minutes after starting, then every 24 hours. It uses SQLite's online backup, so the bot keeps running. Each copy is integrity-checked and readable only by the bot's user. The newest 14 are kept.
+- One backup by hand: `sudo -u shakhira .venv/bin/python -m shakhira_bot --backup`
+- **Copy backups off the server** too, for example a daily `rsync` or `rclone` of `data/backups/` to cloud storage. A backup on the same disk doesn't survive losing the server.
+- **Restore:** `sudo systemctl stop shakhira-bot`, then copy the chosen `data/backups/shakhira_bot-YYYYMMDD-HHMMSS.db` over `data/shakhira_bot.db` (keep the old file aside), then `sudo systemctl start shakhira-bot`.
 
 ### Good to know
 
-- **Cancelling monthly:** members cancel in Telegram (Settings → My Stars). Telegram removes them when the paid period ends. The bot can't cancel or refund.
-- **Refunds:** not built into the bot.
-- **Trials sold by an older bot** aren't in this database, so they won't be removed automatically.
+- **Cancelling monthly:** members cancel in Telegram (Settings → My Stars). The bot can't cancel or refund.
+- **Refunds:** not built in. Payment alerts tell you when one may be needed.
+- **Trials sold by the older bot** aren't in this database, so they won't be removed automatically.
 - **Changing the monthly price** creates a new subscription link. Existing subscribers keep their old price.
-- **If you revoke the monthly link** in Telegram, run `python -m shakhira_bot --reset-monthly-link` and restart the bot.
+- **If you revoke the monthly link** in Telegram, run `python -m shakhira_bot --reset-monthly-link` and restart.
+- Dates shown to users are in UTC.
 
 ---
 
@@ -271,16 +248,17 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests use fake Telegram and Cloudinary services. They never charge Stars, post anything, or touch real members.
+The tests use fake Telegram and Cloudinary services. They never charge Stars, post anything, or touch real members. They also run automatically on every pull request (`.github/workflows/tests.yml`, no secrets).
 
 ## Status
 
 | | Status |
 |---|---|
-| Poster code, workflow, tests | Done. Tested with fakes only. |
-| Automatic twice-daily schedule | **Off.** Turn it on after Step 3 (see Schedule). |
-| Poster against the real Cloudinary account and channel | **Not verified yet.** Run Step 3. |
-| Bot admin rights in @yourshakhira | **Not verified.** The `check` mode verifies it. |
-| Subscription bot code and tests (this repo) | Done. Tested with fakes only. **Not the code of the bot that is live today.** |
-| Subscription bot from this repo deployed | **No.** Needs an always-on host and your go-ahead. Your current live bot keeps running unchanged. |
-| One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (see Part 2). |
+| Poster on GitHub Actions, 5 AM and 10 PM IST | **Running.** 34 posts, 23 Oct to 8 Nov. |
+| Content in Cloudinary `tgpub` | **Used up since 9 Nov.** Upload new media. |
+| Exhaustion and low-content alerts, run summary, posting report, once-per-slot guard | Done in this update, tested with fakes. Alerts by Telegram need the `ADMIN_CHAT_ID` variable. |
+| On-time external trigger (cron-job.org) | **Proposed, not set up.** See "On-time posting". |
+| Content recycling | **Off.** Only with `POST_WHEN_EXHAUSTED=restart`. |
+| Subscription bot code (this repo) | Security fixes done and tested with fakes. **Not deployed, not the live bot.** |
+| Live @ShakhiraVIPBot | Runs elsewhere; source and host not yet identified. |
+| One-trial rule, `/paysupport`, extra menu buttons | **Waiting for your approval** (Part 2). |
