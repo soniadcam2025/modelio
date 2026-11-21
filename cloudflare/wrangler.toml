@@ -18,7 +18,7 @@ run_worker_first = true   # every response goes through the Worker so security h
 [[d1_databases]]
 binding = "DB"
 database_name = "shakhira-staging"
-database_id = "REPLACE_WITH_STAGING_D1_ID"
+database_id = "9f817e23-7415-416c-8f7b-bb15eeeab6c4"
 migrations_dir = "migrations"
 
 [vars]
