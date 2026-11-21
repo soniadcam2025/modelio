@@ -169,3 +169,41 @@ test("pause switches: master pause stops all sends; the poster flag is public an
   const actions = (await new Ops(e.DB).all("SELECT action FROM audit_log WHERE action LIKE '%pause' OR action LIKE '%resume'")).map((a) => a.action);
   assert.deepEqual(actions, ["automation_pause", "poster_pause", "automation_resume", "poster_resume"]);
 });
+
+test("formatting and buttons: only Telegram-supported HTML, up to 6 link buttons, passed to Telegram", async () => {
+  const e = env({ BOT_TOKEN: TOKEN, REQUIRE_PREVIEW: "false" }), s = await login(e);
+  const bad = await call(e, s, "/api/content", "POST", { kind: "text", target: "public", parse_mode: "HTML", text: "<script>x</script>" });
+  assert.match(bad.body.error, /not supported/);
+  assert.match((await call(e, s, "/api/content", "POST", { kind: "text", target: "public", parse_mode: "HTML", text: '<a href="javascript:x">x</a>' })).body.error, /not supported/);
+  assert.match((await call(e, s, "/api/content", "POST", { kind: "text", target: "public", text: "x", buttons: [{ text: "A", url: "http://insecure" }] })).body.error, /https/);
+  assert.equal((await call(e, s, "/api/content", "POST", { kind: "poll", target: "public", text: "q?", options: ["a", "b"], buttons: [{ text: "A", url: "https://a.b" }] })).status, 400);
+  assert.equal((await call(e, s, "/api/content", "POST", { kind: "text", target: "public", text: "x", buttons: Array.from({ length: 7 }, () => ({ text: "A", url: "https://a.b" })) })).status, 400);
+  const text = '<b>New</b> drop 🔥 <a href="https://t.me/ShakhiraVIPBot">Join VIP</a>';
+  const c = (await call(e, s, "/api/content", "POST", { kind: "photo", target: "public", media_url: "https://res.cloudinary.com/x/p.jpg", parse_mode: "HTML", text,
+    hashtags: "#vip", buttons: [{ text: "💎 Join VIP", url: "https://t.me/ShakhiraVIPBot?start=x" }, { text: "Instagram", url: "https://instagram.com/x" }] })).body;
+  await on(e, "scheduled_posts");
+  await call(e, s, `/api/content/${c.id}/publish`, "POST", { confirm: true });
+  sent.length = 0;
+  await runScheduled(e, Math.floor(Date.now() / 1000) + 5);
+  const p = sent.find((x) => x.method === "sendPhoto").params;
+  assert.equal(p.parse_mode, "HTML");
+  assert.equal(p.caption, `${text}\n\n#vip`);
+  assert.deepEqual(p.reply_markup.inline_keyboard.map((r) => r[0].text), ["💎 Join VIP", "Instagram"]);
+});
+
+test("Bot & channels shows each channel's reaction settings from Telegram (read-only, no counts invented)", async () => {
+  const e = env({ BOT_TOKEN: TOKEN }), s = await login(e);
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const m = String(url).split("/").pop();
+    if (m === "getChat") return new Response(JSON.stringify({ ok: true, result: JSON.parse(init.body).chat_id === "-100777"
+      ? { title: "VIP", type: "channel", available_reactions: [{ type: "emoji", emoji: "🔥" }, { type: "emoji", emoji: "❤" }] } : { title: "Public", type: "channel" } }));
+    if (m === "getChatMemberCount") return new Response(JSON.stringify({ ok: true, result: 10 }));
+    return orig(url, init);
+  };
+  try {
+    const t = (await call(e, s, "/api/telegram")).body;
+    assert.deepEqual(t.channels.vip.reactions, ["🔥", "❤"]);
+    assert.equal(t.channels.public.reactions, "all");
+  } finally { globalThis.fetch = orig; }
+});

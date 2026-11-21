@@ -25,6 +25,10 @@ function scope(botScope) {
 }
 
 function markup(item, config) {
+  if (item.buttons_json) {
+    const rows = JSON.parse(item.buttons_json).map((b) => [{ text: b.text, url: b.url }]);
+    if (rows.length) return { inline_keyboard: rows };
+  }
   if (item.button_text && item.button_url) return { inline_keyboard: [[{ text: item.button_text, url: item.button_url }]] };
   if (item.kind === "promo") return { inline_keyboard: [[{ text: "💎 Join VIP", url: `https://t.me/${config.botUsername}?start=promo_${item.id}` }]] };
   return undefined;
@@ -36,11 +40,12 @@ export async function sendItem(tg, config, item, text) {
   const caption = text || undefined;
   // Telegram's "protected content": no forwarding or saving in official apps. Screenshots and other apps can still copy it.
   const protect_content = Number(item.protect_content) ? true : undefined;
+  const parse_mode = item.parse_mode === "HTML" ? "HTML" : undefined;
   switch (item.kind) {
-    case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content });
-    case "photo": return tg.call("sendPhoto", { chat_id, photo: item.media_url, caption, reply_markup, protect_content });
-    case "video": return tg.call("sendVideo", { chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
-    case "animation": return tg.call("sendAnimation", { chat_id, animation: item.media_url, caption, reply_markup, protect_content });
+    case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content, parse_mode });
+    case "photo": return tg.call("sendPhoto", { parse_mode, chat_id, photo: item.media_url, caption, reply_markup, protect_content });
+    case "video": return tg.call("sendVideo", { parse_mode, chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
+    case "animation": return tg.call("sendAnimation", { parse_mode, chat_id, animation: item.media_url, caption, reply_markup, protect_content });
     case "poll": case "quiz": {
       const params = { chat_id, question: text, options: JSON.parse(item.options_json).map((t) => ({ text: t })),
         is_anonymous: true, allows_multiple_answers: !!item.multiple_answers, protect_content };
@@ -50,7 +55,7 @@ export async function sendItem(tg, config, item, text) {
     case "paid_media": {
       const path = item.media_url.toLowerCase().split("?")[0];
       const type = VIDEO_EXT.some((e) => path.endsWith(e)) ? "video" : "photo";
-      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption, protect_content });
+      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption, parse_mode, protect_content, reply_markup });
     }
     default: throw new Error(`Unknown content kind ${item.kind}`);
   }

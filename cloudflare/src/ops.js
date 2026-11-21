@@ -108,6 +108,22 @@ export function validateContent(data) {
   const hashtags = tags.map((t) => "#" + t).join(" ");
   if (hashtags && !["poll", "quiz"].includes(kind) && text.length + hashtags.length + 2 > limit)
     throw new OpsError(`Text plus hashtags must fit in ${limit} characters`);
+  // Formatting: Telegram HTML (only the tags Telegram supports), so links can have their own text.
+  const parseMode = data.parse_mode === "HTML" ? "HTML" : "";
+  if (parseMode && !["poll", "quiz"].includes(kind)) {
+    const bad = (text.match(/<\/?([a-zA-Z-]+)[^>]*>/g) || []).find((t) => !/^<\/?(b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)>$|^<a href="(https:\/\/|tg:\/\/)[^"<>]{1,500}">$|^<\/a>$/.test(t));
+    if (bad) throw new OpsError(`Formatting: ${bad} is not supported. Use <b>, <i>, <u>, <s>, <a href="https://…">, <code>, <blockquote> or <tg-spoiler>`);
+  }
+  // Inline buttons: up to 6, one per row, each opening a link.
+  let buttons = Array.isArray(data.buttons) ? data.buttons : data.buttons_json ? JSON.parse(data.buttons_json) : [];
+  buttons = buttons.filter((b) => String(b?.text ?? "").trim() || String(b?.url ?? "").trim());
+  if (buttons.length > 6) throw new OpsError("Use at most 6 buttons");
+  buttons = buttons.map((b) => {
+    const t = cleanText(b.text, 64, "Button text"), u = String(b.url ?? "").trim();
+    if (!t || !startsWithAny(u, [...URL_PREFIXES, ...TG_PREFIXES]) || u.length > 500) throw new OpsError("Each button needs text and an https:// or t.me link");
+    return { text: t, url: u };
+  });
+  if (buttons.length && ["poll", "quiz"].includes(kind)) throw new OpsError("Polls and quizzes can't have buttons");
   // Recurring schedule: {"every": "daily" | "weekly", "until": <unix time>?, "count": <total posts>?}
   let repeat = data.repeat ?? (data.repeat_json ? JSON.parse(data.repeat_json) : null);
   if (repeat && repeat.every) {
@@ -118,6 +134,8 @@ export function validateContent(data) {
     repeat = JSON.stringify({ every: repeat.every, ...(until ? { until } : {}), ...(count ? { count } : {}) });
   } else repeat = "";
   return {
+    parse_mode: ["poll", "quiz"].includes(kind) ? "" : parseMode,
+    buttons_json: buttons.length ? JSON.stringify(buttons) : "",
     protect_content: data.protect_content ? 1 : 0,
     repeat_json: repeat,
     bot_id: botId,
@@ -198,10 +216,10 @@ export class Ops {
     const r = await this.run(
       "INSERT INTO content_items (kind, target, text, media_url, options_json, correct_option, explanation, multiple_answers, " +
       "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at, " +
-      "expire_after_minutes, source, hashtags, bot_id, protect_content, repeat_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "expire_after_minutes, source, hashtags, bot_id, protect_content, repeat_json, parse_mode, buttons_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers,
       v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now,
-      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags, v.bot_id, v.protect_content, v.repeat_json);
+      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags, v.bot_id, v.protect_content, v.repeat_json, v.parse_mode, v.buttons_json);
     const id = r.meta.last_row_id;
     await this.audit(actor, "content_create", `#${id} ${v.kind} -> ${v.target}`);
     return this.content(id);
@@ -230,9 +248,9 @@ export class Ops {
     await this.checkBotTarget(v);
     await this.run(
       "UPDATE content_items SET kind=?, target=?, text=?, media_url=?, options_json=?, correct_option=?, explanation=?, multiple_answers=?, " +
-      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, bot_id=?, protect_content=?, repeat_json=?, updated_at=? WHERE id=?",
+      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, bot_id=?, protect_content=?, repeat_json=?, parse_mode=?, buttons_json=?, updated_at=? WHERE id=?",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers, v.close_after_minutes,
-      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, v.bot_id, v.protect_content, v.repeat_json, this.now(), Number(id));
+      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, v.bot_id, v.protect_content, v.repeat_json, v.parse_mode, v.buttons_json, this.now(), Number(id));
     await this.audit(actor, "content_update", `#${id}`);
     return this.content(id);
   }
@@ -259,7 +277,7 @@ export class Ops {
       if (made >= rule.count) return null;
     }
     const cols = ["kind", "target", "text", "media_url", "options_json", "correct_option", "explanation", "multiple_answers", "close_after_minutes",
-      "star_count", "button_text", "button_url", "use_caption_library", "expire_after_minutes", "hashtags", "bot_id", "protect_content", "repeat_json", "source"];
+      "star_count", "button_text", "button_url", "use_caption_library", "expire_after_minutes", "hashtags", "bot_id", "protect_content", "repeat_json", "source", "parse_mode", "buttons_json"];
     const r = await this.run(`INSERT INTO content_items (${cols.join(", ")}, status, scheduled_at, series_id, occurrence_key, created_by, created_at, updated_at) ` +
       `VALUES (${cols.map(() => "?").join(", ")}, 'scheduled', ?, ?, ?, 'series', ?, ?) ON CONFLICT DO NOTHING`,
       ...cols.map((c) => item[c] ?? (c === "source" ? "" : null)), next, series, `${series}:${next}`, now, now);
