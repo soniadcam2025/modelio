@@ -32,7 +32,9 @@ database_id = "54eb917a-7ff9-4a3b-96b6-2608cebecd1b"
 
 [vars]
 ENVIRONMENT = "production"
-REQUIRE_PREVIEW = "true"
+# Production posting approved on 22 Nov 2026 (posts, polls, promotions; not paid media or member actions).
+# Set back to "true" to lock posting again (posts then go only to the preview chat).
+REQUIRE_PREVIEW = "false"
 PREVIEW_CHAT_ID = ""
 PUBLIC_CHANNEL = "@yourshakhira"
 DISCUSSION_GROUP_ID = ""

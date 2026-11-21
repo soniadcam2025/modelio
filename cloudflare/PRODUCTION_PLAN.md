@@ -53,6 +53,28 @@ There is still exactly **one Telegram webhook receiver**: the live bot `shakhira
 | **L8** | Join requests, moderation, reactions | Claude | Change the live bot, following `LIVE_BOT_INTEGRATION.md`: about 15 lines plus a service binding. Then switch on **join_requests**, **moderation** and **reaction_tracking**. | Roll back the bot version in Cloudflare. |
 | **L9** | Retire Vercel staging | Claude | Delete the Vercel project once the production Worker has run for a week. | Redeploy from `vercel/` in one command. |
 
+## Production posting: ACTIVE since 22 Nov 2026 (01:17 IST)
+
+**Before switching on**
+- The private preview was confirmed by you: post #3 reached your chat.
+- Overdue posts #1 and #2 were held as drafts, not published.
+
+**Settings**
+- **Bot permissions:** @ShakhiraVIPBot may publish posts, polls and promotions only. **Paid media** and **member actions** are off.
+- **Features on:** `scheduled_posts` (plus `member_sync`). All other automations, reminders, admin actions and moderation stay off.
+- **Lock:** `REQUIRE_PREVIEW = "false"`.
+
+**Test post**
+- **Post:** #3 (text) to the public channel, published with explicit confirmation.
+- **Result:** Telegram message ID **43**.
+- **Duplicate check:** watched over 3+ further cron runs; still one post. Every send is claimed before sending, so a post can't go out twice.
+
+**Paid media guard:** in live mode the server refuses to queue any post type the bot isn't permitted to send. Paid media therefore can't be published until its preview and a real Stars payment are tested, and you approve. Then turn on the `paid_media` permission.
+
+**Undo**
+- **Instant:** Automation → pause *Dashboard posting*.
+- **Full lock:** set `REQUIRE_PREVIEW = "true"` and run `npm run deploy:production`. Posts then go only to your preview chat.
+
 ## Content management (built 21 Nov 2026): activation order
 
 Everything below works in the dashboard now. While posting is locked, nothing reaches a channel.

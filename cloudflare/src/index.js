@@ -4,7 +4,7 @@
 import { LoginLimiter, Sessions, constantTimeEqual, readCookie, verifyPassword } from "./auth.js";
 import { SupabaseDB } from "./pg.js";
 import { runBackup } from "./backup.js";
-import { BotStore, PERMISSIONS } from "./bots.js";
+import { botAllows, BotStore, PERMISSIONS } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
@@ -293,17 +293,23 @@ function routes() {
   });
   add("PUT", "/api/content/(\\d+)", async (c, m) => json(contentOut(await c.ops.updateContent(m[1], await body(c.request), c.actor))));
   // Real publishing (live mode) needs an explicit confirmation on every schedule / publish request.
-  const confirmIfLive = (c, b) => {
-    if (automationMode(c.env, c.config) === "live" && b.confirm !== true)
-      throw new OpsError("Confirm that this post will be published to the channel");
+  const confirmIfLive = async (c, b, id) => {
+    if (automationMode(c.env, c.config) !== "live") return;
+    if (b.confirm !== true) throw new OpsError("Confirm that this post will be published to the channel");
+    // Only post types the bot is permitted to send can be queued for real (e.g. paid media stays off until approved).
+    const item = await c.ops.content(id);
+    if (!item) throw new OpsError("Not found");
+    const bot = item.bot_id ? await c.ops.one("SELECT * FROM bots WHERE id = ?", item.bot_id) : await c.ops.one("SELECT * FROM bots WHERE is_primary = 1");
+    if (bot && !botAllows(bot, item.kind))
+      throw new OpsError(`@${bot.username} is not permitted to publish ${item.kind === "paid_media" ? "paid media" : item.kind + " posts"} yet (Bots & integrations → Manage → Permissions)`);
   };
   add("POST", "/api/content/(\\d+)/schedule", async (c, m) => {
-    const b = await body(c.request); confirmIfLive(c, b);
+    const b = await body(c.request); await confirmIfLive(c, b, m[1]);
     if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} scheduled`);
     return json(contentOut(await c.ops.scheduleContent(m[1], b.scheduled_at, c.actor)));
   });
   add("POST", "/api/content/(\\d+)/publish", async (c, m) => {
-    const b = await body(c.request); confirmIfLive(c, b);
+    const b = await body(c.request); await confirmIfLive(c, b, m[1]);
     if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} now`);
     return json(contentOut(await c.ops.scheduleContent(m[1], c.ops.now(), c.actor)));
   });
