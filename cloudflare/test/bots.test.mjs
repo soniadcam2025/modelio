@@ -40,6 +40,8 @@ globalThis.fetch = async (url, init = {}) => {
   if (method === "getMe") return ok(me);
   if (method === "getWebhookInfo") return ok({ url: me.id === 1111111111 ? "https://live-bot.example/telegram" : "", pending_update_count: 0 });
   if (method === "getChat") return ok({ id: params.chat_id, title: `Chat ${params.chat_id}`, type: "channel" });
+  if (method === "getChatMember") return ok(params.chat_id === "-1009999" ? { status: "member" } : params.chat_id === "-1009998"
+    ? { status: "administrator", can_post_messages: false } : { status: "administrator", can_post_messages: true });
   return ok({ message_id: 77 });
 };
 
@@ -111,6 +113,8 @@ test("isolation: a bot can only use its own channels, permissions and switch", a
   const vip = (await call(e, s, "/api/bots", "POST", { token: VIP_TOKEN, password: PASSWORD })).body;
   const news = (await call(e, s, "/api/bots", "POST", { token: NEW_TOKEN, password: PASSWORD })).body;
   assert.equal((await call(e, s, `/api/bots/${news.id}/channels`, "POST", { chat_id: "-1009001" })).status, 200);
+  assert.match((await call(e, s, `/api/bots/${news.id}/channels`, "POST", { chat_id: "-1009999" })).body.error, /not an admin/);
+  assert.match((await call(e, s, `/api/bots/${news.id}/channels`, "POST", { chat_id: "-1009998" })).body.error, /can't post/);
   const steal = await call(e, s, `/api/bots/${vip.id}/channels`, "POST", { chat_id: "-1009001" });
   assert.equal(steal.body.error, "That channel belongs to another bot", steal.text);
   const post = (b) => call(e, s, "/api/content", "POST", { kind: "text", text: "hi", ...b });
@@ -129,7 +133,9 @@ test("isolation: a bot can only use its own channels, permissions and switch", a
   const items = Object.fromEntries((await call(e, s, "/api/content")).body.map((i) => [i.id, i]));
   assert.equal(items[mine.id].status, "failed", "no 'posts' permission yet");
   assert.match(items[mine.id].last_error, /permission/);
-  await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now });
+  const unconfirmed = await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now });
+  assert.match(unconfirmed.body.error, /Confirm/, "live mode: every real publish needs explicit confirmation");
+  assert.equal((await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now, confirm: true })).status, 200);
   await call(e, s, `/api/bots/${news.id}/permissions`, "PUT", { permissions: { posts: true, member_actions: true } });
   assert.equal((await call(e, s, `/api/bots/${news.id}`.replace(/$/, "/history"))).body.bot.permissions.member_actions, false, "member actions only for the primary bot");
   sent.length = 0;

@@ -185,6 +185,6 @@ test("/api/me advertises the new capabilities to the shared frontend", async () 
   const e = env();
   const s = await login(e);
   const me = await (await call(e, s, "/api/me")).json();
-  assert.deepEqual(me.capabilities, ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots"]);
+  assert.deepEqual(me.capabilities, ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots", "content_v2"]);
   assert.equal(me.automation, "simulated");
 });

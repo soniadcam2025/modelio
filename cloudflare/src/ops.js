@@ -108,7 +108,18 @@ export function validateContent(data) {
   const hashtags = tags.map((t) => "#" + t).join(" ");
   if (hashtags && !["poll", "quiz"].includes(kind) && text.length + hashtags.length + 2 > limit)
     throw new OpsError(`Text plus hashtags must fit in ${limit} characters`);
+  // Recurring schedule: {"every": "daily" | "weekly", "until": <unix time>?, "count": <total posts>?}
+  let repeat = data.repeat ?? (data.repeat_json ? JSON.parse(data.repeat_json) : null);
+  if (repeat && repeat.every) {
+    if (!["daily", "weekly"].includes(repeat.every)) throw new OpsError("Repeat daily or weekly");
+    const until = repeat.until === undefined || repeat.until === null || repeat.until === "" ? null : toInt(repeat.until);
+    const count = repeat.count === undefined || repeat.count === null || repeat.count === "" ? null : toInt(repeat.count);
+    if (Number.isNaN(until) || Number.isNaN(count) || (count !== null && (count < 2 || count > 365))) throw new OpsError("Repeat: end date or 2–365 posts");
+    repeat = JSON.stringify({ every: repeat.every, ...(until ? { until } : {}), ...(count ? { count } : {}) });
+  } else repeat = "";
   return {
+    protect_content: data.protect_content ? 1 : 0,
+    repeat_json: repeat,
     bot_id: botId,
     hashtags,
     kind, target, text, media_url: mediaUrl, options_json: JSON.stringify(options), correct_option: correct, explanation,
@@ -187,10 +198,10 @@ export class Ops {
     const r = await this.run(
       "INSERT INTO content_items (kind, target, text, media_url, options_json, correct_option, explanation, multiple_answers, " +
       "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at, " +
-      "expire_after_minutes, source, hashtags, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)",
+      "expire_after_minutes, source, hashtags, bot_id, protect_content, repeat_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers,
       v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now,
-      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags, v.bot_id);
+      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags, v.bot_id, v.protect_content, v.repeat_json);
     const id = r.meta.last_row_id;
     await this.audit(actor, "content_create", `#${id} ${v.kind} -> ${v.target}`);
     return this.content(id);
@@ -219,9 +230,9 @@ export class Ops {
     await this.checkBotTarget(v);
     await this.run(
       "UPDATE content_items SET kind=?, target=?, text=?, media_url=?, options_json=?, correct_option=?, explanation=?, multiple_answers=?, " +
-      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, bot_id=?, updated_at=? WHERE id=?",
+      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, bot_id=?, protect_content=?, repeat_json=?, updated_at=? WHERE id=?",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers, v.close_after_minutes,
-      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, v.bot_id, this.now(), Number(id));
+      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, v.bot_id, v.protect_content, v.repeat_json, this.now(), Number(id));
     await this.audit(actor, "content_update", `#${id}`);
     return this.content(id);
   }
@@ -232,6 +243,37 @@ export class Ops {
     await this.run("UPDATE content_items SET status='scheduled', scheduled_at=?, last_error='', updated_at=? WHERE id=?", at, this.now(), Number(id));
     await this.audit(actor, "content_schedule", `#${id} at ${at}`);
     return this.content(id);
+  }
+  // After a recurring post goes out, queue its next occurrence (skipping times already past). The unique
+  // occurrence key means a retried or concurrent run can never create the same occurrence twice.
+  async scheduleNextOccurrence(item, now) {
+    if (!item.repeat_json) return null;
+    const rule = JSON.parse(item.repeat_json);
+    const step = rule.every === "weekly" ? 7 * 86400 : 86400;
+    const series = Number(item.series_id || item.id);
+    let next = Number(item.scheduled_at) + step;
+    while (next <= now) next += step;
+    if (rule.until && next > rule.until) return null;
+    if (rule.count) {
+      const made = Number((await this.one("SELECT COUNT(*) AS n FROM content_items WHERE id = ? OR series_id = ?", series, series))?.n || 0);
+      if (made >= rule.count) return null;
+    }
+    const cols = ["kind", "target", "text", "media_url", "options_json", "correct_option", "explanation", "multiple_answers", "close_after_minutes",
+      "star_count", "button_text", "button_url", "use_caption_library", "expire_after_minutes", "hashtags", "bot_id", "protect_content", "repeat_json", "source"];
+    const r = await this.run(`INSERT INTO content_items (${cols.join(", ")}, status, scheduled_at, series_id, occurrence_key, created_by, created_at, updated_at) ` +
+      `VALUES (${cols.map(() => "?").join(", ")}, 'scheduled', ?, ?, ?, 'series', ?, ?) ON CONFLICT DO NOTHING`,
+      ...cols.map((c) => item[c] ?? (c === "source" ? "" : null)), next, series, `${series}:${next}`, now, now);
+    if (r.meta.changes === 1) await this.audit("worker", "series_next", `#${r.meta.last_row_id} (series #${series}) at ${next}`);
+    return r.meta.changes === 1 ? next : null;
+  }
+  async stopSeries(id, actor) {
+    const item = await this.content(id);
+    if (!item) throw new OpsError("Not found");
+    const series = Number(item.series_id || item.id);
+    await this.run("UPDATE content_items SET repeat_json = '', updated_at = ? WHERE id = ? OR series_id = ?", this.now(), series, series);
+    const r = await this.run("UPDATE content_items SET status = 'cancelled', updated_at = ? WHERE (id = ? OR series_id = ?) AND status IN ('scheduled', 'draft')", this.now(), series, series);
+    await this.audit(actor, "series_stop", `series #${series}, ${r.meta.changes} upcoming cancelled`);
+    return { cancelled: r.meta.changes };
   }
   async cancelContent(id, actor) {
     const item = await this.content(id);
