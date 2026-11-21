@@ -133,11 +133,9 @@ test("isolation: a bot can only use its own channels, permissions and switch", a
   const items = Object.fromEntries((await call(e, s, "/api/content")).body.map((i) => [i.id, i]));
   assert.equal(items[mine.id].status, "failed", "no 'posts' permission yet");
   assert.match(items[mine.id].last_error, /permission/);
-  const unconfirmed = await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now });
-  assert.match(unconfirmed.body.error, /Confirm/, "live mode: every real publish needs explicit confirmation");
-  assert.match((await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now, confirm: true })).body.error, /not permitted/, "can't queue without the permission");
+  assert.match((await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now })).body.error, /not permitted/, "can't queue without the permission");
   await call(e, s, `/api/bots/${news.id}/permissions`, "PUT", { permissions: { posts: true, member_actions: true } });
-  assert.equal((await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now, confirm: true })).status, 200);
+  assert.equal((await call(e, s, `/api/content/${mine.id}/schedule`, "POST", { scheduled_at: now })).status, 200, "one click once permitted");
   assert.equal((await call(e, s, `/api/bots/${news.id}`.replace(/$/, "/history"))).body.bot.permissions.member_actions, false, "member actions only for the primary bot");
   sent.length = 0;
   await runScheduled(e, now + 120);

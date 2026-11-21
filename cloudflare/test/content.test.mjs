@@ -1,4 +1,4 @@
-// Content management: publish now / schedule with confirmation, recurring series without duplicates,
+// Content management: one-click publish now / schedule, recurring series without duplicates,
 // protected content, private previews, automation pause switches and the Cloudinary media library.
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -84,7 +84,7 @@ test("protected content is passed to every kind of send", async () => {
   for (const p of [{ kind: "text", text: "t" }, { kind: "photo", media_url: "https://res.cloudinary.com/x/p.jpg" }, { kind: "video", media_url: "https://res.cloudinary.com/x/v.mp4" },
     { kind: "animation", media_url: "https://res.cloudinary.com/x/g.gif" }, { kind: "poll", text: "q?", options: ["a", "b"] }, { kind: "paid_media", media_url: "https://res.cloudinary.com/x/p.jpg", star_count: 50 }]) {
     const c = (await call(e, s, "/api/content", "POST", { target: "vip", protect_content: true, ...p })).body;
-    assert.equal((await call(e, s, `/api/content/${c.id}/publish`, "POST", { confirm: true })).status, 200);
+    assert.equal((await call(e, s, `/api/content/${c.id}/publish`, "POST", {})).status, 200);
   }
   sent.length = 0;
   await runScheduled(e, now + 5);
@@ -94,12 +94,20 @@ test("protected content is passed to every kind of send", async () => {
   assert.equal(sends.find((x) => x.method === "sendPaidMedia").params.star_count, 50);
 });
 
-test("publish now and schedule need explicit confirmation only when posting is live", async () => {
+test("publish now and schedule work with one click for signed-in admins, and are audited", async () => {
   const live = env({ BOT_TOKEN: TOKEN, REQUIRE_PREVIEW: "false" }), s = await login(live);
   const c = (await call(live, s, "/api/content", "POST", { kind: "text", target: "public", text: "hello" })).body;
-  assert.match((await call(live, s, `/api/content/${c.id}/publish`, "POST", {})).body.error, /Confirm/);
-  assert.equal((await call(live, s, `/api/content/${c.id}/publish`, "POST", { confirm: true })).body.status, "scheduled");
-  assert.ok((await new Ops(live.DB).all("SELECT * FROM audit_log WHERE action='publish_confirmed'")).length === 1);
+  assert.equal((await call(live, null, `/api/content/${c.id}/publish`, "POST", {})).status, 401, "still needs sign-in");
+  assert.equal((await call(live, s, `/api/content/${c.id}/publish`, "POST", {})).body.status, "scheduled");
+  assert.ok((await new Ops(live.DB).all("SELECT * FROM audit_log WHERE action='publish_now'")).length === 1);
+  // Pressing Publish now twice still sends once (the scheduler claims each post before sending).
+  await call(live, s, `/api/content/${c.id}/publish`, "POST", {});
+  await on(live, "scheduled_posts");
+  sent.length = 0;
+  await runScheduled(live, Math.floor(Date.now() / 1000) + 5);
+  await runScheduled(live, Math.floor(Date.now() / 1000) + 65);
+  assert.equal(sent.filter((x) => x.method === "sendMessage").length, 1);
+  assert.equal((await call(live, s, `/api/content/${c.id}/publish`, "POST", {})).status, 400, "a posted post can't be published again");
   const sim = env(), s2 = await login(sim);
   const c2 = (await call(sim, s2, "/api/content", "POST", { kind: "text", target: "public", text: "hello" })).body;
   assert.equal((await call(sim, s2, `/api/content/${c2.id}/publish`, "POST", {})).status, 200, "simulated: nothing real is sent");
@@ -182,7 +190,7 @@ test("formatting and buttons: only Telegram-supported HTML, up to 6 link buttons
   const c = (await call(e, s, "/api/content", "POST", { kind: "photo", target: "public", media_url: "https://res.cloudinary.com/x/p.jpg", parse_mode: "HTML", text,
     hashtags: "#vip", buttons: [{ text: "💎 Join VIP", url: "https://t.me/ShakhiraVIPBot?start=x" }, { text: "Instagram", url: "https://instagram.com/x" }] })).body;
   await on(e, "scheduled_posts");
-  await call(e, s, `/api/content/${c.id}/publish`, "POST", { confirm: true });
+  await call(e, s, `/api/content/${c.id}/publish`, "POST", {});
   sent.length = 0;
   await runScheduled(e, Math.floor(Date.now() / 1000) + 5);
   const p = sent.find((x) => x.method === "sendPhoto").params;
@@ -213,10 +221,10 @@ test("live mode: a post type the bot isn't permitted to send can't be queued (pa
   const bot = (await call(e, s, "/api/bots", "POST", { token: TOKEN, password: PASSWORD })).body;
   await call(e, s, `/api/bots/${bot.id}/permissions`, "PUT", { permissions: { posts: true, polls: true, promos: true, paid_media: false } });
   const paid = (await call(e, s, "/api/content", "POST", { kind: "paid_media", target: "vip", media_url: "https://res.cloudinary.com/x/p.jpg", star_count: 5 })).body;
-  const r = await call(e, s, `/api/content/${paid.id}/publish`, "POST", { confirm: true });
+  const r = await call(e, s, `/api/content/${paid.id}/publish`, "POST", {});
   assert.equal(r.status, 400);
   assert.match(r.body.error, /not permitted to publish paid media/);
-  assert.equal((await call(e, s, `/api/content/${paid.id}/schedule`, "POST", { confirm: true, scheduled_at: 2_000_000_000 })).status, 400);
+  assert.equal((await call(e, s, `/api/content/${paid.id}/schedule`, "POST", { scheduled_at: 2_000_000_000 })).status, 400);
   const txt = (await call(e, s, "/api/content", "POST", { kind: "text", target: "public", text: "ok" })).body;
-  assert.equal((await call(e, s, `/api/content/${txt.id}/publish`, "POST", { confirm: true })).status, 200);
+  assert.equal((await call(e, s, `/api/content/${txt.id}/publish`, "POST", {})).status, 200);
 });

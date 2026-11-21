@@ -346,7 +346,7 @@ async function pageContent(main) {
 }
 
 function rowActions(i) {
-  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(e); };
   const btns = [];
   if (["draft", "scheduled", "failed"].includes(i.status)) btns.push(h("button", { class: "link", onclick: stop(() => editor(i)) }, "Edit"));
   if (["draft", "failed"].includes(i.status)) btns.push(h("button", { class: "link", onclick: stop(() => schedulePrompt(i)) }, "Schedule"));
@@ -355,10 +355,9 @@ function rowActions(i) {
   if (["poll", "quiz"].includes(i.kind) && i.status === "posted" && !i.poll_closed_at) btns.push(h("button", { class: "link", onclick: stop(async () => { if (await act(() => api("/api/actions", { method: "POST", body: { kind: "close_poll", payload: { content_id: i.id } } }), "The worker will close the poll")) route(); }) }, "Close poll"));
   if (can("content_v2")) {
     btns.push(h("button", { class: "link", onclick: stop(async () => { await act(() => api(`/api/content/${i.id}/preview`, { method: "POST" }), "Preview sent to your Telegram"); }) }, "Preview"));
-    if (i.status === "failed") btns.push(h("button", { class: "link", onclick: stop(async () => {
-      let confirmed = false;
-      if (state.automation === "live") { if (!confirm("Retry publishing this post for real now?")) return; confirmed = true; }
-      if (await act(() => api(`/api/content/${i.id}/publish`, { method: "POST", body: { confirm: confirmed } }), "Retrying within a minute")) route();
+    if (i.status === "failed") btns.push(h("button", { class: "link", onclick: stop(async (e) => {
+      const btn = e?.currentTarget; if (btn) btn.disabled = true;
+      if (await act(() => api(`/api/content/${i.id}/publish`, { method: "POST" }), "Retrying within a minute")) route(); else if (btn) btn.disabled = false;
     }) }, "Retry"));
     if (i.repeat_json || i.series_id) btns.push(h("button", { class: "link danger", onclick: stop(async () => { if (confirm("Stop this repeating post? Upcoming copies are cancelled.") && await act(() => api(`/api/content/${i.id}/stop-series`, { method: "POST" }), "Series stopped")) route(); }) }, "Stop repeating"));
   }
@@ -503,29 +502,24 @@ function editor(item, preset = {}) {
     ...(can("content_v2") ? { protect_content: protect.checked, repeat: repeat.value ? { every: repeat.value, count: repeatCount.value || null } : null } : {}),
   });
   // mode: "draft" | "schedule" | "publish" | "preview"
+  // One request at a time: every action button in the editor is disabled until the current one finishes.
+  let busy = false;
   async function save(mode) {
+    if (busy) return;
+    busy = true;
+    const buttonsEls = [...document.querySelectorAll(".drawer .row.end button")];
+    buttonsEls.forEach((b) => { b.disabled = true; });
+    try { await saveInner(mode); } finally { busy = false; buttonsEls.forEach((b) => { b.disabled = false; }); }
+  }
+  async function saveInner(mode) {
     const body = payload();
     if (mode === true) mode = "schedule";
     if (mode === "schedule" && !body.scheduled_at) { toast("Choose when to publish", true); return; }
-    let confirmed = false;
-    if (["schedule", "publish"].includes(mode)) {
-      const where = target.options[target.selectedIndex]?.text || "the channel";
-      const bot = target.value.includes("|") ? where.split(" → ")[0] : `@${state.primaryBot || "ShakhiraVIPBot"}`;
-      const summary = (text.value || (useLib.checked ? "(caption from the library)" : "")).replace(/<[^>]+>/g, "").slice(0, 160);
-      const destination = { live: `REAL post to ${where}`, preview: "your private preview chat only (preview mode)",
-        locked: "nowhere yet: posting is locked until a preview chat is set or publishing is approved",
-        simulated: "nowhere: simulation (no bot connected, no message is sent)" }[state.automation] || "see Automation";
-      const msg = [`${mode === "publish" ? "Publish now" : `Schedule for ${at.value.replace("T", " ")} IST`}${repeat.value ? ` (repeats ${repeat.value})` : ""}`,
-        `Bot: ${bot}`, `Channel: ${where}`, `Type: ${KIND_LABEL[kind.value]}${kind.value === "paid_media" ? ` · ${stars.value || "?"} ⭐` : ""}${protect.checked ? " · protected" : ""}`,
-        `Content: ${summary || "—"}`, "", `Goes to: ${destination}`, "", "Continue?"].join("\n");
-      if (!confirm(msg)) return;
-      confirmed = true;
-    }
     const saved = await act(async () => {
       let r = item && item.id ? await api(`/api/content/${item.id}`, { method: "PUT", body }) : await api("/api/content", { method: "POST", body });
       item = r;
-      if (mode === "schedule") r = await api(`/api/content/${r.id}/schedule`, { method: "POST", body: { scheduled_at: body.scheduled_at, confirm: confirmed } });
-      if (mode === "publish") r = await api(`/api/content/${r.id}/publish`, { method: "POST", body: { confirm: confirmed } });
+      if (mode === "schedule") r = await api(`/api/content/${r.id}/schedule`, { method: "POST", body: { scheduled_at: body.scheduled_at } });
+      if (mode === "publish") r = await api(`/api/content/${r.id}/publish`, { method: "POST" });
       if (mode === "preview") await api(`/api/content/${r.id}/preview`, { method: "POST" });
       return r;
     }, { draft: "Saved as draft", schedule: "Scheduled", publish: "Publishing within a minute", preview: "Preview sent to your Telegram (saved as a draft)" }[mode]);
