@@ -48,5 +48,6 @@ export function makeD1(path = ":memory:") {
     db.exec(readFileSync(new URL(`../migrations/${m}`, import.meta.url), "utf8"));
     db.prepare("INSERT INTO d1_migrations (name) VALUES (?)").run(m);
   }
-  return { prepare: (sql) => new Stmt(db, sql), exec: (sql) => db.exec(sql), close: () => db.close(), raw: db };
+  const batch = async (stmts) => { db.exec("BEGIN"); try { const out = []; for (const st of stmts) out.push(await st.run()); db.exec("COMMIT"); return out; } catch (e) { db.exec("ROLLBACK"); throw e; } };
+  return { batch, prepare: (sql) => new Stmt(db, sql), exec: (sql) => db.exec(sql), close: () => db.close(), raw: db };
 }

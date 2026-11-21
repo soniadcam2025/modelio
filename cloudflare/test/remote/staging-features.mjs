@@ -4,7 +4,7 @@ const BASE = process.env.STAGING_URL, PW = process.env.STAGING_PASSWORD;
 if (!BASE || !BASE.includes("staging")) { console.error("Refusing: STAGING_URL must be the staging Worker"); process.exit(2); }
 const results = [];
 const check = (name, ok, detail = "") => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`); };
-const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: PW }) });
+const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: process.env.STAGING_EMAIL, password: PW }) });
 const s = { cookie: r.headers.get("set-cookie").split(";")[0], csrf: (await r.json()).csrf };
 const api = async (path, { method = "GET", body } = {}) => {
   const res = await fetch(BASE + path, { method, headers: { "content-type": "application/json", cookie: s.cookie, "x-csrf-token": s.csrf },
@@ -13,7 +13,8 @@ const api = async (path, { method = "GET", body } = {}) => {
 };
 const health = (await (await fetch(BASE + "/api/health")).json());
 check("still simulation-only", health.automation === "simulated");
-check("capabilities advertised", JSON.stringify((await api("/api/me")).body.capabilities) === '["post_expiry","paid_media_automation"]');
+const caps = (await api("/api/me")).body.capabilities;
+check("capabilities advertised", ["post_expiry", "paid_media_automation"].every((c) => caps.includes(c)));
 const feats = (await api("/api/settings")).body.features;
 check("new features exist and start OFF", feats.post_expiry?.enabled === false && feats.auto_paid_media?.enabled === false);
 

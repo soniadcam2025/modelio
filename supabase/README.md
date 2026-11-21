@@ -1,26 +1,24 @@
-# Shakhira dashboard on Vercel + Supabase (staging)
+# Shakhira platform database: Supabase
 
-**Dashboard:** https://shakhira-admin-staging.vercel.app
+**Production:** the Cloudflare Worker `shakhira-admin` uses the Supabase project `shakhira-prod` (Mumbai) for its data and for sign-in (Supabase Auth).
 
-**Status:** staging, with simulated Telegram.
-- No bot token is configured, so nothing is ever sent.
-- The live bot `shakhira-vip-bot` and its D1 `shakhira-vip` are not connected and were not changed.
+**Staging:** the Worker `shakhira-admin-staging` uses `shakhira-staging`. The older Vercel staging deployment (https://shakhira-admin-staging.vercel.app) uses the same staging project and is kept only for comparison until launch.
+
+Launch steps, monitoring, backups and rollback are in `cloudflare/PRODUCTION_PLAN.md`; this file covers the database.
 
 ## How it fits together
 
 ```
-browser ──► Vercel (bom1, Mumbai)  ── one Node function for /api/*, plus the static dashboard
-               │  service-role key (server only)
-               ▼
-            Supabase (ap-south-1): Postgres schema `shakhira` + Supabase Auth
-               ▲
-Cloudflare Worker shakhira-admin-staging ── cron every minute ── signed POST /api/internal/cycle
+browser ──► Cloudflare Worker (dashboard + API + per-minute cron), Smart Placement near Mumbai
+               │  secret key (server only)          │ BACKUP_DB (daily copy, 14 days)
+               ▼                                     ▼
+            Supabase: schema `shakhira` + Auth     Cloudflare D1 `shakhira-backups`
+live bot shakhira-vip-bot ──(after approval L8: signed copy of each update)──► /internal/update
+live bot D1 shakhira-vip ──(after approval L4: read-only member sync)──► Subscribers
 ```
 
-### Request path
-- **API code:** the API is `cloudflare/src/index.js`, the same code the Worker runs. Vercel bundles it through `vercel/entry.mjs`.
-- **Database choice:** `getDB(env)` uses Supabase when `SUPABASE_URL` and `SUPABASE_SECRET_KEY` are set; otherwise it uses the Worker's D1 binding.
-- **Query path:** every query goes through one RPC, `public.shakhira_exec`.
+### Query path
+- **One gateway:** every query goes through one RPC, `public.shakhira_exec`.
   - It runs as the role `shakhira_app`, which can reach only the `shakhira` schema (not `auth` or `storage`).
   - It can be called only with the secret key; the `anon` and `authenticated` roles have no access.
 - **Row-level security:** RLS is on for every table, with no policies. The schema is not exposed by the REST API.
@@ -33,24 +31,26 @@ Cloudflare Worker shakhira-admin-staging ── cron every minute ── signed 
 - After sign-in, the dashboard issues its own signed session cookie: HttpOnly, Secure, SameSite=Strict, valid 12 hours, plus a CSRF token.
 - Failed sign-ins are rate-limited: 5 per address and 20 overall per 15 minutes.
 
-### Scheduler
-- The Worker cron sends `HMAC(CYCLE_SECRET, "cycle:<time>")`, valid for 2 minutes.
-- Each cycle claims rows before sending, so a second request never posts twice.
+### Migrations
+Apply in order: `0001` (schema), `0002` (least-privilege gateway), `0003` (live sync and forwarded updates). Both projects are at `0003`.
 
 ## Settings (names only; values live in Vercel, Cloudflare and Supabase, never in git)
 
 | Where | Name | |
 |---|---|---|
-| Vercel (Production env) | `ENVIRONMENT=staging`, `REQUIRE_PREVIEW=true`, `AUTH_MODE=supabase`, `SUPABASE_URL`, `PUBLIC_CHANNEL`, `BOT_USERNAME`, `POST_SLOTS_UTC` | plain |
+| Vercel staging (Production env) | `ENVIRONMENT=staging`, `REQUIRE_PREVIEW=true`, `AUTH_MODE=supabase`, `SUPABASE_URL`, `PUBLIC_CHANNEL`, `BOT_USERNAME`, `POST_SLOTS_UTC` | plain |
 | Vercel | `SUPABASE_SECRET_KEY`, `DASHBOARD_SECRET`, `CYCLE_SECRET` | sensitive |
-| Cloudflare `shakhira-admin-staging` | `CYCLE_URL` (wrangler.toml), `CYCLE_SECRET` (secret) | |
+| Cloudflare `shakhira-admin` and `shakhira-admin-staging` | `SUPABASE_URL`, `AUTH_MODE` (wrangler files) | plain |
+| Cloudflare Workers | `SUPABASE_SECRET_KEY`, `DASHBOARD_SECRET`, `UPDATE_SECRET` | secrets |
 
-`BOT_TOKEN` is deliberately **not** set anywhere in staging.
+`BOT_TOKEN` is deliberately **not** set anywhere yet (launch approval L2).
 
 ## Deploy
 
 ```bash
-cd vercel && npm ci && npm run build && npx vercel deploy --prebuilt --prod
+cd cloudflare && npm ci && npm test && npm run deploy:production   # Worker shakhira-admin
+cd cloudflare && npm run deploy:staging                             # Worker shakhira-admin-staging
+cd vercel && npm ci && npm run build && npx vercel deploy --prebuilt --prod   # old staging (until L9)
 ```
 
 Database changes are SQL files in `supabase/migrations/`, applied in order with the Supabase SQL editor or the Management API.
@@ -65,49 +65,29 @@ update auth.users set raw_app_meta_data = raw_app_meta_data || '{"shakhira_admin
 
 To remove access, delete the user or set the flag to false.
 - Existing sessions end within 12 hours.
-- To end them at once, rotate `DASHBOARD_SECRET` in Vercel and redeploy.
+- To end them at once, rotate `DASHBOARD_SECRET` on the Worker (`wrangler secret put DASHBOARD_SECRET -c wrangler.production.toml`).
 
-## Backups and recovery
+## Backups, monitoring and rollback
 
-- **Download:** Features & settings → *Backups & monitoring* → **Download backup (JSON)**, or `GET /api/backup` while signed in.
-  - Contains every dashboard table.
-  - Each download is recorded in the activity log.
-- **Free-plan limit:** Supabase Free has no downloadable automatic backups. Download one weekly and before every change.
-- **Restore:**
-  1. Create the schema from `supabase/migrations/`.
-  2. Insert the JSON rows, for example with a small script that reuses `supabase/tools/migrate-d1-staging.mjs`'s insert builder.
-- **D1 copy:** the staging D1 `shakhira-staging` still holds the earlier staging data. `supabase/tools/migrate-d1-staging.mjs` copies it (idempotent, staging only).
+These are in `cloudflare/PRODUCTION_PLAN.md`:
+- daily D1 backups and **Back up now**
+- `supabase/tools/restore-backup.mjs`, with a restore drill done on staging
+- the `/api/health` endpoint and the GitHub health-check workflow
+- Worker rollback
 
-## Monitoring
-
-- **Health:** `GET /api/health` (no sign-in) returns:
-  - `ok`
-  - `database.{kind, ok, ms}`
-  - `scheduler_last_seen`
-  - the `auth` and `automation` modes
-- **Status codes:** 503 when the database is unreachable.
-- **Dashboard:** *Backups & monitoring* shows the same; the scheduler is flagged if it has not run for 5 minutes.
-- **Logs:** Vercel → Project → Logs (function errors), and Cloudflare → Worker → Logs (cron hand-off status).
-
-## Rollback
-
-| What | How |
-|---|---|
-| Dashboard release | Vercel → Deployments → previous → *Promote to Production* (instant) |
-| Scheduler back to D1 | remove `CYCLE_URL` from `cloudflare/wrangler.toml`, redeploy the staging Worker |
-| Stop the scheduler entirely | Cloudflare → `shakhira-admin-staging` → Triggers → remove the cron |
-| Data | restore from the latest JSON backup |
+`supabase/tools/migrate-d1-staging.mjs` copied the earlier staging data from D1 `shakhira-staging` into `shakhira-staging` once (idempotent, staging only).
 
 ## Costs (free plans)
 
 **Supabase Free**
-- Limits: 500 MB database, 50k monthly users.
-- The project pauses after 7 days without requests; the per-minute cron prevents that.
-
-**Vercel Hobby**
-- Limits: 100 GB-hours of functions and 100 GB of transfer.
-- **Hobby is for non-commercial use only.** Before taking paid subscribers through this dashboard, either move to Vercel Pro (US$20/month) or serve the same code from the Cloudflare Worker (free), which already works.
+- Two projects: production and staging.
+- Limits: 500 MB database each, 50k monthly users.
+- A project pauses after 7 days without requests; the per-minute cron prevents that.
 
 **Cloudflare Workers Free**
-- Limits: 100k requests/day.
-- The cron uses about 1,440 requests/day.
+- Limits: 100k requests/day, 5 crons (3 used), 10 D1 databases (5 used).
+- Commercial use is allowed.
+
+**Vercel Hobby (old staging only)**
+- Non-commercial use only, so it is not used for production.
+- Delete it after launch (approval L9).

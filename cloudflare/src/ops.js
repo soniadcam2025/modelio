@@ -14,11 +14,12 @@ export const FEATURES = {
   trial_reminders: "Remind trial members 24 hours before their trial ends",
   renewal_reminders: "Remind monthly subscribers 3 days before Telegram renews them",
   admin_actions: "Carry out admin actions queued in the dashboard (approve, remove, unban, message)",
-  join_requests: "Record join requests to the channels (needs the full bot; see README)",
-  moderation: "Moderate the channel's existing discussion group, if it has one (needs the full bot)",
-  reaction_tracking: "Record reaction counts on channel posts (needs the full bot)",
+  join_requests: "Record join requests to the channels (via the live bot; approval L8)",
+  moderation: "Moderate the channel's existing discussion group, if it has one (via the live bot; approval L8)",
+  reaction_tracking: "Record reaction counts on channel posts (via the live bot; approval L8)",
   post_expiry: "Delete posts automatically when their set expiry time is reached",
   auto_paid_media: "Post paid media automatically from its own Cloudinary folder on a schedule",
+  member_sync: "Copy members and trials from the live VIP bot's database (read-only) into Subscribers",
 };
 // Telegram only lets bots delete their messages for 48 hours after sending.
 export const MAX_EXPIRY_MINUTES = 48 * 60;
@@ -117,6 +118,22 @@ export const BACKUP_TABLES = ["settings", "content_items", "captions", "profiles
   "moderation_log", "reaction_counts", "reminders_sent", "audit_log", "payments", "trials", "member_events", "pending_unbans",
   "auto_paid_runs", "auto_paid_posted"];
 
+function summarize(userId, profile, payments, trials, events, now) {
+  profile = profile || { user_id: userId, username: "", first_name: "", source: "", tags: "", notes: "", first_seen: null, last_seen: null };
+  const lastSub = events.find((e) => e.subscription_until)?.subscription_until ?? null;
+  const activeTrial = trials.find((t) => t.status === "active" && t.expires_at > now);
+  const latest = events[0]?.event;
+  const membership = lastSub && lastSub > now && !["left", "removed"].includes(latest) ? "monthly"
+    : activeTrial ? "trial" : ["left", "removed"].includes(latest) ? "left" : "none";
+  const seen = [profile.last_seen, ...payments.map((p) => p.created_at), ...events.map((e) => e.created_at)].filter(Boolean);
+  const { user_id: _u, ...rest } = profile;
+  return {
+    user_id: userId, ...rest, membership, subscription_until: lastSub, trial_expires_at: activeTrial ? activeTrial.expires_at : null,
+    stars_paid: payments.filter((p) => (p.status === null || p.status === "accepted") && p.currency === "XTR").reduce((n, p) => n + Number(p.amount), 0),
+    last_seen: seen.length ? Math.max(...seen.map(Number)) : null,
+  };
+}
+
 export class Ops {
   constructor(db, now = () => Math.floor(Date.now() / 1000)) {
     this.db = db;
@@ -133,10 +150,10 @@ export class Ops {
     await this.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, String(value));
   }
   async featureEnabled(name) { return (await this.getSetting("feature:" + name, "0")) === "1"; }
+  // One query for every switch.
   async features() {
-    const out = {};
-    for (const [name, description] of Object.entries(FEATURES)) out[name] = { enabled: await this.featureEnabled(name), description };
-    return out;
+    const on = new Set((await this.all("SELECT key FROM settings WHERE key LIKE 'feature:%' AND value = '1'")).map((r) => r.key.slice(8)));
+    return Object.fromEntries(Object.entries(FEATURES).map(([name, description]) => [name, { enabled: on.has(name), description }]));
   }
   async setFeature(name, enabled, actor) {
     if (!(name in FEATURES)) throw new OpsError(`Unknown feature '${name}'`);
@@ -294,34 +311,34 @@ export class Ops {
     await this.audit(actor, "profile_update", `user ${userId}`);
     return this.subscriber(userId, this.now());
   }
+  // Four queries in total (not four per person): on Supabase every query is a network round trip.
   async subscribers(query = "", now = this.now(), limit = 500) {
-    const ids = await this.all("SELECT user_id FROM profiles UNION SELECT user_id FROM payments UNION SELECT user_id FROM trials UNION SELECT user_id FROM member_events");
-    let people = [];
-    for (const r of ids) people.push(await this.subscriber(r.user_id, now, true));
+    const [profiles, payments, trials, events] = await Promise.all([
+      this.all("SELECT * FROM profiles"),
+      this.all("SELECT telegram_payment_charge_id AS charge_id, user_id, plan, amount, currency, status, created_at FROM payments ORDER BY created_at DESC"),
+      this.all("SELECT id, user_id, starts_at, expires_at, joined_at, status FROM trials ORDER BY id DESC"),
+      this.all("SELECT user_id, event, invite_link_name, subscription_until, created_at FROM member_events ORDER BY created_at DESC, id DESC"),
+    ]);
+    const group = (rows) => { const m = new Map(); for (const r of rows) { const k = Number(r.user_id); if (!m.has(k)) m.set(k, []); m.get(k).push(r); } return m; };
+    const byProfile = new Map(profiles.map((p) => [Number(p.user_id), p]));
+    const pay = group(payments), tri = group(trials), ev = group(events);
+    const ids = new Set([...byProfile.keys(), ...pay.keys(), ...tri.keys(), ...ev.keys()]);
+    let people = [...ids].map((id) => summarize(id, byProfile.get(id), pay.get(id) || [], tri.get(id) || [], (ev.get(id) || []).slice(0, 50), now));
     const q = query.trim().toLowerCase().replace(/^@/, "");
     if (q) people = people.filter((s) => String(s.user_id).includes(q) || s.username.toLowerCase().includes(q) || s.first_name.toLowerCase().includes(q) || s.tags.toLowerCase().includes(q));
     people.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0));
     return people.slice(0, limit);
   }
   async subscriber(userId, now, brief = false) {
-    const profile = (await this.one("SELECT * FROM profiles WHERE user_id=?", userId)) ||
-      { user_id: userId, username: "", first_name: "", source: "", tags: "", notes: "", first_seen: null, last_seen: null };
-    const payments = await this.all("SELECT telegram_payment_charge_id AS charge_id, plan, amount, currency, status, created_at FROM payments WHERE user_id=? ORDER BY created_at DESC", userId);
-    const trials = await this.all("SELECT id, starts_at, expires_at, joined_at, status FROM trials WHERE user_id=? ORDER BY id DESC", userId);
-    const events = await this.all("SELECT event, invite_link_name, subscription_until, created_at FROM member_events WHERE user_id=? ORDER BY id DESC LIMIT 50", userId);
-    const lastSub = events.find((e) => e.subscription_until)?.subscription_until ?? null;
-    const activeTrial = trials.find((t) => t.status === "active" && t.expires_at > now);
-    const membership = lastSub && lastSub > now ? "monthly" : activeTrial ? "trial" : events[0]?.event === "left" ? "left" : "none";
-    const seen = [profile.last_seen, ...payments.map((p) => p.created_at), ...events.map((e) => e.created_at)].filter(Boolean);
-    const out = {
-      ...profile, membership, subscription_until: lastSub, trial_expires_at: activeTrial ? activeTrial.expires_at : null,
-      stars_paid: payments.filter((p) => (p.status === null || p.status === "accepted") && p.currency === "XTR").reduce((n, p) => n + p.amount, 0),
-      last_seen: seen.length ? Math.max(...seen) : null,
-    };
+    const [profile, payments, trials, events] = await Promise.all([
+      this.one("SELECT * FROM profiles WHERE user_id=?", userId),
+      this.all("SELECT telegram_payment_charge_id AS charge_id, plan, amount, currency, status, created_at FROM payments WHERE user_id=? ORDER BY created_at DESC", userId),
+      this.all("SELECT id, starts_at, expires_at, joined_at, status FROM trials WHERE user_id=? ORDER BY id DESC", userId),
+      this.all("SELECT event, invite_link_name, subscription_until, created_at FROM member_events WHERE user_id=? ORDER BY created_at DESC, id DESC LIMIT 50", userId),
+    ]);
+    const out = summarize(Number(userId), profile, payments, trials, events, now);
     return brief ? out : { ...out, payments, trials, events };
   }
-
-  // Join requests and admin actions
   joinRequests(status = "pending", limit = 500) {
     return status ? this.all("SELECT * FROM join_requests WHERE status=? ORDER BY requested_at DESC LIMIT ?", status, limit)
       : this.all("SELECT * FROM join_requests ORDER BY requested_at DESC LIMIT ?", limit);
@@ -379,7 +396,8 @@ export class Ops {
   // Backup: every dashboard table as JSON (sessions and login failures left out: they are short-lived security data).
   async exportAll() {
     const out = { format: "shakhira-backup-v1", exported_at: this.now(), tables: {} };
-    for (const t of BACKUP_TABLES) out.tables[t] = await this.all(`SELECT * FROM ${t}`);
+    const lists = await Promise.all(BACKUP_TABLES.map((t) => this.all(`SELECT * FROM ${t}`)));
+    BACKUP_TABLES.forEach((t, i) => { out.tables[t] = lists[i]; });
     return out;
   }
 

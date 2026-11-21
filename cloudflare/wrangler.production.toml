@@ -1,0 +1,57 @@
+# PRODUCTION admin dashboard + automation: https://shakhira-admin.<account>.workers.dev
+# Deploy: npm run deploy:production   (builds the frontend, then `wrangler deploy -c wrangler.production.toml`)
+#
+# Launch safety: until you approve each step in PRODUCTION_PLAN.md,
+#   - BOT_TOKEN is not set, so every Telegram call is SIMULATED (nothing is sent);
+#   - REQUIRE_PREVIEW = "true", so even with a token only PREVIEW_CHAT_ID could receive anything;
+#   - every feature switch is off in the new database;
+#   - LIVE_DB (the live bot's shakhira-vip) is NOT bound. The live bot, its D1 and its webhook are unchanged.
+name = "shakhira-admin"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+# Account crons on the free plan: 5. Used: live bot 1, staging 1, this 1.
+[triggers]
+crons = ["* * * * *"]
+
+# Fallback database only (the dashboard uses Supabase when SUPABASE_SECRET_KEY is set). Not the live bot's D1.
+[[d1_databases]]
+binding = "BACKUP_DB"
+database_name = "shakhira-backups"
+database_id = "75d99f93-715e-4cbb-bf81-c3f82066c92c"
+
+# Approval E1 (read-only member sync): uncomment, deploy, then switch on "member_sync" in Features & settings.
+# The code only ever runs SELECT on this binding (src/live.js readOnly()).
+# [[d1_databases]]
+# binding = "LIVE_DB"
+# database_name = "shakhira-vip"
+# database_id = "54eb917a-7ff9-4a3b-96b6-2608cebecd1b"
+
+[vars]
+ENVIRONMENT = "production"
+REQUIRE_PREVIEW = "true"
+PREVIEW_CHAT_ID = ""
+PUBLIC_CHANNEL = "@yourshakhira"
+VIP_CHANNEL_ID = ""
+DISCUSSION_GROUP_ID = ""
+ADMIN_CHAT_ID = ""
+BOT_USERNAME = "ShakhiraVIPBot"
+POST_SLOTS_UTC = "16:30,23:30"
+SUPABASE_URL = "https://ttdvmdunxhftcbrpmxqu.supabase.co"
+AUTH_MODE = "supabase"
+
+# Secrets (wrangler secret put -c wrangler.production.toml <NAME>; never committed):
+#   SUPABASE_SECRET_KEY  shakhira-prod secret key
+#   DASHBOARD_SECRET     48+ random characters (rotating it signs everyone out)
+#   UPDATE_SECRET        shared with the live bot for forwarded updates (approval D2)
+#   BOT_TOKEN            set by you at launch (approval B2)
+#   CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET  read-only media library (A3)
+
+# Smart Placement (free): runs the Worker near its database (Supabase, Mumbai) instead of near each visitor.
+[placement]
+mode = "smart"
+
+[observability]
+enabled = true

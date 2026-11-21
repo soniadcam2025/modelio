@@ -268,9 +268,12 @@ async function pageOverview(main) {
   const worker = o.worker_last_seen && Date.now() / 1000 - o.worker_last_seen < 600;
   put(main, 
     head("Overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
-    o.environment === "staging" ? h("div", { class: "banner warn" }, o.automation === "preview"
-      ? "STAGING: automation sends only to the private preview chat. Nothing reaches the channels or members."
-      : "STAGING: automation is simulated. Nothing is sent to Telegram.") : null,
+    o.environment === "staging" || ["simulated", "preview", "locked"].includes(o.automation) ? h("div", { class: "banner warn" },
+      `${String(o.environment || "").toUpperCase()}: ` + (o.automation === "preview"
+        ? "automation sends only to the private preview chat. Nothing reaches the channels or members."
+        : o.automation === "locked" ? "a bot token is set but no preview chat, so automation is paused."
+        : o.automation === "simulated" ? "automation is simulated (no bot token). Nothing is sent to Telegram."
+        : "automation is live.")) : null,
     offCount === Object.keys(o.features).length
       ? h("div", { class: "banner warn" }, "All automated features are switched off. Turn them on one by one in Features & settings once the worker is running.")
       : null,
@@ -597,9 +600,9 @@ async function pageSettings(main) {
   };
   put(main, 
     head("Features & settings", "Everything is off until you switch it on. Switch on one feature at a time and watch the results."),
-    h("div", { class: "banner warn" }, "Safety: the dashboard never holds the bot token. The send-only worker carries out these features and never receives updates, so the live bot keeps working. Features marked “full bot” only work after the live bot has been retired and replaced; until then they record nothing."),
+    h("div", { class: "banner warn" }, "Safety: this dashboard only sends to Telegram; the live VIP bot stays the only receiver of Telegram updates, and members keep using it exactly as before. Features marked “via live bot” work once the live bot forwards a copy of its updates here (launch approval L8); until then they record nothing."),
     h("section", { class: "card" }, h("h2", {}, "Features"), Object.entries(st.features).map(([name, f]) => h("div", { class: "toggle-row" },
-      h("div", {}, h("div", {}, f.description, " ", FULL_BOT_FEATURES.has(name) ? chip("pending", "full bot") : chip("scheduled", "worker")), h("div", { class: "small muted mono" }, name)), toggle(name, f)))),
+      h("div", {}, h("div", {}, f.description, " ", FULL_BOT_FEATURES.has(name) ? chip("pending", "via live bot") : chip("scheduled", "worker")), h("div", { class: "small muted mono" }, name)), toggle(name, f)))),
     h("section", { class: "card", style: null }, h("h2", {}, "Join requests"), policy("public", `Public channel (${st.public_channel})`), policy("vip", "VIP channel")),
     can("paid_media_automation") ? await paidMediaSettings() : null,
     can("backup") ? await backupCard() : null);
@@ -613,8 +616,14 @@ async function backupCard() {
   return h("section", { class: "card" }, h("h2", {}, "Backups & monitoring"),
     h("div", { class: "toggle-row" }, h("div", {}, "Database"), db ? chip(db.ok ? "posted" : "failed", `${db.kind} · ${db.ok ? `ok, ${db.ms} ms` : "unreachable"}`) : chip("failed", "unknown")),
     h("div", { class: "toggle-row" }, h("div", {}, "Scheduler last ran"), seen ? chip(Date.now() / 1000 - seen < 300 ? "posted" : "failed", fmt.format(new Date(seen * 1000))) : chip("pending", "not yet")),
-    h("p", { class: "small muted" }, "Download a full copy of the dashboard data (posts, captions, settings, profiles, analytics and the activity log). Each download is recorded in the activity log."),
-    h("a", { class: "btn", href: "/api/backup", download: "" }, "Download backup (JSON)"));
+    health && health.backup_configured !== undefined ? h("div", { class: "toggle-row" }, h("div", {}, "Daily backup (03:10 IST, kept 14 days)"),
+      !health.backup_configured ? chip("pending", "not linked") : health.backup_last ? chip(Date.now() / 1000 - health.backup_last < 26 * 3600 ? "posted" : "failed", fmt.format(new Date(health.backup_last * 1000))) : chip("pending", "none yet")) : null,
+    health && health.live_bot_linked !== undefined ? h("div", { class: "toggle-row" }, h("div", {}, "Live VIP bot members (read-only sync)"),
+      !health.live_bot_linked ? chip("pending", "not linked") : health.member_sync_last ? chip("posted", fmt.format(new Date(health.member_sync_last * 1000))) : chip("pending", "switch on “member_sync”")) : null,
+    h("p", { class: "small muted" }, "Download a full copy of the dashboard data (posts, captions, settings, profiles, members, analytics and the activity log). Each download is recorded in the activity log."),
+    h("div", { class: "row" },
+      h("a", { class: "btn", href: "/api/backup", download: "" }, "Download backup (JSON)"),
+      health && health.backup_configured ? h("button", { onclick: async () => { if (await act(() => api("/api/backup/now", { method: "POST" }), "Backup stored")) route(); } }, "Back up now") : null));
 }
 
 async function paidMediaSettings() {
