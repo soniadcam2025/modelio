@@ -30,8 +30,10 @@ shared with the Python version (`dashboard/static`).
 
 - **Deployed:** `shakhira-admin-staging` on the account's workers.dev subdomain, bound to D1 `shakhira-staging` (region ENAM).
 - **Automation:** simulated (no `BOT_TOKEN`). The cron runs every minute.
-- **Remote smoke test:** 40/40 checks passed (`test/remote/staging-smoke.mjs`).
-- **Browsers:** desktop, iPhone 13 and Pixel 7 checked on all pages.
+- **Remote tests:** smoke 40/40 (`test/remote/staging-smoke.mjs`), features 14/14 (`test/remote/staging-features.mjs`: paid media, expiry).
+- **Private preview:** `test/remote/staging-preview.mjs`, once `BOT_TOKEN` and `PREVIEW_CHAT_ID` are set.
+- **Optional features:** automated paid media and post expiry, both off by default. See `PRODUCTION_PLAN.md`.
+- **Browsers:** desktop, iPhone 13 and Pixel 7 checked on all 10 pages.
 - **Workers Logs:** 0 errors.
 - **Not shown here:** the URL and password. This repository is public; the owner has them.
 - Cron triggers take about 10–15 minutes to start after the first deploy.

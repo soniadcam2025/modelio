@@ -5,6 +5,7 @@ import { LoginLimiter, Sessions, readCookie, verifyPassword } from "./auth.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
+import { cloudinaryConfig, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory } from "./cloudinary.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
@@ -92,7 +93,8 @@ function routes() {
     res.headers.set("Set-Cookie", `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`);
     return res;
   });
-  add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token) }));
+  add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
+    capabilities: ["post_expiry", "paid_media_automation"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now(), stats = await c.ops.analytics(now, 30);
@@ -171,8 +173,28 @@ function routes() {
     return json({ target: m[1], policy: await c.ops.joinPolicy(m[1]) });
   });
   add("GET", "/api/audit", async (c) => json(await c.ops.auditEntries()));
-  // The Cloudinary library stays with the GitHub Actions poster; staging does not hold Cloudinary keys.
-  add("GET", "/api/poster", async () => json({ configured: false }));
+  add("GET", "/api/settings/paid-media", async (c) => json(await c.ops.paidMediaConfig()));
+  add("PUT", "/api/settings/paid-media", async (c) => json(await c.ops.setPaidMediaConfig(await body(c.request), c.actor)));
+
+  // Read-only view of the GitHub poster's Cloudinary folder (and the paid-media folder, if set).
+  add("GET", "/api/poster", async (c) => {
+    const cfg = cloudinaryConfig(c.env);
+    if (!cfg) return json({ configured: false });
+    try {
+      const assets = await listFolder(cfg, GITHUB_POSTER_FOLDER);
+      const paid = await c.ops.paidMediaConfig();
+      let paidFolder = null;
+      if (paid.folder) {
+        const pa = await listFolder(cfg, paid.folder);
+        const used = new Set((await c.ops.all("SELECT public_id FROM auto_paid_posted")).map((r) => r.public_id));
+        paidFolder = { folder: paid.folder, total: pa.length, unused: pa.filter((a) => !used.has(a.public_id)).length };
+      }
+      return json({ configured: true, folder: GITHUB_POSTER_FOLDER, inventory: posterInventory(assets, c.ops.now()),
+        recent_slots: [], library: libraryEntries(assets), paid_folder: paidFolder });
+    } catch (e) {
+      return json({ configured: true, error: String(e.message).slice(0, 200) });
+    }
+  });
   return r;
 }
 const ROUTES = routes();
@@ -211,7 +233,9 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
     return { mode };
   }
   const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl });
-  const summary = await runCycle(tg, new Ops(env.DB, () => now), config, now, async (msg) => console.warn("ALERT", msg));
+  const cfg = cloudinaryConfig(env);
+  const listAssets = cfg ? (folder) => listFolder(cfg, folder, fetchImpl) : null;
+  const summary = await runCycle(tg, new Ops(env.DB, () => now), config, now, async (msg) => console.warn("ALERT", msg), { listAssets });
   return { mode, summary, simulated: tg.simulated.length };
 }
 

@@ -4,6 +4,7 @@
 // handles, so the two can never post the same thing.
 
 import { TelegramError } from "./telegram.js";
+import { classify, GITHUB_POSTER_FOLDER } from "./cloudinary.js";
 
 const STALE_SENDING_SECONDS = 10 * 60;
 const MAX_RETRY_DELAY = 15 * 60;
@@ -150,11 +151,89 @@ export async function runAdminActions(tg, ops, config, now) {
   return counts;
 }
 
-export async function runCycle(tg, ops, config, now, alert) {
+// Posts with an expiry are deleted once it passes. Telegram allows bots to delete for 48 hours.
+export async function expirePosts(tg, ops, config, now) {
+  let expired = 0;
+  const due = await ops.all("SELECT * FROM content_items WHERE status IN ('posted','simulated') AND expire_after_minutes IS NOT NULL " +
+    "AND expired_at IS NULL AND posted_at + expire_after_minutes * 60 <= ?", now);
+  for (const item of due) {
+    let note = "";
+    if (item.status === "posted" && item.message_id) {
+      try {
+        await tg.call("deleteMessage", { chat_id: targetChat(config, item.target), message_id: item.message_id });
+      } catch (err) {
+        if (!(err instanceof TelegramError && err.code === 400)) continue; // retry next minute
+        note = `could not delete: ${err.message}`;               // already gone or too old: stop trying
+      }
+    }
+    await ops.run("UPDATE content_items SET expired_at=?, last_error=CASE WHEN ?='' THEN last_error ELSE ? END, updated_at=? WHERE id=?",
+      now, note, note, now, item.id);
+    expired++;
+  }
+  return expired;
+}
+
+// The latest occurrence (<= now) of each configured HH:MM UTC time, as slot IDs like 20261121T1430Z.
+export function dueSlots(times, now, windowSeconds = 30 * 60) {
+  const out = [];
+  for (const t of times) {
+    const [h, m] = t.split(":").map(Number);
+    let at = Math.floor(now / 86400) * 86400 + h * 3600 + m * 60;
+    if (at > now) at -= 86400;
+    if (now - at <= windowSeconds) {
+      const d = new Date(at * 1000).toISOString();
+      out.push({ slot: `${d.slice(0, 4)}${d.slice(5, 7)}${d.slice(8, 10)}T${d.slice(11, 13)}${d.slice(14, 16)}Z`, at });
+    }
+  }
+  return out;
+}
+
+// Automated paid media: at each configured time, queue the next unused asset from its own Cloudinary folder.
+// The slot is claimed in D1 first (INSERT OR IGNORE), so one slot can never create two posts.
+// Used assets are remembered in D1, never as Cloudinary tags. The GitHub poster's folder is refused.
+export async function queueAutoPaidMedia(ops, now, listAssets) {
+  const cfg = await ops.paidMediaConfig();
+  if (!cfg.folder || !cfg.times_utc.length || cfg.folder.toLowerCase() === GITHUB_POSTER_FOLDER || !listAssets) return [];
+  const queued = [];
+  for (const { slot } of dueSlots(cfg.times_utc, now)) {
+    const claim = await ops.run("INSERT OR IGNORE INTO auto_paid_runs (slot, created_at) VALUES (?, ?)", slot, now);
+    if (claim.meta.changes !== 1) continue; // this slot was already handled
+    let assets;
+    try {
+      assets = await listAssets(cfg.folder);
+    } catch (err) {
+      await ops.run("UPDATE auto_paid_runs SET note=? WHERE slot=?", `listing failed: ${err.message}`, slot);
+      continue;
+    }
+    const used = new Set((await ops.all("SELECT public_id FROM auto_paid_posted")).map((r) => r.public_id));
+    const next = assets.filter((a) => classify(a).kind && ["photo", "video"].includes(classify(a).kind) && !used.has(a.public_id))
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.public_id.localeCompare(b.public_id))[0];
+    if (!next) {
+      await ops.run("UPDATE auto_paid_runs SET note='no unused media left in the folder' WHERE slot=?", slot);
+      continue;
+    }
+    const item = await ops.createContent({
+      kind: "paid_media", target: cfg.target, media_url: next.secure_url, star_count: next.stars || cfg.default_stars,
+      text: next.caption || cfg.caption || "", expire_after_minutes: cfg.expire_after_minutes, source: `auto:${next.public_id}`,
+    }, "automation");
+    await ops.scheduleContent(item.id, now, "automation");
+    await ops.run("INSERT OR IGNORE INTO auto_paid_posted (public_id, content_id, posted_at) VALUES (?, ?, ?)", next.public_id, item.id, now);
+    await ops.run("UPDATE auto_paid_runs SET public_id=?, content_id=? WHERE slot=?", next.public_id, item.id, slot);
+    queued.push(item.id);
+  }
+  return queued;
+}
+
+export async function runCycle(tg, ops, config, now, alert, { listAssets = null } = {}) {
   await ops.setSetting("heartbeat:worker", now);
+  // Housekeeping: forget expired session revocations and old login failures.
+  await ops.run("DELETE FROM revoked_sessions WHERE expires_at < ?", now);
+  await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   const summary = {};
+  if (await ops.featureEnabled("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
   if (await ops.featureEnabled("scheduled_posts")) summary.posts = await publishDue(tg, ops, config, now, alert);
   if (await ops.featureEnabled("poll_auto_close")) summary.polls_closed = await closeDuePolls(tg, ops, config, now);
+  if (await ops.featureEnabled("post_expiry")) summary.expired = await expirePosts(tg, ops, config, now);
   // Preview/staging touches no real member: no admin actions, no reminders.
   if (config.previewChatId || config.requirePreview) return summary;
   if (await ops.featureEnabled("admin_actions")) summary.actions = await runAdminActions(tg, ops, config, now);

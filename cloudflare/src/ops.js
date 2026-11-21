@@ -17,7 +17,13 @@ export const FEATURES = {
   join_requests: "Record join requests to the channels (needs the full bot; see README)",
   moderation: "Moderate the channel's existing discussion group, if it has one (needs the full bot)",
   reaction_tracking: "Record reaction counts on channel posts (needs the full bot)",
+  post_expiry: "Delete posts automatically when their set expiry time is reached",
+  auto_paid_media: "Post paid media automatically from its own Cloudinary folder on a schedule",
 };
+// Telegram only lets bots delete their messages for 48 hours after sending.
+export const MAX_EXPIRY_MINUTES = 48 * 60;
+export const PAID_MEDIA_KEY = "paid_media:config";
+export const DEFAULT_PAID_MEDIA = { default_stars: 50, folder: "", times_utc: [], target: "vip", expire_after_minutes: null, caption: "" };
 
 export class OpsError extends Error {}
 
@@ -76,6 +82,13 @@ export function validateContent(data) {
     if (!buttonText || !startsWithAny(buttonUrl, [...URL_PREFIXES, ...TG_PREFIXES]) || buttonUrl.length > 500)
       throw new OpsError("A button needs text and an https:// or t.me link");
   }
+  let expireAfter = data.expire_after_minutes;
+  if (expireAfter === null || expireAfter === undefined || expireAfter === "") expireAfter = null;
+  else {
+    expireAfter = toInt(expireAfter);
+    if (Number.isNaN(expireAfter) || expireAfter < 5 || expireAfter > MAX_EXPIRY_MINUTES)
+      throw new OpsError("Delete-after must be between 5 minutes and 48 hours (Telegram's limit for deleting)");
+  }
   let scheduledAt = data.scheduled_at;
   if (scheduledAt === "" || scheduledAt === null || scheduledAt === undefined) scheduledAt = null;
   else {
@@ -87,6 +100,7 @@ export function validateContent(data) {
     multiple_answers: data.multiple_answers && kind === "poll" ? 1 : 0, close_after_minutes: closeAfter, star_count: stars,
     button_text: buttonText, button_url: buttonUrl,
     use_caption_library: data.use_caption_library && MEDIA_KINDS.includes(kind) && !text ? 1 : 0, scheduled_at: scheduledAt,
+    expire_after_minutes: expireAfter,
   };
 }
 
@@ -136,10 +150,11 @@ export class Ops {
     const v = validateContent(data), now = this.now();
     const r = await this.run(
       "INSERT INTO content_items (kind, target, text, media_url, options_json, correct_option, explanation, multiple_answers, " +
-      "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+      "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at, " +
+      "expire_after_minutes, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers,
-      v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now);
+      v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now,
+      v.expire_after_minutes, String(data.source || "").slice(0, 200));
     const id = r.meta.last_row_id;
     await this.audit(actor, "content_create", `#${id} ${v.kind} -> ${v.target}`);
     return this.content(id);
@@ -155,9 +170,9 @@ export class Ops {
     const v = validateContent({ ...item, options: JSON.parse(item.options_json), ...data });
     await this.run(
       "UPDATE content_items SET kind=?, target=?, text=?, media_url=?, options_json=?, correct_option=?, explanation=?, multiple_answers=?, " +
-      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, updated_at=? WHERE id=?",
+      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, updated_at=? WHERE id=?",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers, v.close_after_minutes,
-      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, this.now(), Number(id));
+      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, this.now(), Number(id));
     await this.audit(actor, "content_update", `#${id}`);
     return this.content(id);
   }
@@ -195,6 +210,35 @@ export class Ops {
     if (end !== null) { sql += " AND COALESCE(posted_at, scheduled_at, created_at) < ?"; args.push(end); }
     sql += " ORDER BY COALESCE(scheduled_at, created_at) DESC LIMIT ?"; args.push(limit);
     return this.all(sql, ...args);
+  }
+
+  // Paid media automation settings
+  async paidMediaConfig() {
+    try { return { ...DEFAULT_PAID_MEDIA, ...JSON.parse(await this.getSetting(PAID_MEDIA_KEY, "{}")) }; }
+    catch { return { ...DEFAULT_PAID_MEDIA }; }
+  }
+  async setPaidMediaConfig(data, actor) {
+    const stars = toInt(data.default_stars);
+    if (!(stars >= 1 && stars <= 10000)) throw new OpsError("Default price must be 1 to 10,000 Stars");
+    const folder = String(data.folder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (folder && !/^[\w\-/ ]{1,100}$/.test(folder)) throw new OpsError("Folder name can use letters, numbers, - _ / and spaces");
+    if (folder.toLowerCase() === "tgpub") throw new OpsError("Use a separate folder: 'tgpub' belongs to the free-channel poster (GitHub)");
+    const times = [...new Set((Array.isArray(data.times_utc) ? data.times_utc : String(data.times_utc || "").split(","))
+      .map((t) => String(t).trim()).filter(Boolean))];
+    for (const t of times) if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new OpsError(`Times must look like 14:30 (UTC), got '${t}'`);
+    if (times.length > 6) throw new OpsError("At most 6 automatic paid-media posts a day");
+    if (!TARGETS.includes(data.target)) throw new OpsError("Choose the public or the VIP channel");
+    let expire = data.expire_after_minutes;
+    if (expire === "" || expire === null || expire === undefined) expire = null;
+    else {
+      expire = toInt(expire);
+      if (!(expire >= 5 && expire <= MAX_EXPIRY_MINUTES)) throw new OpsError("Delete-after must be between 5 minutes and 48 hours");
+    }
+    const cfg = { default_stars: stars, folder, times_utc: times.sort(), target: data.target, expire_after_minutes: expire,
+      caption: cleanText(data.caption, 1024, "Caption") };
+    await this.setSetting(PAID_MEDIA_KEY, JSON.stringify(cfg));
+    await this.audit(actor, "paid_media_config", JSON.stringify(cfg).slice(0, 400));
+    return cfg;
   }
 
   // Captions

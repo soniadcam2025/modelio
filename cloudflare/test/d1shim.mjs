@@ -1,6 +1,6 @@
 // A small Cloudflare D1 stand-in on Node's built-in SQLite, for tests. Same call shapes:
 // db.prepare(sql).bind(...).first() / .all() -> {results} / .run() -> {meta:{changes,last_row_id}}
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 class Stmt {
@@ -13,6 +13,12 @@ class Stmt {
 
 export function makeD1(path = ":memory:") {
   const db = new DatabaseSync(path);
-  db.exec(readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  // Like `wrangler d1 migrations apply`: each migration runs once per database.
+  db.exec("CREATE TABLE IF NOT EXISTS d1_migrations (name TEXT PRIMARY KEY)");
+  for (const m of readdirSync(new URL("../migrations/", import.meta.url)).filter((f) => f.endsWith(".sql")).sort()) {
+    if (db.prepare("SELECT 1 FROM d1_migrations WHERE name = ?").get(m)) continue;
+    db.exec(readFileSync(new URL(`../migrations/${m}`, import.meta.url), "utf8"));
+    db.prepare("INSERT INTO d1_migrations (name) VALUES (?)").run(m);
+  }
   return { prepare: (sql) => new Stmt(db, sql), exec: (sql) => db.exec(sql), close: () => db.close(), raw: db };
 }

@@ -1,52 +1,131 @@
-# Production integration plan (draft, needs approval at every step)
+# Production integration checklist for @ShakhiraVIPBot
 
-Current state (21 Nov 2026):
-- **Live bot:** the Worker `shakhira-vip-bot` (webhook, one cron every 5 minutes) is untouched.
-- **GitHub poster:** posting at 5 AM and 10 PM IST with smart rotation.
-- **Staging:** the admin Worker is built and tested, and waits only for D1 permission on the Cloudflare token.
+Status (21 Nov 2026):
+- **Staging:** `shakhira-admin-staging` + D1 `shakhira-staging` is live in **simulation**, with all features off.
+- **Live bot:** the Worker `shakhira-vip-bot` (webhook, cron every 5 minutes, D1 `shakhira-vip`) has never been changed.
+- **Free-channel posting:** GitHub Actions posts at 5 AM and 10 PM IST with smart rotation.
 
-Rules for every step:
-- **Live bot:** never modified or redeployed unless a step says so and you approved it.
-- **Resources:** free Cloudflare allowances only; no new bots, channels or groups.
-- **Reversibility:** each step can be undone on its own.
+How each step is written:
+- **Owner:** who acts.
+- **Changes:** exactly what is touched.
+- **Verify:** how we know it worked.
+- **Undo:** how to reverse it.
 
-## Step 1: Staging sign-off (no production impact)
-- Deploy `shakhira-admin-staging` + D1 `shakhira-staging` with example data and **simulated** automation.
-- Test all eight post types, security, persistence and logs on the live staging URL, on desktop and mobile.
-- Optional real preview: you set `BOT_TOKEN` yourself and put your own user ID in `PREVIEW_CHAT_ID`. Posts then reach only your private chat with the bot.
-- **Undo:** `wrangler delete shakhira-admin-staging`, then `wrangler d1 delete shakhira-staging`.
+Nothing moves to the next step without your written approval.
 
-## Step 2: Production admin Worker for channel content (send-only)
-- A separate Worker `shakhira-admin` with its own D1 `shakhira-prod`, no example data, and every feature off.
-- You switch on **Scheduled posts** only. The Worker can then publish text, media, polls, quizzes, promotions and paid media to the two channels.
-- It still only sends, so the live bot's webhook and members are unaffected.
-- **No overlap with the GitHub poster:**
-  - The Worker never posts Cloudinary auto-posts.
-  - Planned addition: the Worker refuses to schedule within 15 minutes of the 5 AM / 10 PM IST slots, so posts never land on top of each other.
-- **Cost:** a second cron trigger, so 3 of the 5 free ones in use. Requests stay far under 100,000 a day.
-- **Undo:** switch the feature off (takes effect within 1 minute), or delete the Worker. Published messages can be deleted in Telegram.
+---
 
-## Step 3: Member features (join requests, reminders, moderation, reactions, payment events)
-- These need incoming Telegram updates, which only the live bot's webhook receives. Two options, both changing the live bot, so both need its source code and your explicit approval:
-  1. **Forwarding (smallest change):** the live bot forwards a copy of selected updates to the admin Worker over a Cloudflare service binding. It keeps answering members exactly as today.
-  2. **Merge:** move these features into the live bot's own code.
-- Until then they stay off. Reminders also need subscription data, which only the live bot holds today.
-- **Undo:** remove the forwarding line and redeploy the previous live-bot version (Cloudflare keeps versions; rollback is one command).
+## A. Staging acceptance (no production impact)
 
-## Step 4: Subscriber data (read-only first)
-- Locate where the live bot stores subscribers and payments (KV or D1 in the same account), then make a **read-only export** for the dashboard's subscriber view.
-- No writes to live subscriber data in this step.
-- **Undo:** drop the copied data from `shakhira-prod`.
+**A1. Admin login**
+- **Owner:** you.
+- **Changes:** set your own staging password with `cd cloudflare && node tools/hash-password.mjs | npx wrangler secret put DASHBOARD_PASSWORD_HASH`.
+- **Verify:** sign in.
+- **Undo:** run the same command again.
+- **Sign out every session at once:** `openssl rand -base64 48 | npx wrangler secret put DASHBOARD_SECRET`.
 
-## Step 5: Payment-related actions (last, if wanted)
-- Refund helpers or manual access changes only after steps 2–4 have run cleanly, each with its own approval.
-- Prices (499 ⭐ / 30 days, 49 ⭐ / 3 days) stay as they are.
+**A2. Private Telegram preview**
+1. You: in Telegram, send `/start` to @ShakhiraVIPBot (once; lets the bot message you) and get your numeric user ID from @userinfobot.
+2. You: Cloudflare dashboard → Workers & Pages → `shakhira-admin-staging` → Settings → Variables and Secrets → **Add → Secret** `BOT_TOKEN` (the same token as the live bot).
+   - Safe in any order: a token without a preview chat is **locked** (nothing is sent).
+3. Claude: set `PREVIEW_CHAT_ID = "<your ID>"` in `wrangler.toml` and redeploy staging.
+4. Claude: run `test/remote/staging-preview.mjs`. Eight messages (text, photo, video, GIF, poll, quiz, VIP promotion, paid media at 1 ⭐) arrive **only in your private chat**.
 
-## Free-tier budget after all steps
+- **Verify:** you see the eight messages; the dashboard shows them `posted` with Telegram message IDs.
+- **Undo:** delete the `BOT_TOKEN` secret, which returns staging to simulation.
 
-| Resource | Use | Free limit |
-|---|---|---|
-| Workers | 3 (live bot, staging, production) | 100 |
-| Cron triggers | 3 | 5 |
-| Requests/day | ~3,500 | 100,000 |
-| D1 | 2 databases, a few MB | 10 databases, 5 GB |
+**A3. Media library**
+- **Owner:** you.
+- **Changes:** add three secrets to `shakhira-admin-staging`: `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`.
+  - Use the same values as the GitHub secrets, or better, a read-only Cloudinary API key.
+  - The Worker only **reads** the `tgpub` folder and never adds or removes tags.
+- **Verify:** the Media library page shows the same numbers as the GitHub `report` run (new, posted, reusable after 30 days).
+- **Undo:** delete the secrets.
+
+## B. Production admin Worker: channel content (send-only)
+
+**B1. Create production resources**
+- **Owner:** Claude, after your approval.
+- **Changes:** Worker `shakhira-admin` (a copy of staging with `ENVIRONMENT = "production"`) and a new empty D1 `shakhira-admin-prod`, with no example data.
+- **Free plan:** 3 Workers of 100, 3 cron triggers of 5, 3 D1 databases of 10.
+- **Undo:** `wrangler delete shakhira-admin`, then `wrangler d1 delete shakhira-admin-prod`.
+
+**B2. Production settings**
+- `REQUIRE_PREVIEW = "false"` and `PREVIEW_CHAT_ID = ""`.
+- `VIP_CHANNEL_ID` = the real VIP channel ID. You confirm it; it is not in this repository.
+- `BOT_TOKEN`: set by you as a secret.
+- Admin password: new and different from staging.
+
+**B3. Turn on one feature: “Publish scheduled posts”**
+- **Changes:** dashboard posts can go to the channels.
+- **Never sends:** Cloudinary auto-posts (GitHub keeps those). Member actions and reminders stay off.
+- **Verify:** one test text post to the public channel at a quiet time, then delete it.
+- **Undo:** switch the feature off (within 1 minute).
+
+**B4. Planned guard before B3**
+- The Worker refuses to schedule a post within 15 minutes of 5:00 AM or 10:00 PM IST, so dashboard posts never land on top of the GitHub auto-posts.
+- About 1 hour of work, plus tests.
+
+## C. Paid media: configurable Stars pricing and optional expiry
+
+Already built and tested in staging; production use needs B.
+
+**C1. Manual paid media**
+- **Where:** Posts & polls → New post → *Paid media (Stars)*.
+- **Price:** set per post, 1–10,000 ⭐.
+- **Optional:** “Delete automatically after” 5 minutes to 48 hours. Telegram only lets bots delete within 48 hours.
+- Stars from paid media posted in a channel go to **the channel's** Stars balance.
+
+**C2. Automated paid media**
+- **Where:** Features & settings → *Paid media automation*.
+- **Settings:**
+  - default price
+  - a **separate** Cloudinary folder (for example `vip_drops`; `tgpub` is refused)
+  - up to 6 daily times (UTC)
+  - target channel
+  - optional delete-after
+  - default caption
+- **Per file:** set a Cloudinary context `stars=120` to override the price, and `caption=…` for its own caption.
+- **Rules:**
+  - The oldest unused file is posted at each time.
+  - Each time slot is claimed in D1 first, so a slot can never post twice.
+  - Used files are remembered in D1, never tagged in Cloudinary.
+- **Turn on:** “Post paid media automatically” + “Publish scheduled posts”, and “Delete posts automatically” if expiry is used.
+- **Verify in staging first:**
+  - Simulation: add the Cloudinary secrets (A3) and a test folder.
+  - Then preview (A2): the paid post arrives only in your private chat.
+- **Undo:** switch the feature off; already-queued posts can be cancelled in Posts & polls.
+
+## D. Member features (changes the live bot: separate approval, needs its source)
+
+These need incoming Telegram updates, which only `shakhira-vip-bot` receives through its webhook:
+- join requests
+- trial and renewal reminders
+- moderation
+- reaction counts
+- `/admin`
+
+**D1.** You provide the live bot's source code (or approve downloading the deployed script read-only from Cloudflare).
+
+**D2.** Smallest change: add a **service binding** from `shakhira-vip-bot` to `shakhira-admin` and forward a *copy* of selected updates. The live bot keeps answering members exactly as today.
+
+**D3. Rollout**
+- Deploy as a new version of `shakhira-vip-bot`.
+- Watch `/status` and payments for 1 hour.
+- **Undo:** `wrangler rollback` to the previous version (Cloudflare keeps versions).
+
+## E. Subscriber data and payments (last)
+
+**E1.** Read-only export of subscribers and payments from `shakhira-vip` into the dashboard's subscriber view. No writes to the live database.
+
+**E2.** Refund helpers or manual access changes, each with its own approval.
+- Prices stay 499 ⭐ / 30 days and 49 ⭐ / 3 days.
+
+---
+
+## Things that never change without your explicit approval
+- **Live bot:** `shakhira-vip-bot`'s code, cron and webhook.
+- **Its database:** `shakhira-vip`.
+- **Channels:** both channels' settings, the bot's admin rights, prices and subscriptions.
+- **GitHub poster:** its workflow, schedule (5 AM / 10 PM IST) and smart rotation.
+- **Paid services:** no paid Cloudflare plan or add-on.
