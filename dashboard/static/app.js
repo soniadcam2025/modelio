@@ -1,7 +1,8 @@
 // Shakhira admin dashboard. Plain JS, no build step. All text is inserted with textContent
 // (never innerHTML), so names, captions and messages from Telegram users can't inject markup.
 
-const state = { csrf: null, user: null, badges: {} };
+const state = { csrf: null, user: null, badges: {}, caps: null };
+const can = (cap) => (state.caps || []).includes(cap);
 const TZ = "Asia/Kolkata";
 const IST_OFFSET_MS = 330 * 60 * 1000;
 
@@ -91,7 +92,7 @@ async function act(fn, success) {
 }
 
 const STATUS_CHIP = {
-  posted: "good", scheduled: "info", draft: "", sending: "warn", failed: "bad", uncertain: "warn", cancelled: "",
+  posted: "good", scheduled: "info", simulated: "info", draft: "", sending: "warn", failed: "bad", uncertain: "warn", cancelled: "",
   approved: "good", declined: "", pending: "warn", done: "good", queued: "info",
   monthly: "good", trial: "info", left: "", none: "",
 };
@@ -200,19 +201,25 @@ const PAGES = [
   ["activity", "Activity log", pageActivity],
 ];
 
-function renderLogin(message) {
+async function renderLogin(message) {
+  // Supabase Auth deployments sign in with email + password; the others with the dashboard password only.
+  if (state.authMode === undefined) {
+    try { state.authMode = (await api("/api/health")).auth || "password"; } catch { state.authMode = "password"; }
+  }
+  const withEmail = state.authMode === "supabase";
+  const email = withEmail ? h("input", { type: "email", autocomplete: "username", required: true, "aria-label": "Email" }) : null;
   const pw = h("input", { type: "password", autocomplete: "current-password", required: true, "aria-label": "Password" });
   const err = h("p", { class: "small", hidden: !message }, message || "");
   const form = h("form", { onsubmit: async (e) => {
     e.preventDefault();
     try {
-      const r = await api("/api/login", { method: "POST", body: { password: pw.value } });
+      const r = await api("/api/login", { method: "POST", body: withEmail ? { email: email.value, password: pw.value } : { password: pw.value } });
       state.csrf = r.csrf; state.user = r.user; route();
     } catch (ex) { err.hidden = false; err.textContent = ex.message; pw.select(); }
-  } }, field("Password", pw), err, h("button", { class: "primary", type: "submit" }, "Sign in"));
+  } }, withEmail ? field("Email", email) : null, field("Password", pw), err, h("button", { class: "primary", type: "submit" }, "Sign in"));
   put(document.getElementById("app"), h("div", { class: "login" },
-    h("div", { class: "card" }, h("h1", {}, "💎 Shakhira admin"), h("p", { class: "muted" }, "Sign in to manage the channels."), form)));
-  pw.focus();
+    h("div", { class: "card glass" }, h("h1", {}, "💎 Shakhira admin"), h("p", { class: "muted" }, "Sign in to manage the channels."), form)));
+  (email || pw).focus();
 }
 
 function renderShell(active) {
@@ -237,7 +244,10 @@ function toggleTheme() {
 
 async function route() {
   if (!state.user) {
-    try { const me = await api("/api/me"); state.user = me.user; state.csrf = me.csrf; } catch { return renderLogin(); }
+    try { const me = await api("/api/me"); state.user = me.user; state.csrf = me.csrf; state.caps = me.capabilities || []; } catch { return renderLogin(); }
+  }
+  if (state.caps === null) {
+    try { state.caps = (await api("/api/me")).capabilities || []; } catch { state.caps = []; }
   }
   const id = (location.hash || "#overview").slice(1).split("/")[0];
   const page = PAGES.find((p) => p[0] === id) || PAGES[0];
@@ -258,6 +268,9 @@ async function pageOverview(main) {
   const worker = o.worker_last_seen && Date.now() / 1000 - o.worker_last_seen < 600;
   put(main, 
     head("Overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
+    o.environment === "staging" ? h("div", { class: "banner warn" }, o.automation === "preview"
+      ? "STAGING: automation sends only to the private preview chat. Nothing reaches the channels or members."
+      : "STAGING: automation is simulated. Nothing is sent to Telegram.") : null,
     offCount === Object.keys(o.features).length
       ? h("div", { class: "banner warn" }, "All automated features are switched off. Turn them on one by one in Features & settings once the worker is running.")
       : null,
@@ -286,7 +299,7 @@ const kpi = (label, value, sub) => h("div", { class: "card kpi" }, h("div", { cl
 async function pageContent(main) {
   const filter = new URLSearchParams(location.hash.split("?")[1] || "").get("status") || "";
   const [items, captions] = await Promise.all([api("/api/content" + (filter ? `?status=${filter}` : "")), api("/api/captions")]);
-  const tabs = h("div", { class: "tabs", role: "tablist" }, ["", "scheduled", "draft", "posted", "failed", "uncertain"].map((st) =>
+  const tabs = h("div", { class: "tabs", role: "tablist" }, ["", "scheduled", "draft", "posted", "simulated", "failed", "uncertain"].map((st) =>
     h("button", { class: st === filter ? "active" : "", role: "tab", "aria-selected": String(st === filter),
       onclick: () => (location.hash = st ? `#content?status=${st}` : "#content") }, st ? st[0].toUpperCase() + st.slice(1) : "All")));
   put(main, 
@@ -340,6 +353,8 @@ function editor(item) {
   const btnText = h("input", { maxlength: 64, value: v.button_text || "" });
   const btnUrl = h("input", { type: "url", placeholder: "https://t.me/…", value: v.button_url || "" });
   const at = h("input", { type: "datetime-local", value: tsToIstInput(v.scheduled_at) });
+  const expire = h("input", { type: "number", min: 5, max: 2880, placeholder: "e.g. 1440 for 24 hours", value: v.expire_after_minutes || "" });
+  const hashtags = h("input", { maxlength: 420, placeholder: "#vip #newdrop", value: v.hashtags || "" });
   let options = [...(v.options && v.options.length ? v.options : ["", ""])];
 
   function drawOptions() {
@@ -387,6 +402,8 @@ function editor(item) {
     options, correct_option: Number(correct.value || 0), explanation: explanation.value, multiple_answers: multi.checked,
     close_after_minutes: closeAfter.value || null, star_count: stars.value || null, button_text: btnText.value,
     button_url: btnUrl.value, scheduled_at: istInputToTs(at.value),
+    ...(can("post_expiry") ? { expire_after_minutes: expire.value || null } : {}),
+    ...(can("hashtags") ? { hashtags: hashtags.value } : {}),
   });
   async function save(schedule) {
     const body = payload();
@@ -401,6 +418,9 @@ function editor(item) {
   drawer(item ? `Edit post #${item.id}` : "New post", h("form", { onsubmit: (e) => { e.preventDefault(); save(true); } },
     h("div", { class: "grid two" }, field("Type", kind), field("Channel", target)),
     groups.text, groups.media, groups.lib, groups.poll, groups.multi, groups.quiz, groups.close, groups.stars, groups.button,
+    can("hashtags") ? field("Hashtags (optional)", hashtags, "Up to 10, added on a new line at the end of the text or caption. Not added to polls or quizzes.") : null,
+    can("post_expiry") ? field("Delete automatically after (minutes, optional)", expire,
+      "5 minutes to 48 hours. Telegram lets bots delete their own posts only within 48 hours. Needs “Delete posts automatically” on.") : null,
     field("Publish at (India time)", at, "Posts go out within about 30 seconds of this time, once the worker is running and Scheduled posts is on."),
     h("div", { class: "row end" }, h("button", { type: "button", onclick: () => save(false) }, "Save draft"), h("button", { class: "primary", type: "submit" }, "Schedule"))));
 }
@@ -460,7 +480,8 @@ async function pageMedia(main) {
       : inv.reusable_now ? h("div", { class: "banner warn" }, `No new media: the poster is reposting the oldest posts (last posted 30+ days ago). ${num(inv.reusable_now)} can be reposted now. Upload new media to “${p.folder}” to post fresh content.`)
       : h("div", { class: "banner bad" }, `Nothing can be posted: no new media, and every post is still inside its 30-day cooldown${inv.next_reuse_at ? `. Reposting resumes ${when(inv.next_reuse_at)}` : ""}. Upload new media to “${p.folder}” to post sooner.`),
     h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), `in “${p.folder}”`), kpi("Posted", num(inv.posted), `${num(inv.reusable_now)} reusable now (30+ days old)`),
-      kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"), kpi("Unsupported", num(inv.unsupported), "format or size")),
+      kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"), kpi("Unsupported", num(inv.unsupported), "format or size"),
+      p.paid_folder ? kpi("Paid-media folder", num(p.paid_folder.unused), `unused of ${num(p.paid_folder.total)} in “${p.paid_folder.folder}”`) : null),
     h("section", { class: "card", style: null }, h("h2", {}, "Files"), h("div", { class: "media-grid" }, p.library.map((m) => h("div", { class: "media-tile" },
       m.thumb ? h("img", { src: m.thumb, alt: m.name, loading: "lazy" }) : h("div", { class: "ph" }, m.kind),
       h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.name), chip(m.state === "queued" ? "scheduled" : m.state === "posted" ? "posted" : "uncertain", m.state), m.note ? h("span", { class: "muted" }, m.note) : null))))));
@@ -579,7 +600,46 @@ async function pageSettings(main) {
     h("div", { class: "banner warn" }, "Safety: the dashboard never holds the bot token. The send-only worker carries out these features and never receives updates, so the live bot keeps working. Features marked “full bot” only work after the live bot has been retired and replaced; until then they record nothing."),
     h("section", { class: "card" }, h("h2", {}, "Features"), Object.entries(st.features).map(([name, f]) => h("div", { class: "toggle-row" },
       h("div", {}, h("div", {}, f.description, " ", FULL_BOT_FEATURES.has(name) ? chip("pending", "full bot") : chip("scheduled", "worker")), h("div", { class: "small muted mono" }, name)), toggle(name, f)))),
-    h("section", { class: "card", style: null }, h("h2", {}, "Join requests"), policy("public", `Public channel (${st.public_channel})`), policy("vip", "VIP channel")));
+    h("section", { class: "card", style: null }, h("h2", {}, "Join requests"), policy("public", `Public channel (${st.public_channel})`), policy("vip", "VIP channel")),
+    can("paid_media_automation") ? await paidMediaSettings() : null,
+    can("backup") ? await backupCard() : null);
+}
+
+async function backupCard() {
+  let health = null;
+  try { health = await api("/api/health"); } catch { /* shown as unknown */ }
+  const db = health && health.database;
+  const seen = health && health.scheduler_last_seen;
+  return h("section", { class: "card" }, h("h2", {}, "Backups & monitoring"),
+    h("div", { class: "toggle-row" }, h("div", {}, "Database"), db ? chip(db.ok ? "posted" : "failed", `${db.kind} · ${db.ok ? `ok, ${db.ms} ms` : "unreachable"}`) : chip("failed", "unknown")),
+    h("div", { class: "toggle-row" }, h("div", {}, "Scheduler last ran"), seen ? chip(Date.now() / 1000 - seen < 300 ? "posted" : "failed", fmt.format(new Date(seen * 1000))) : chip("pending", "not yet")),
+    h("p", { class: "small muted" }, "Download a full copy of the dashboard data (posts, captions, settings, profiles, analytics and the activity log). Each download is recorded in the activity log."),
+    h("a", { class: "btn", href: "/api/backup", download: "" }, "Download backup (JSON)"));
+}
+
+async function paidMediaSettings() {
+  const cfg = await api("/api/settings/paid-media");
+  const stars = h("input", { type: "number", min: 1, max: 10000, value: cfg.default_stars, required: true });
+  const folder = h("input", { value: cfg.folder, placeholder: "e.g. vip_drops (never tgpub)" });
+  const times = h("input", { value: cfg.times_utc.join(", "), placeholder: "e.g. 08:00, 18:30 (UTC)" });
+  const target = h("select", {}, h("option", { value: "vip", selected: cfg.target === "vip" }, "VIP channel"), h("option", { value: "public", selected: cfg.target === "public" }, "Public channel"));
+  const expire = h("input", { type: "number", min: 5, max: 2880, value: cfg.expire_after_minutes || "", placeholder: "optional" });
+  const caption = h("textarea", { maxlength: 1024, placeholder: "Used when the file has no caption of its own" }); caption.value = cfg.caption || "";
+  const istTimes = cfg.times_utc.map((t) => { const [hh, mm] = t.split(":").map(Number); const m = (hh * 60 + mm + 330) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")} IST`; });
+  return h("section", { class: "card" }, h("h2", {}, "Paid media automation"),
+    h("p", { class: "muted small" }, "Posts the oldest unused photo or video from its own Cloudinary folder at each time, as paid media. A file's own Cloudinary context ",
+      h("span", { class: "mono" }, "stars=120"), " overrides the default price, and its ", h("span", { class: "mono" }, "caption"),
+      " is used if set. Needs “Post paid media automatically” and “Publish scheduled posts” on. Used files are remembered here, never tagged in Cloudinary."),
+    istTimes.length ? h("p", { class: "small" }, "Current times: ", istTimes.join(", ")) : null,
+    h("form", { onsubmit: async (e) => { e.preventDefault();
+      if (await act(() => api("/api/settings/paid-media", { method: "PUT", body: { default_stars: stars.value, folder: folder.value, times_utc: times.value,
+        target: target.value, expire_after_minutes: expire.value || null, caption: caption.value } }), "Saved")) route(); } },
+      h("div", { class: "grid two" }, field("Default price (Stars)", stars), field("Channel", target)),
+      field("Cloudinary folder", folder, "A separate folder. tgpub is refused: it belongs to the free-channel poster."),
+      field("Times (UTC, comma-separated)", times, "Up to 6 a day. 16:30 UTC is 10:00 PM IST."),
+      field("Delete after (minutes, optional)", expire, "5 to 2,880 (48 hours). Needs “Delete posts automatically” on."),
+      field("Default caption (optional)", caption),
+      h("button", { type: "submit" }, "Save")));
 }
 
 async function pageActivity(main) {

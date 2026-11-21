@@ -189,3 +189,71 @@ tr.clickable:hover td { background: var(--surface-2); }
 [hidden] { display: none !important; }
 label.inline { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 label.inline input[type="checkbox"] { width: 18px; height: 18px; margin: 0; }
+
+/* ── Liquid Glass ─────────────────────────────────────────────────────────────
+   Translucent, blurred surfaces over a soft colour field, with a thin light rim.
+   Text stays on near-opaque glass so contrast holds in both themes; with
+   reduced transparency (or no backdrop-filter support) surfaces fall back to solid. */
+:root {
+  --glass: rgba(255, 255, 255, .62);
+  --glass-strong: rgba(255, 255, 255, .82);
+  --glass-rim: rgba(255, 255, 255, .75);
+  --glass-edge: rgba(15, 23, 42, .08);
+  --glass-shadow: 0 1px 0 rgba(255, 255, 255, .6) inset, 0 8px 32px rgba(15, 23, 42, .10);
+  --field-1: #c9dcff; --field-2: #f6d5ea; --field-3: #d4f1e6;
+  --radius: 18px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --glass: rgba(28, 30, 38, .55); --glass-strong: rgba(30, 32, 40, .80);
+    --glass-rim: rgba(255, 255, 255, .10); --glass-edge: rgba(255, 255, 255, .08);
+    --glass-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 10px 40px rgba(0, 0, 0, .45);
+    --field-1: #1b2a55; --field-2: #3a1838; --field-3: #10352c;
+  }
+}
+:root[data-theme="dark"] {
+  --glass: rgba(28, 30, 38, .55); --glass-strong: rgba(30, 32, 40, .80);
+  --glass-rim: rgba(255, 255, 255, .10); --glass-edge: rgba(255, 255, 255, .08);
+  --glass-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 10px 40px rgba(0, 0, 0, .45);
+  --field-1: #1b2a55; --field-2: #3a1838; --field-3: #10352c;
+}
+body {
+  background:
+    radial-gradient(60vmax 50vmax at 8% 0%, var(--field-1), transparent 60%),
+    radial-gradient(50vmax 45vmax at 100% 20%, var(--field-2), transparent 60%),
+    radial-gradient(55vmax 50vmax at 40% 100%, var(--field-3), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+}
+.card, .nav, .login .card, dialog, .toast {
+  background: var(--glass);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--glass-shadow);
+  -webkit-backdrop-filter: blur(22px) saturate(170%);
+  backdrop-filter: blur(22px) saturate(170%);
+}
+.card { border-radius: var(--radius); }
+.nav { border-right: 1px solid var(--glass-edge); }
+.nav a { border-radius: 12px; transition: background .15s ease; }
+.nav a:hover, .nav a.active { background: var(--glass-strong); box-shadow: 0 0 0 1px var(--glass-rim) inset; }
+button, .btn, input, select, textarea {
+  border-radius: 12px;
+  background: var(--glass-strong);
+  border-color: var(--glass-edge);
+}
+button:hover, .btn:hover { background: var(--surface); }
+button.primary {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white), var(--accent));
+  border-color: transparent; box-shadow: 0 1px 0 rgba(255, 255, 255, .35) inset, 0 4px 14px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.chip { -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.login .card { border-radius: 24px; }
+@media (prefers-reduced-transparency: reduce) {
+  .card, .nav, .login .card, dialog, .toast, button, .btn, input, select, textarea {
+    background: var(--surface); -webkit-backdrop-filter: none; backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .card, .nav, .login .card, dialog, .toast { background: var(--surface); }
+}
+@media (prefers-reduced-motion: reduce) { .nav a { transition: none; } }

@@ -35,6 +35,21 @@ approval. No new bots, channels, groups or discussion groups are created anywher
 
 Every worker and full-bot feature is **off** until switched on in the dashboard (Features & settings).
 
+## 2b. Hosting options (checked 20 Nov 2026)
+
+**Where the live bot runs:** a read-only check (`tools/identify_live_bot.py`, workflow *Identify live bot*) shows that `@ShakhiraVIPBot` is a **Cloudflare Worker** (`*.workers.dev`) that receives updates by **webhook**.
+- Workers are serverless: short request handlers and timed jobs, with no long-running process and no local disk.
+- The dashboard and worker in this repository are long-running Python processes with SQLite, so they cannot be added to the live bot's Worker as they are.
+- The Nova AI Google Cloud VM is **not** to be used; Shakhira and Nova stay separate.
+
+| Option | Monthly cost | What it takes | Limits / risks |
+|---|---|---|---|
+| **A. A separate Cloudflare Worker in the same account as the live bot** (dashboard + cron-triggered sender, data in D1, login via Cloudflare Access) | **$0** on the Workers Free plan | A port of the dashboard API and send-only worker to a Worker (TypeScript). An API token scoped to Workers, D1 and Access in that account. The live bot's Worker is not touched. | Free plan:<br>• 100,000 requests/day for the whole account (shared with the live bot)<br>• 5 cron triggers per account (some may be used by the live bot)<br>• 10 ms CPU per cron run (network waits don't count)<br>• D1: 5 GB, 5 M row reads and 100 k row writes per day<br>• Cloudflare Access free for up to 50 users |
+| **B. Oracle Cloud Always Free VM** (runs this code unchanged) | **$0** | A new Oracle account (card verification), then `deploy/vm/preflight.sh` and the systemd units | Always Free Arm allowance was cut to 2 OCPU / 12 GB in 2026, and instances above it are terminated. Capacity is sometimes unavailable. A separate account to maintain. |
+| C. Small VPS (e.g. 1 vCPU / 1–2 GB) | about $4–6 | A purchase (needs approval) | Simplest to run; a recurring cost |
+| D. An always-on home computer | $0 | Python + the systemd units or a scheduler | Reliability depends on the machine and its connection |
+| Not suitable: GitHub Actions / Pages, PythonAnywhere free, Render free | — | — | Actions: no persistent private data, and runs start hours late. Pages: static only. Free web tiers sleep or block always-on tasks. |
+
 ## 3. Before deploying: identify the live bot
 
 The live `@ShakhiraVIPBot` code is not in this repository. Run this **read-only** check (it never

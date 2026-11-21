@@ -65,6 +65,10 @@ async def run_worker(cfg: Config, store: Storage, stop: asyncio.Event, bot=None,
 
 
 def main(cfg: Config, store: Storage) -> int:
+    if cfg.require_preview and cfg.preview_chat_id is None:
+        logger.error("Not starting: WORKER_REQUIRE_PREVIEW is on but PREVIEW_CHAT_ID is not set. "
+                     "This server may only run the worker in preview mode.")
+        return 3
     async def runner():
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

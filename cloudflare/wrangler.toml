@@ -1,0 +1,44 @@
+# STAGING admin dashboard + send-only automation for the Shakhira channels.
+# A separate Worker: it never touches the live bot Worker (shakhira-vip-bot).
+name = "shakhira-admin-staging"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+# One cron trigger (the account has 5 on the free plan; the live bot uses 1).
+[triggers]
+crons = ["* * * * *"]
+
+# The dashboard frontend is bundled into the script by build.mjs (no separate static-asset upload);
+# every response goes through the Worker, so security headers are always set.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "shakhira-staging"
+database_id = "9f817e23-7415-416c-8f7b-bb15eeeab6c4"
+migrations_dir = "migrations"
+
+[vars]
+ENVIRONMENT = "staging"
+# Staging lock: never publish to the channels. Without BOT_TOKEN the automation is simulated
+# (nothing is sent to Telegram). With BOT_TOKEN and PREVIEW_CHAT_ID it sends only to that private chat.
+REQUIRE_PREVIEW = "true"
+PREVIEW_CHAT_ID = ""
+PUBLIC_CHANNEL = "@yourshakhira"
+VIP_CHANNEL_ID = ""
+BOT_USERNAME = "ShakhiraVIPBot"
+# UTC times of the GitHub Actions poster (5 AM and 10 PM IST), shown in the calendar only.
+POST_SLOTS_UTC = "16:30,23:30"
+# The cron is only the clock: each minute it sends one signed request to the Vercel backend, which runs the
+# cycle next to the Supabase database. Needs the CYCLE_SECRET secret (same value as on Vercel). Remove to run on D1 again.
+CYCLE_URL = "https://shakhira-admin-staging.vercel.app/api/internal/cycle"
+
+# Secrets (set with `wrangler secret put`, never committed):
+#   DASHBOARD_PASSWORD_HASH  from `node tools/hash-password.mjs`
+#   DASHBOARD_SECRET         at least 32 random characters
+#   BOT_TOKEN                optional; leave unset in staging to simulate all sends
+
+# Workers Logs (included in the free plan): cron runs and errors are visible in the Cloudflare dashboard.
+[observability]
+enabled = true
