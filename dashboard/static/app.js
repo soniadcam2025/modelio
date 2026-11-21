@@ -247,9 +247,11 @@ function toggleTheme() {
 async function route() {
   if (!state.user) {
     try { const me = await api("/api/me"); state.user = me.user; state.csrf = me.csrf; state.caps = me.capabilities || []; state.automation = me.automation; } catch { return renderLogin(); }
+    if ((state.caps || []).includes("bots")) api("/api/bots").then((r) => { state.primaryBot = r.bots.find((b) => b.is_primary)?.username; }).catch(() => {});
   }
   if (state.caps === null) {
-    try { state.caps = (await api("/api/me")).capabilities || []; } catch { state.caps = []; }
+    try { const me = await api("/api/me"); state.caps = me.capabilities || []; state.automation = me.automation; } catch { state.caps = []; }
+    if ((state.caps || []).includes("bots") && !state.primaryBot) api("/api/bots").then((r) => { state.primaryBot = r.bots.find((b) => b.is_primary)?.username; }).catch(() => {});
   }
   const id = (location.hash || "#overview").slice(1).split("/")[0];
   const page = PAGES.find((p) => p[0] === id) || PAGES[0];
@@ -308,7 +310,8 @@ function telegramCard() {
   api("/api/telegram").then((t) => {
     if (!t.configured) { put(box, h("h2", {}, "Bot & channels"), h("p", { class: "muted" }, "Add the BOT_TOKEN secret to this Worker to see the bot and channel status here (read-only).")); return; }
     const row = (label, value) => h("div", { class: "toggle-row" }, h("div", {}, label), value);
-    const ch = (c, name) => !c ? chip("pending", "not configured") : c.error ? chip("failed", c.error) : chip("posted", `${c.title}${c.members !== null ? ` · ${num(c.members)} members` : ""}`);
+    const ch = (c, name) => !c ? chip("pending", "not configured") : c.error ? chip("failed", c.error) : h("span", {}, chip("posted", `${c.title}${c.members !== null ? ` · ${num(c.members)} members` : ""}`),
+      h("span", { class: "small muted" }, ` reactions: ${c.reactions === "all" ? "all emoji" : Array.isArray(c.reactions) ? (c.reactions.length ? c.reactions.join(" ") : "off") : "—"}`));
     const w = t.webhook || {};
     put(box, h("h2", {}, "Bot & channels"),
       row("Bot", t.bot.error ? chip("failed", t.bot.error) : chip("posted", `@${t.bot.username}`)),
@@ -398,6 +401,16 @@ function editor(item, preset = {}) {
   const expire = h("input", { type: "number", min: 5, max: 2880, placeholder: "e.g. 1440 for 24 hours", value: v.expire_after_minutes || "" });
   const hashtags = h("input", { maxlength: 420, placeholder: "#vip #newdrop", value: v.hashtags || "" });
   const protect = h("input", { type: "checkbox", checked: !!Number(v.protect_content || 0) });
+  const html = h("input", { type: "checkbox", checked: v.parse_mode === "HTML" });
+  let buttons = v.buttons_json ? JSON.parse(v.buttons_json) : v.button_text ? [{ text: v.button_text, url: v.button_url }] : [];
+  const buttonsBox = h("div", {});
+  function drawButtons() {
+    put(buttonsBox, ...buttons.map((b, i) => h("div", { class: "row option-row" },
+      h("input", { maxlength: 64, placeholder: "Button text", value: b.text || "", oninput: (e) => { buttons[i].text = e.target.value; drawPreview(); } }),
+      h("input", { type: "url", placeholder: "https://… or https://t.me/…", value: b.url || "", oninput: (e) => { buttons[i].url = e.target.value; } }),
+      h("button", { type: "button", class: "link danger", onclick: () => { buttons.splice(i, 1); drawButtons(); drawPreview(); } }, "Remove"))),
+      buttons.length < 6 ? h("button", { type: "button", onclick: () => { buttons.push({ text: "", url: "" }); drawButtons(); } }, "Add button") : null);
+  }
   const rule = v.repeat_json ? JSON.parse(v.repeat_json) : {};
   const repeat = h("select", {}, [["", "Once"], ["daily", "Every day"], ["weekly", "Every week"]].map(([val, l]) => h("option", { value: val, selected: (rule.every || "") === val }, l)));
   const repeatCount = h("input", { type: "number", min: 2, max: 365, placeholder: "no limit", value: rule.count || "" });
@@ -424,17 +437,22 @@ function editor(item, preset = {}) {
       can("content_v2") ? h("div", { class: "row" },
         h("label", { class: "btn" }, "Upload from this device", h("input", { type: "file", accept: "image/*,video/*", hidden: true, onchange: async (e) => {
           const f = e.target.files[0]; if (!f) return;
-          const url = await act(() => uploadToCloudinary(f, "shakhira_admin"), "Uploaded to the dashboard library");
+          const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
+          e.target.closest(".row").after(bar);
+          const url = await act(() => uploadToCloudinary(f, "shakhira_admin", (pct) => { bar.value = pct; }), "Uploaded to the dashboard library");
+          bar.remove();
           if (url) { mediaUrl.value = url; drawPreview(); }
         } })),
         h("button", { type: "button", onclick: () => pickMedia((url) => { mediaUrl.value = url; drawPreview(); }) }, "Choose from library")) : null),
     lib: h("label", { class: "inline field" }, useLib, "Leave the caption empty and use the caption library"),
+    format: h("div", {}, h("label", { class: "inline field" }, html, "Formatting (bold, italic, links with their own text)"),
+      h("p", { class: "small muted" }, 'Use <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strike</s>, <tg-spoiler>spoiler</tg-spoiler>, <a href="https://…">link text</a>. Plain links and emoji work without it.')),
     poll: h("div", {}, h("h3", {}, "Options"), optsBox),
     multi: h("label", { class: "inline field" }, multi, "Allow several answers"),
     quiz: h("div", {}, field("Correct answer", correct), field("Explanation (shown after answering)", explanation)),
     close: field("Close automatically after (minutes)", closeAfter, "Results are saved for Analytics when the poll closes."),
     stars: field("Price in Stars", stars, "Each viewer unlocks it for this many Stars (Telegram's native paid media). It is NOT view-once: anyone who paid can open it again at any time. “Protected content” stops forwarding and saving in Telegram apps, but not screenshots or screen recording."),
-    button: h("div", {}, h("h3", {}, "Button (optional)"), field("Button text", btnText), field("Button link", btnUrl)),
+    button: h("div", {}, h("h3", {}, "Buttons (optional, up to 6)"), buttonsBox, h("p", { class: "small muted" }, "Each button opens a link. VIP promotions without buttons get a “💎 Join VIP” button automatically.")),
   };
   function show() {
     const k = kind.value;
@@ -446,7 +464,8 @@ function editor(item, preset = {}) {
     groups.quiz.hidden = k !== "quiz";
     groups.close.hidden = !["poll", "quiz"].includes(k);
     groups.stars.hidden = k !== "paid_media";
-    groups.button.hidden = ["poll", "quiz", "paid_media"].includes(k);
+    groups.button.hidden = ["poll", "quiz"].includes(k);
+    groups.format.hidden = ["poll", "quiz"].includes(k);
     groups.text.firstChild.textContent = ["poll", "quiz"].includes(k) ? "Question" : isMedia ? "Caption" : "Text";
   }
   // What the post will look like (approximate; Telegram decides the final layout).
@@ -456,21 +475,29 @@ function editor(item, preset = {}) {
       ? (isVideo ? h("video", { src: url, muted: true, controls: true, preload: "metadata" }) : h("img", { src: url, alt: "", loading: "lazy" })) : null;
     const body = ["poll", "quiz"].includes(k)
       ? h("div", {}, h("strong", {}, text.value || "Question"), h("ul", {}, options.filter(Boolean).map((o, i) => h("li", {}, o, k === "quiz" && String(i) === correct.value ? " ✓" : ""))))
-      : h("div", { class: "pre" }, [text.value || (useLib.checked ? "(caption from the library)" : ""), hashtags.value ? `\n\n${hashtags.value}` : ""].join(""));
-    put(previewBox, h("div", { class: "small muted" }, `Preview · ${target.options[target.selectedIndex]?.text || ""}`),
-      k === "paid_media" ? h("div", { class: "paid-badge" }, `⭐ ${stars.value || "?"} to unlock`) : null, media, body,
-      protect.checked ? h("div", { class: "small muted" }, "🔒 Protected: no forwarding or saving") : null);
+      : h("div", { class: "pre" }, html.checked ? renderTelegramHtml(text.value) : text.value || (useLib.checked ? "(caption from the library)" : ""), hashtags.value ? `\n\n${hashtags.value}` : "");
+    const paid = k === "paid_media";
+    const shownMedia = paid && media ? h("div", { class: "paid-wrap" }, media, h("div", { class: "paid-overlay" }, h("span", {}, `⭐ Unlock for ${stars.value || "?"}`))) : media;
+    if (paid && media) media.removeAttribute("controls");
+    const btns = buttons.filter((b) => (b.text || "").trim());
+    put(previewBox, h("div", { class: "small muted" }, `Preview · ${target.options[target.selectedIndex]?.text || ""}${html.checked ? " · formatted by Telegram" : ""}`),
+      shownMedia, body,
+      btns.length ? h("div", { class: "preview-buttons" }, btns.map((b) => h("div", {}, b.text))) : k === "promo" ? h("div", { class: "preview-buttons" }, h("div", {}, "💎 Join VIP")) : null,
+      protect.checked ? h("div", { class: "small muted" }, "🔒 Protected: no forwarding or saving") : null,
+      paid ? h("p", { class: "small muted" }, "Paid media is not view-once: after paying, viewers can open it again.") : null,
+      !["poll", "quiz"].includes(k) ? h("p", { class: "small muted" }, "Reactions under the post follow the channel's own reaction settings in Telegram (shown on Overview → Bot & channels).") : null);
   }
+  drawButtons();
   kind.addEventListener("change", () => { show(); drawPreview(); });
-  for (const el of [text, mediaUrl, stars, hashtags, target, protect, correct]) el.addEventListener("input", drawPreview);
+  for (const el of [text, mediaUrl, stars, hashtags, target, protect, correct, html]) { el.addEventListener("input", drawPreview); el.addEventListener("change", drawPreview); }
   show();
   drawPreview();
 
   const payload = () => ({
     kind: kind.value, ...targetValue(), text: text.value, media_url: mediaUrl.value, use_caption_library: useLib.checked,
     options, correct_option: Number(correct.value || 0), explanation: explanation.value, multiple_answers: multi.checked,
-    close_after_minutes: closeAfter.value || null, star_count: stars.value || null, button_text: btnText.value,
-    button_url: btnUrl.value, scheduled_at: istInputToTs(at.value),
+    close_after_minutes: closeAfter.value || null, star_count: stars.value || null, button_text: "", button_url: "",
+    buttons: buttons.filter((b) => (b.text || "").trim() || (b.url || "").trim()), parse_mode: html.checked ? "HTML" : "", scheduled_at: istInputToTs(at.value),
     ...(can("post_expiry") ? { expire_after_minutes: expire.value || null } : {}),
     ...(can("hashtags") ? { hashtags: hashtags.value } : {}),
     ...(can("content_v2") ? { protect_content: protect.checked, repeat: repeat.value ? { every: repeat.value, count: repeatCount.value || null } : null } : {}),
@@ -481,9 +508,17 @@ function editor(item, preset = {}) {
     if (mode === true) mode = "schedule";
     if (mode === "schedule" && !body.scheduled_at) { toast("Choose when to publish", true); return; }
     let confirmed = false;
-    if (["schedule", "publish"].includes(mode) && state.automation === "live") {
+    if (["schedule", "publish"].includes(mode)) {
       const where = target.options[target.selectedIndex]?.text || "the channel";
-      if (!confirm(`This will be published for real to ${where}${mode === "publish" ? " now" : ` at ${at.value.replace("T", " ")} (India time)`}. Continue?`)) return;
+      const bot = target.value.includes("|") ? where.split(" → ")[0] : `@${state.primaryBot || "ShakhiraVIPBot"}`;
+      const summary = (text.value || (useLib.checked ? "(caption from the library)" : "")).replace(/<[^>]+>/g, "").slice(0, 160);
+      const destination = { live: `REAL post to ${where}`, preview: "your private preview chat only (preview mode)",
+        locked: "nowhere yet: posting is locked until a preview chat is set or publishing is approved",
+        simulated: "nowhere: simulation (no bot connected, no message is sent)" }[state.automation] || "see Automation";
+      const msg = [`${mode === "publish" ? "Publish now" : `Schedule for ${at.value.replace("T", " ")} IST`}${repeat.value ? ` (repeats ${repeat.value})` : ""}`,
+        `Bot: ${bot}`, `Channel: ${where}`, `Type: ${KIND_LABEL[kind.value]}${kind.value === "paid_media" ? ` · ${stars.value || "?"} ⭐` : ""}${protect.checked ? " · protected" : ""}`,
+        `Content: ${summary || "—"}`, "", `Goes to: ${destination}`, "", "Continue?"].join("\n");
+      if (!confirm(msg)) return;
       confirmed = true;
     }
     const saved = await act(async () => {
@@ -498,7 +533,7 @@ function editor(item, preset = {}) {
   }
   drawer(item ? `Edit post #${item.id}` : "New post", h("form", { onsubmit: (e) => { e.preventDefault(); save(true); } },
     h("div", { class: "grid two" }, field("Type", kind), field("Channel", target)),
-    groups.text, groups.media, groups.lib, groups.poll, groups.multi, groups.quiz, groups.close, groups.stars, groups.button,
+    groups.text, groups.format, groups.media, groups.lib, groups.poll, groups.multi, groups.quiz, groups.close, groups.stars, groups.button,
     can("hashtags") ? field("Hashtags (optional)", hashtags, "Up to 10, added on a new line at the end of the text or caption. Not added to polls or quizzes.") : null,
     can("post_expiry") ? field("Delete automatically after (minutes, optional)", expire,
       "5 minutes to 48 hours. Telegram lets bots delete their own posts only within 48 hours. Needs “Delete posts automatically” on.") : null,
@@ -892,11 +927,26 @@ async function manageBot(b, permissions) {
     history.content.length ? table([{ label: "Post", render: (i) => `#${i.id} ${KIND_LABEL[i.kind] || i.kind}` }, { label: "Status", render: (i) => chip(i.status) }, { label: "Error", key: "last_error" }], history.content) : null));
 }
 
+// Telegram-style formatting for the preview, built as DOM nodes (never innerHTML): only Telegram's tags are kept,
+// links only for https:// and tg://, everything else becomes plain text.
+function renderTelegramHtml(src) {
+  const TAGS = { b: "strong", strong: "strong", i: "em", em: "em", u: "u", ins: "u", s: "s", strike: "s", del: "s", code: "code", pre: "pre", blockquote: "blockquote", "tg-spoiler": "span" };
+  const doc = new DOMParser().parseFromString(`<body>${src}</body>`, "text/html");
+  const walk = (node) => [...node.childNodes].map((n) => {
+    if (n.nodeType === 3) return n.textContent;
+    const tag = n.nodeName.toLowerCase();
+    if (tag === "a") { const href = n.getAttribute("href") || ""; return /^(https:|tg:)/.test(href) ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }, walk(n)) : n.textContent; }
+    if (TAGS[tag]) return h(TAGS[tag], tag === "tg-spoiler" ? { class: "spoiler" } : {}, walk(n));
+    return n.textContent;
+  });
+  return walk(doc.body);
+}
+
 // ---------- Uploads, library picker, automation ----------
 
 const MAX_UPLOAD = { image: 10 * 1024 * 1024, video: 100 * 1024 * 1024 };
 // Signed by the Worker; the file goes straight from the browser to Cloudinary (the API secret never reaches the browser).
-async function uploadToCloudinary(file, folder) {
+async function uploadToCloudinary(file, folder, onProgress = null) {
   const type = file.type.startsWith("video/") ? "video" : file.type.startsWith("image/") ? "image" : null;
   if (!type) throw new Error("Choose an image or a video");
   if (file.size > MAX_UPLOAD[type]) throw new Error(`Too large: ${type === "image" ? "10" : "100"} MB at most`);
@@ -904,9 +954,15 @@ async function uploadToCloudinary(file, folder) {
   const form = new FormData();
   form.append("file", file);
   for (const k of ["api_key", "timestamp", "signature", "folder", "asset_folder", "tags"]) form.append(k, sig[k]);
-  const res = await fetch(sig.upload_url, { method: "POST", body: form });
-  const out = await res.json().catch(() => ({}));
-  if (!res.ok || !out.secure_url) throw new Error(out.error?.message || `Upload failed (${res.status})`);
+  const out = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", sig.upload_url);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100)); };
+    xhr.onload = () => { let b = {}; try { b = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300 && b.secure_url) resolve(b); else reject(new Error(b.error?.message || `Upload failed (${xhr.status})`)); };
+    xhr.onerror = () => reject(new Error("Upload failed: network error"));
+    xhr.send(form);
+  });
   if (type === "image" && file.size > 5 * 1024 * 1024) toast("Uploaded. Note: Telegram accepts photos up to 5 MB by link; use a smaller image for photo posts.", true);
   return out.secure_url;
 }
@@ -936,7 +992,7 @@ async function pageMediaV2(main) {
     let done = 0;
     for (const f of files) {
       status.textContent = `Uploading ${done + 1} of ${files.length}: ${f.name}…`;
-      try { await uploadToCloudinary(f, current.folder); done++; } catch (err) { toast(`${f.name}: ${err.message}`, true); }
+      try { await uploadToCloudinary(f, current.folder, (pct) => { status.textContent = `Uploading ${done + 1} of ${files.length}: ${f.name} — ${pct}%`; }); done++; } catch (err) { toast(`${f.name}: ${err.message}`, true); }
     }
     status.textContent = `${done} of ${files.length} uploaded.`;
     if (done) setTimeout(route, 600);

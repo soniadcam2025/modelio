@@ -225,7 +225,9 @@ function routes() {
     const channel = async (chatId) => {
       if (!chatId) return null;
       const [chat, members] = await Promise.all([safe(tg.call("getChat", { chat_id: chatId })), safe(tg.call("getChatMemberCount", { chat_id: chatId }))]);
-      return chat.error ? { error: chat.error } : { title: chat.title, type: chat.type, username: chat.username || null, members: typeof members === "number" ? members : null };
+      // available_reactions: absent = all emoji allowed; [] = reactions off; otherwise the allowed list (set by channel admins in Telegram).
+      const reactions = chat.available_reactions === undefined ? "all" : chat.available_reactions.map((r) => r.emoji || (r.custom_emoji_id ? "custom" : r.type));
+      return chat.error ? { error: chat.error } : { title: chat.title, type: chat.type, username: chat.username || null, members: typeof members === "number" ? members : null, reactions };
     };
     const [me, hook, pub, vip] = await Promise.all([safe(tg.call("getMe", {})), safe(tg.call("getWebhookInfo", {})),
       channel(c.config.publicChannel), channel(c.config.vipChannelId)]);

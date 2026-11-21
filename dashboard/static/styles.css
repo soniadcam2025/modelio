@@ -268,3 +268,13 @@ button.primary {
 .picker { margin-top: 16px; border-top: 1px solid var(--glass-edge); padding-top: 12px; }
 label.btn { cursor: pointer; }
 label.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+.paid-wrap { position: relative; display: inline-block; overflow: hidden; border-radius: 12px; }
+.paid-wrap img, .paid-wrap video { filter: blur(18px) brightness(.85); transform: scale(1.08); margin: 0; }
+.paid-overlay { position: absolute; inset: 0; display: grid; place-items: center; }
+.paid-overlay span { background: rgba(0, 0, 0, .55); color: #fff; padding: 8px 16px; border-radius: 999px; font-weight: 650; }
+.preview-buttons { display: grid; gap: 4px; margin-top: 6px; }
+.preview-buttons div { text-align: center; padding: 6px; border-radius: 10px; background: var(--glass-strong); border: 1px solid var(--glass-edge); font-weight: 600; font-size: 13px; }
+.upload-progress { width: 100%; height: 8px; }
+.post-preview .spoiler { background: var(--text-2); color: transparent; border-radius: 4px; }
+.post-preview .spoiler:hover { color: inherit; background: none; }
