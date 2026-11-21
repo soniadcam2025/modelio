@@ -37,3 +37,7 @@ POST_SLOTS_UTC = "16:30,23:30"
 #   DASHBOARD_PASSWORD_HASH  from `node tools/hash-password.mjs`
 #   DASHBOARD_SECRET         at least 32 random characters
 #   BOT_TOKEN                optional; leave unset in staging to simulate all sends
+
+# Workers Logs (included in the free plan): cron runs and errors are visible in the Cloudflare dashboard.
+[observability]
+enabled = true
