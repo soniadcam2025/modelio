@@ -41,9 +41,13 @@ const startsWithAny = (s, prefixes) => prefixes.some((p) => s.startsWith(p));
 const toInt = (v) => (v === null || v === undefined || v === "" || !/^-?\d+$/.test(String(v).trim()) ? NaN : Number(v));
 
 export function validateContent(data) {
-  const kind = data.kind, target = data.target;
+  const kind = data.kind, target = String(data.target ?? "");
   if (!CONTENT_KINDS.includes(kind)) throw new OpsError("Choose a post type");
-  if (!TARGETS.includes(target)) throw new OpsError("Choose the public or the VIP channel");
+  const botId = data.bot_id === null || data.bot_id === undefined || data.bot_id === "" ? null : toInt(data.bot_id);
+  if (Number.isNaN(botId)) throw new OpsError("Choose a bot");
+  // "chat:<id>" targets a channel assigned to a non-primary bot (checked against bot_channels on save).
+  if (!TARGETS.includes(target) && !(botId !== null && /^chat:(@[A-Za-z0-9_]{5,32}|-?\d{5,20})$/.test(target)))
+    throw new OpsError("Choose the public or the VIP channel");
   const limit = MEDIA_KINDS.includes(kind) ? 1024 : ["poll", "quiz"].includes(kind) ? 300 : 4096;
   const text = cleanText(data.text, limit, "Text");
   let mediaUrl = String(data.media_url ?? "").trim();
@@ -105,6 +109,7 @@ export function validateContent(data) {
   if (hashtags && !["poll", "quiz"].includes(kind) && text.length + hashtags.length + 2 > limit)
     throw new OpsError(`Text plus hashtags must fit in ${limit} characters`);
   return {
+    bot_id: botId,
     hashtags,
     kind, target, text, media_url: mediaUrl, options_json: JSON.stringify(options), correct_option: correct, explanation,
     multiple_answers: data.multiple_answers && kind === "poll" ? 1 : 0, close_after_minutes: closeAfter, star_count: stars,
@@ -116,7 +121,7 @@ export function validateContent(data) {
 
 export const BACKUP_TABLES = ["settings", "content_items", "captions", "profiles", "join_requests", "admin_actions", "moderation_rules",
   "moderation_log", "reaction_counts", "reminders_sent", "audit_log", "payments", "trials", "member_events", "pending_unbans",
-  "auto_paid_runs", "auto_paid_posted"];
+  "auto_paid_runs", "auto_paid_posted", "bots", "bot_channels", "integration_secrets"];
 
 function summarize(userId, profile, payments, trials, events, now) {
   profile = profile || { user_id: userId, username: "", first_name: "", source: "", tags: "", notes: "", first_seen: null, last_seen: null };
@@ -178,16 +183,29 @@ export class Ops {
   async content(id) { return this.one("SELECT * FROM content_items WHERE id = ?", Number(id)); }
   async createContent(data, actor) {
     const v = validateContent(data), now = this.now();
+    await this.checkBotTarget(v);
     const r = await this.run(
       "INSERT INTO content_items (kind, target, text, media_url, options_json, correct_option, explanation, multiple_answers, " +
       "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at, " +
-      "expire_after_minutes, source, hashtags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)",
+      "expire_after_minutes, source, hashtags, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers,
       v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now,
-      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags);
+      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags, v.bot_id);
     const id = r.meta.last_row_id;
     await this.audit(actor, "content_create", `#${id} ${v.kind} -> ${v.target}`);
     return this.content(id);
+  }
+  // A post for a bot may only target that bot's own channels; public/vip belong to the primary bot.
+  async checkBotTarget(v) {
+    if (v.bot_id === null) return;
+    const bot = await this.one("SELECT id, is_primary, status FROM bots WHERE id = ?", v.bot_id);
+    if (!bot) throw new OpsError("Choose a connected bot");
+    if (TARGETS.includes(v.target)) {
+      if (!Number(bot.is_primary)) throw new OpsError("The public and VIP channels belong to the primary bot");
+      return;
+    }
+    const own = await this.one("SELECT 1 AS ok FROM bot_channels WHERE bot_id = ? AND chat_id = ?", v.bot_id, v.target.slice(5));
+    if (!own) throw new OpsError("That channel is not assigned to this bot");
   }
   async editable(id) {
     const item = await this.content(id);
@@ -198,11 +216,12 @@ export class Ops {
   async updateContent(id, data, actor) {
     const item = await this.editable(id);
     const v = validateContent({ ...item, options: JSON.parse(item.options_json), ...data });
+    await this.checkBotTarget(v);
     await this.run(
       "UPDATE content_items SET kind=?, target=?, text=?, media_url=?, options_json=?, correct_option=?, explanation=?, multiple_answers=?, " +
-      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, updated_at=? WHERE id=?",
+      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, bot_id=?, updated_at=? WHERE id=?",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers, v.close_after_minutes,
-      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, this.now(), Number(id));
+      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, v.bot_id, this.now(), Number(id));
     await this.audit(actor, "content_update", `#${id}`);
     return this.content(id);
   }

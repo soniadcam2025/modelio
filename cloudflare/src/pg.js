@@ -40,7 +40,7 @@ export class SupabaseDB {
     if (!url || !key) throw new Error("SUPABASE_URL and SUPABASE_SECRET_KEY are required");
     this.endpoint = url.replace(/\/+$/, "") + "/rest/v1/rpc/shakhira_exec";
     this.key = key;
-    this.fetch = fetchImpl;
+    this.fetch = (...args) => fetchImpl(...args); // never call fetch as a method: Workers throws "Illegal invocation"
   }
 
   async exec(q, mode) {
