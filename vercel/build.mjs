@@ -5,8 +5,11 @@ import { SECURITY_HEADERS } from "../cloudflare/src/index.js";
 
 const out = new URL("./.vercel/output/", import.meta.url).pathname;
 rmSync(out, { recursive: true, force: true });
-mkdirSync(out + "static", { recursive: true });
-for (const f of ["index.html", "app.js", "styles.css"]) cpSync(new URL(`../dashboard/static/${f}`, import.meta.url).pathname, out + "static/" + f);
+// index.html at the root; it loads /static/app.js and /static/styles.css (same paths as the Worker and the Python app).
+mkdirSync(out + "static/static", { recursive: true });
+const src = (f) => new URL(`../dashboard/static/${f}`, import.meta.url).pathname;
+cpSync(src("index.html"), out + "static/index.html");
+for (const f of ["app.js", "styles.css"]) cpSync(src(f), out + "static/static/" + f);
 
 const fn = out + "functions/api/index.func/";
 mkdirSync(fn, { recursive: true });

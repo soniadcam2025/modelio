@@ -1,7 +1,8 @@
 # Production integration checklist for @ShakhiraVIPBot
 
 Status (21 Nov 2026):
-- **Staging:** `shakhira-admin-staging` + D1 `shakhira-staging` is live in **simulation**, with all features off.
+- **Staging dashboard:** https://shakhira-admin-staging.vercel.app (Vercel Hobby, region bom1) on Supabase `shakhira-staging` (ap-south-1), in **simulation**, with all features off. Sign-in uses Supabase Auth. See `supabase/README.md`.
+- **Staging clock:** the Worker `shakhira-admin-staging` cron sends one signed request per minute to Vercel, which runs the cycle. Its own D1 `shakhira-staging` holds the earlier staging data, which has been copied to Supabase.
 - **Live bot:** the Worker `shakhira-vip-bot` (webhook, cron every 5 minutes, D1 `shakhira-vip`) has never been changed.
 - **Free-channel posting:** GitHub Actions posts at 5 AM and 10 PM IST with smart rotation.
 
@@ -41,6 +42,10 @@ Nothing moves to the next step without your written approval.
   - The Worker only **reads** the `tgpub` folder and never adds or removes tags.
 - **Verify:** the Media library page shows the same numbers as the GitHub `report` run (new, posted, reusable after 30 days).
 - **Undo:** delete the secrets.
+
+## A4. Choose the production host (decision needed)
+- **Vercel Hobby** is non-commercial only. A paid VIP channel is commercial use, so production on Vercel needs **Pro at US$20/month** (your approval).
+- **Free alternative:** run the same code as the Cloudflare Worker `shakhira-admin` (section B) with Supabase as its database (set `SUPABASE_URL` and `SUPABASE_SECRET_KEY` secrets), at no cost. The Vercel deployment then stays as staging only.
 
 ## B. Production admin Worker: channel content (send-only)
 

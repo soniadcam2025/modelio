@@ -168,17 +168,20 @@ function routes() {
     capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
-    const now = c.ops.now(), stats = await c.ops.analytics(now, 30);
-    const upcoming = (await c.ops.contentList({ status: "scheduled" })).filter((i) => i.scheduled_at).sort((a, b) => a.scheduled_at - b.scheduled_at);
-    const attention = [...(await c.ops.contentList({ status: "failed" })), ...(await c.ops.contentList({ status: "uncertain" }))];
-    const people = await c.ops.subscribers("", now, 100000);
-    const hb = await c.ops.getSetting("heartbeat:worker");
+    const now = c.ops.now();
+    // Independent reads, run together (each is a network round trip on Supabase).
+    const [stats, scheduled, failed, uncertain, people, hb, joinPending, queued, features] = await Promise.all([
+      c.ops.analytics(now, 30), c.ops.contentList({ status: "scheduled" }), c.ops.contentList({ status: "failed" }),
+      c.ops.contentList({ status: "uncertain" }), c.ops.subscribers("", now, 100000), c.ops.getSetting("heartbeat:worker"),
+      c.ops.joinRequests("pending"), c.ops.queuedActions(), c.ops.features()]);
+    const upcoming = scheduled.filter((i) => i.scheduled_at).sort((a, b) => a.scheduled_at - b.scheduled_at);
+    const attention = [...failed, ...uncertain];
     return json({
       now, stars_30d: stats.stars_total, revenue_by_day: stats.revenue_by_day, trials: stats.trials,
       members: Object.fromEntries(["monthly", "trial", "left", "none"].map((k) => [k, people.filter((p) => p.membership === k).length])),
       scheduled_count: upcoming.length, upcoming: upcoming.slice(0, 6).map(contentOut), attention: attention.slice(0, 10).map(contentOut),
-      join_pending: (await c.ops.joinRequests("pending")).length, actions_queued: (await c.ops.queuedActions()).length,
-      features: await c.ops.features(), worker_last_seen: hb ? Number(hb) : null, poster_slots_ist: c.config.slotTimes.map(slotLabel),
+      join_pending: joinPending.length, actions_queued: queued.length,
+      features, worker_last_seen: hb ? Number(hb) : null, poster_slots_ist: c.config.slotTimes.map(slotLabel),
       environment: c.config.environment, automation: automationMode(c.env, c.config),
     });
   });

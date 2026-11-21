@@ -15,17 +15,19 @@ function makeSupabase(path) {
   const db = new SupabaseDB({ url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SECRET_KEY });
   const fresh = path === ":memory:" || !seen.has(path);
   seen.add(path);
-  const ready = fresh ? Promise.all(TABLES.map((t) => db.exec(`DELETE FROM ${t} WHERE true RETURNING 1`, "run"))) : Promise.resolve();
+  // Cleared on first use (not at creation), so a database object that is never used clears nothing.
+  let cleared = null;
+  const ready = () => (cleared ||= fresh ? Promise.all(TABLES.map((t) => db.exec(`DELETE FROM ${t} WHERE true RETURNING 1`, "run"))) : Promise.resolve());
   const wrap = (stmt) => {
     const w = {
       bind: (...a) => { stmt.bind(...a); return w; },
-      first: async (c) => { await ready; return stmt.first(c); },
-      all: async () => { await ready; return stmt.all(); },
-      run: async () => { await ready; return stmt.run(); },
+      first: async (c) => { await ready(); return stmt.first(c); },
+      all: async () => { await ready(); return stmt.all(); },
+      run: async () => { await ready(); return stmt.run(); },
     };
     return w;
   };
-  return { prepare: (sql) => wrap(db.prepare(sql)) };
+  return { prepare: (sql) => wrap(db.prepare(sql)), close: () => {} };
 }
 
 class Stmt {
