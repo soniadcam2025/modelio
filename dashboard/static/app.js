@@ -198,6 +198,7 @@ const PAGES = [
   ["moderation", "Moderation", pageModeration],
   ["analytics", "Analytics", pageAnalytics],
   ["settings", "Features & settings", pageSettings],
+  ["bots", "Bots & integrations", pageBots],
   ["activity", "Activity log", pageActivity],
 ];
 
@@ -225,7 +226,7 @@ async function renderLogin(message) {
 function renderShell(active) {
   const nav = h("nav", { class: "nav", "aria-label": "Sections" },
     h("div", { class: "brand" }, h("span", {}, "💎"), "Shakhira admin"),
-    PAGES.map(([id, label]) => h("a", { href: `#${id}`, class: id === active ? "active" : "", "aria-current": id === active ? "page" : null },
+    PAGES.filter(([id]) => id !== "bots" || can("bots")).map(([id, label]) => h("a", { href: `#${id}`, class: id === active ? "active" : "", "aria-current": id === active ? "page" : null },
       label, state.badges[id] ? h("span", { class: "count" }, state.badges[id]) : null)),
     h("div", { class: "nav-foot" },
       h("button", { onclick: toggleTheme }, "Light / dark"),
@@ -364,6 +365,14 @@ function editor(item) {
   const v = item || { kind: "text", target: "public", options: ["", ""] };
   const kind = h("select", {}, Object.entries(KIND_LABEL).map(([k, l]) => h("option", { value: k, selected: k === v.kind }, l)));
   const target = h("select", {}, h("option", { value: "public", selected: v.target === "public" }, "Public channel"), h("option", { value: "vip", selected: v.target === "vip" }, "VIP channel"));
+  // Other connected bots' own channels ("<bot id>|chat:<chat id>"); each bot can only post to its assigned channels.
+  if (can("bots")) api("/api/bots").then(({ bots }) => {
+    for (const b of bots.filter((x) => !x.is_primary && x.status === "active")) for (const ch of b.channels) {
+      const value = `${b.id}|chat:${ch.chat_id}`;
+      target.append(h("option", { value, selected: Number(v.bot_id) === b.id && v.target === `chat:${ch.chat_id}` }, `@${b.username} → ${ch.title}`));
+    }
+  }).catch(() => {});
+  const targetValue = () => { const [a, b] = target.value.split("|"); return b ? { bot_id: Number(a), target: b } : { bot_id: null, target: a }; };
   const text = h("textarea", { maxlength: 4096 }); text.value = v.text || "";
   const mediaUrl = h("input", { type: "url", placeholder: "https://res.cloudinary.com/…", value: v.media_url || "" });
   const useLib = h("input", { type: "checkbox", checked: !!v.use_caption_library });
@@ -421,7 +430,7 @@ function editor(item) {
   show();
 
   const payload = () => ({
-    kind: kind.value, target: target.value, text: text.value, media_url: mediaUrl.value, use_caption_library: useLib.checked,
+    kind: kind.value, ...targetValue(), text: text.value, media_url: mediaUrl.value, use_caption_library: useLib.checked,
     options, correct_option: Number(correct.value || 0), explanation: explanation.value, multiple_answers: multi.checked,
     close_after_minutes: closeAfter.value || null, star_count: stars.value || null, button_text: btnText.value,
     button_url: btnUrl.value, scheduled_at: istInputToTs(at.value),
@@ -690,3 +699,127 @@ async function pageActivity(main) {
 try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch { /* ignore */ }
 window.addEventListener("hashchange", route);
 route();
+
+// ---------- Bots & integrations ----------
+// Saved credentials are encrypted on the server and only ever come back masked. Every credential change asks for
+// the sign-in password again. Webhooks are shown, never changed.
+
+async function reauthFields() {
+  if (state.authMode === undefined) { try { state.authMode = (await api("/api/health")).auth || "password"; } catch { state.authMode = "password"; } }
+  const email = state.authMode === "supabase" ? h("input", { type: "email", autocomplete: "username", required: true }) : null;
+  const pw = h("input", { type: "password", autocomplete: "current-password", required: true });
+  return {
+    nodes: [h("h3", {}, "Confirm it's you"), email ? field("Sign-in email", email) : null, field("Sign-in password", pw, "Needed for every credential change.")],
+    values: () => ({ ...(email ? { email: email.value } : {}), password: pw.value }),
+  };
+}
+
+const webhookChip = (w) => !w || w.error ? chip("failed", w?.error || "unknown")
+  : w.set ? chip(w.last_error ? "failed" : "posted", w.last_error ? `webhook error: ${w.last_error}` : `webhook set · ${num(w.pending_updates || 0)} waiting`)
+  : chip("none", "no webhook");
+
+async function pageBots(main) {
+  const [{ bots, permissions }, cloud] = await Promise.all([api("/api/bots"), api("/api/integrations/cloudinary")]);
+  const switchFor = (b) => h("button", { class: "switch", role: "switch", "aria-checked": String(b.automation_enabled), "aria-label": `Automation for @${b.username}`,
+    disabled: b.status !== "active",
+    onclick: async () => { if (await act(() => api(`/api/bots/${b.id}/automation`, { method: "PUT", body: { enabled: !b.automation_enabled } }), b.automation_enabled ? "Automation off" : "Automation on")) route(); } });
+  put(main,
+    head("Bots & integrations", "Connect bots and Cloudinary. Credentials are encrypted on the server and only ever shown masked."),
+    h("div", { class: "banner warn" }, "Safety: connecting a bot here never changes its webhook or starts another receiver. A new bot starts with automation off and no permissions; it can only post to channels assigned to it, and only to the preview chat while the dashboard is in preview or read-only mode."),
+    h("section", { class: "card" },
+      h("div", { class: "row", style: null }, h("h2", {}, "Bots"), h("span", { style: null }), h("button", { class: "primary", onclick: () => addBotDrawer() }, "Add bot")),
+      table([
+        { label: "Bot", render: (b) => h("div", {}, h("div", {}, `${b.name} `, b.is_primary ? chip("scheduled", "primary") : null), h("div", { class: "small muted" }, `@${b.username}`)) },
+        { label: "Token", render: (b) => h("span", { class: "mono" }, b.token || "—") },
+        { label: "Status", render: (b) => b.status !== "active" ? chip("cancelled", "disconnected") : b.last_check_ok === false ? chip("failed", b.last_error || "check failed") : chip("posted", "connected") },
+        { label: "Webhook", render: (b) => webhookChip(b.webhook) },
+        { label: "Channels", render: (b) => b.channels.length ? b.channels.map((c) => c.title).join(", ") : "—" },
+        { label: "Automation", render: (b) => switchFor(b) },
+        { label: "", render: (b) => h("div", { class: "row" },
+          h("button", { onclick: async (e) => { e.stopPropagation(); if (await act(() => api(`/api/bots/${b.id}/test`, { method: "POST" }), "Checked")) route(); } }, "Test"),
+          h("button", { onclick: (e) => { e.stopPropagation(); manageBot(b, permissions); } }, "Manage")) },
+      ], bots, { empty: "No bots connected yet. Add @ShakhiraVIPBot (or another bot) by its token." })),
+    h("section", { class: "card" }, h("h2", {}, "Cloudinary"),
+      cloud.connected ? [
+        h("div", { class: "toggle-row" }, h("div", {}, "Cloud name"), h("span", { class: "mono" }, cloud.cloud_name)),
+        h("div", { class: "toggle-row" }, h("div", {}, "API key"), h("span", { class: "mono" }, cloud.api_key)),
+        h("div", { class: "toggle-row" }, h("div", {}, "API secret"), h("span", { class: "mono" }, cloud.api_secret)),
+        h("div", { class: "toggle-row" }, h("div", {}, "Connection"), cloud.last_check_ok === false ? chip("failed", cloud.last_error || "check failed")
+          : chip("posted", cloud.last_check_at ? `ok · checked ${ago(cloud.last_check_at)}` : "ok")),
+      ] : h("p", { class: "muted" }, "Not connected here. (Worker secrets, if set, are used instead and are not shown.)"),
+      h("div", { class: "row" },
+        cloud.connected ? h("button", { onclick: async () => { if (await act(() => api("/api/integrations/cloudinary/test", { method: "POST" }), "Checked")) route(); } }, "Test") : null,
+        h("button", { onclick: () => cloudinaryDrawer(cloud) }, cloud.connected ? "Update" : "Connect"),
+        cloud.connected ? h("button", { class: "danger", onclick: () => confirmDrawer("Disconnect Cloudinary", "Removes the saved Cloudinary credentials from this dashboard. Cloudinary itself is not changed.",
+          (cred) => api("/api/integrations/cloudinary", { method: "DELETE", body: cred })) } , "Disconnect") : null)));
+}
+
+async function addBotDrawer() {
+  const token = h("input", { type: "password", autocomplete: "off", required: true, placeholder: "123456789:ABC…" });
+  const re = await reauthFields();
+  drawer("Add bot", h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    if (await act(() => api("/api/bots", { method: "POST", body: { token: token.value, ...re.values() } }), "Bot connected")) { closeDrawer(); route(); }
+  } }, field("Bot token (from @BotFather)", token, "The bot is identified automatically. Its webhook is not changed."), ...re.nodes,
+    h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Connect bot"))));
+}
+
+async function confirmDrawer(title, text, fn) {
+  const re = await reauthFields();
+  drawer(title, h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    if (await act(() => fn(re.values()), "Done")) { closeDrawer(); route(); }
+  } }, h("p", {}, text), ...re.nodes, h("div", { class: "row end" }, h("button", { class: "danger", type: "submit" }, title))));
+}
+
+async function cloudinaryDrawer(cloud) {
+  const name = h("input", { required: true, value: cloud.cloud_name || "" });
+  const key = h("input", { required: true, inputmode: "numeric", autocomplete: "off" });
+  const secret = h("input", { type: "password", required: true, autocomplete: "off" });
+  const re = await reauthFields();
+  drawer(cloud.connected ? "Update Cloudinary" : "Connect Cloudinary", h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    if (await act(() => api("/api/integrations/cloudinary", { method: "PUT", body: { cloud_name: name.value, api_key: key.value, api_secret: secret.value, ...re.values() } }), "Cloudinary saved")) { closeDrawer(); route(); }
+  } }, field("Cloud name", name), field("API key", key), field("API secret", secret, "Tested with Cloudinary before saving. A read-only key is best."), ...re.nodes,
+    h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Test and save"))));
+}
+
+async function manageBot(b, permissions) {
+  const history = await api(`/api/bots/${b.id}/history`);
+  const perms = Object.entries(permissions).filter(([k]) => b.is_primary || k !== "member_actions")
+    .map(([k, label]) => [k, h("input", { type: "checkbox", checked: !!b.permissions[k] }), label]);
+  const chatId = h("input", { placeholder: "@channelname or -100…" });
+  const kind = b.is_primary ? h("select", {}, ["channel", "public", "vip"].map((k) => h("option", { value: k }, k === "channel" ? "Other channel" : k === "vip" ? "VIP channel" : "Public channel"))) : null;
+  const newToken = h("input", { type: "password", autocomplete: "off", placeholder: "New token for the same bot" });
+  const re = await reauthFields();
+  drawer(`@${b.username}`, h("div", {},
+    h("p", { class: "small muted" }, `Telegram ID ${b.bot_user_id} · token ${b.token || "not connected"} · `, webhookChip(b.webhook)),
+    h("h3", {}, "Permissions (what this bot's automation may post)"),
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault();
+      const body = { permissions: Object.fromEntries(perms.map(([k, box]) => [k, box.checked])) };
+      if (await act(() => api(`/api/bots/${b.id}/permissions`, { method: "PUT", body }), "Permissions saved")) { closeDrawer(); route(); }
+    } }, perms.map(([k, box, label]) => h("label", { class: "inline" }, box, label)), h("div", { class: "row end" }, h("button", { type: "submit" }, "Save permissions"))),
+    h("h3", {}, "Channels"),
+    b.channels.length ? h("ul", { class: "list" }, b.channels.map((c) => h("li", {}, h("div", {}, c.title, h("div", { class: "small muted mono" }, `${c.chat_id} · ${c.kind}`)),
+      h("button", { onclick: async () => { if (await act(() => api(`/api/bots/${b.id}/channels/${encodeURIComponent(c.chat_id)}`, { method: "DELETE" }), "Channel removed")) { closeDrawer(); route(); } } }, "Remove")))) : h("p", { class: "muted small" }, "No channels assigned."),
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault();
+      if (await act(() => api(`/api/bots/${b.id}/channels`, { method: "POST", body: { chat_id: chatId.value, kind: kind ? kind.value : "channel" } }), "Channel assigned")) { closeDrawer(); route(); }
+    } }, field("Assign a channel this bot is an admin of", chatId, "Checked with this bot's own token. A channel can belong to only one bot."), kind ? field("Type", kind) : null,
+      h("div", { class: "row end" }, h("button", { type: "submit" }, "Assign"))),
+    h("h3", {}, "Token"),
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault();
+      const cred = re.values();
+      if (e.submitter?.dataset.action === "disconnect") { if (await act(() => api(`/api/bots/${b.id}/token`, { method: "DELETE", body: cred }), "Disconnected")) { closeDrawer(); route(); } return; }
+      if (await act(() => api(`/api/bots/${b.id}/token`, { method: "PUT", body: { token: newToken.value, ...cred } }), "Token replaced")) { closeDrawer(); route(); }
+    } }, field("Replace token", newToken, "Must be a token for this same bot."), ...re.nodes,
+      h("div", { class: "row end" },
+        b.status === "active" ? h("button", { class: "danger", type: "submit", "data-action": "disconnect", formnovalidate: true }, "Disconnect") : null,
+        h("button", { class: "primary", type: "submit" }, "Replace token"))),
+    h("h3", {}, "History"),
+    table([{ label: "When", render: (a) => when(a.created_at) }, { label: "Action", key: "action" }, { label: "Detail", key: "detail" }, { label: "By", key: "actor" }], history.audit, { empty: "No history yet" }),
+    history.content.length ? table([{ label: "Post", render: (i) => `#${i.id} ${KIND_LABEL[i.kind] || i.kind}` }, { label: "Status", render: (i) => chip(i.status) }, { label: "Error", key: "last_error" }], history.content) : null));
+}
+

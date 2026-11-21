@@ -43,15 +43,39 @@ There is still exactly **one Telegram webhook receiver**: the live bot `shakhira
 | # | Approval | Owner | What changes | Undo |
 |---|---|---|---|---|
 | **L1** | Your admin account | you | Sign in at the production URL with the generated login, then in Supabase `shakhira-prod` → Authentication → Users, change the email to yours and set a new password. | n/a |
-| **L2a** | Bot & channel status (read-only) | you | Add the secret `BOT_TOKEN` (same token as the live bot) to `shakhira-admin`. With `REQUIRE_PREVIEW` on and no preview chat, the Worker is **locked**: it sends nothing. The Overview's *Bot & channels* card then shows the bot, webhook health, and both channels' titles and member counts, using only read-only `get*` calls. Member sync and backups continue. | Delete the secret. |
+| **L2a** | Bot & channel status (read-only) | you | In the dashboard, go to **Bots & integrations → Add bot**, paste @ShakhiraVIPBot's token and confirm with your sign-in password. The token is encrypted with the Worker key `CREDENTIALS_KEY` and is only ever shown masked. It is identified with `getMe`; its webhook is only read. With `REQUIRE_PREVIEW` on, the Worker is **locked** and sends nothing. The bot starts with automation off and no permissions. The Overview's *Bot & channels* card then shows the bot, the webhook health and both channels. | **Manage → Disconnect** (removes the dashboard's copy only). |
 | **L2** | Private Telegram preview | you, then Claude | You send `/start` to @ShakhiraVIPBot and get your user ID (@userinfobot). On **both** dashboard Workers, add the secret `BOT_TOKEN` (same token as the live bot). Claude sets `PREVIEW_CHAT_ID` = your ID and redeploys, then runs `test/remote/staging-preview.mjs`: 8 test posts (text, photo, video, GIF, poll, quiz, VIP promo, paid media at 1 ⭐) arrive **only in your private chat**. | Delete `BOT_TOKEN`. |
-| **L3** | Cloudinary media library | you | Add `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` as secrets on the Workers. A read-only key is best; the Worker never tags or deletes. | Delete the secrets. |
+| **L3** | Cloudinary media library | you | Go to **Bots & integrations → Cloudinary → Connect**. The credentials are tested with Cloudinary before saving, then stored encrypted and shown masked. A read-only key is best; the Worker never tags or deletes. Worker secrets, if set, take priority. | **Disconnect**. |
 | **L4 ✅ done** | Real subscribers in the dashboard (read-only) | Claude | Uncomment `LIVE_DB` in `wrangler.production.toml`, deploy, switch on **member_sync**. Members, trials and 49 ⭐ trial payments appear in Subscribers. Monthly 499 ⭐ payments are made through Telegram channel subscriptions, which no bot can see; members show as *monthly* with their renewal date. The code can only run SELECT on that database. | Switch off, re-comment, deploy. |
 | **L5** | Channel publishing from the dashboard | Claude | `REQUIRE_PREVIEW = "false"`, `VIP_CHANNEL_ID` = the real VIP channel ID, `ADMIN_CHAT_ID` = your ID (for alerts), deploy. Switch on **scheduled_posts**. Verify one text post at a quiet time, then delete it. Never posts the Cloudinary media of the GitHub poster, so no duplicates. | Switch the feature off (within 1 minute). |
 | **L6** | Paid media, polls, promotions, expiry, automated paid media | you | Switch on one feature at a time: **poll_auto_close**, **post_expiry**, **auto_paid_media**. Automated paid media uses its own Cloudinary folder (never `tgpub`) and is claimed per slot, so it can't double-post. | Switch off. |
 | **L7** | Member notifications | you | **trial_reminders** (24 h before a trial ends), **renewal_reminders** (3 days before Telegram renews 499 ⭐), and **admin_actions** (approve, decline, remove, unban, DM from the dashboard). Each reminder is sent once (recorded before sending). | Switch off. |
 | **L8** | Join requests, moderation, reactions | Claude | Change the live bot, following `LIVE_BOT_INTEGRATION.md`: about 15 lines plus a service binding. Then switch on **join_requests**, **moderation** and **reaction_tracking**. | Roll back the bot version in Cloudflare. |
 | **L9** | Retire Vercel staging | Claude | Delete the Vercel project once the production Worker has run for a week. | Redeploy from `vercel/` in one command. |
+
+## Bots & integrations (multi-bot)
+
+**What it does**
+- **Adding bots:** each bot is added by its token and identified with `getMe`.
+- **Webhooks:** they are only ever *read*, with `getWebhookInfo`, and never set or deleted. The dashboard never receives updates.
+- **Per-bot settings:** each bot has its own automation switch, permissions (posts, polls, promotions, paid media; member actions for the primary bot only), assigned channels and history.
+
+**Isolation between bots**
+- A channel can belong to only one bot.
+- A bot's posts can only target its own channels, and only go out when that bot's switch and the matching permission are on.
+- The staging lock and preview chat apply to every bot.
+
+**Credential security**
+- Tokens and Cloudinary secrets are encrypted with AES-256-GCM using the Worker secret `CREDENTIALS_KEY`. That key is a different value per Worker and is never stored in Supabase.
+- Each ciphertext is bound to its own record, so a ciphertext copied onto another record won't decrypt.
+- Every credential change needs a fresh sign-in password.
+- Credentials never appear in API responses, logs, backups or this repository; tests check this.
+
+**If `CREDENTIALS_KEY` is lost or rotated:** saved credentials can't be decrypted. Re-enter them with **Replace token** or **Update**; nothing else is affected.
+
+**Rollback**
+- **Configuration:** backups include the encrypted configuration, and restoring them brings back the previous tokens (tested).
+- **Worker versions:** rollback was drilled on staging on 21 Nov 2026.
 
 ## Monitoring
 
