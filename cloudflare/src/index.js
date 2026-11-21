@@ -4,6 +4,7 @@
 import { LoginLimiter, Sessions, constantTimeEqual, readCookie, verifyPassword } from "./auth.js";
 import { SupabaseDB } from "./pg.js";
 import { runBackup } from "./backup.js";
+import { syncLiveBot } from "./live.js";
 import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle } from "./scheduler.js";
@@ -160,6 +161,27 @@ function routes() {
     if (!(await cycleAuthorized(c.request, c.env, Math.floor(Date.now() / 1000)))) return err("Not allowed", 403);
     return json(await runScheduled(c.env));
   }, { auth: false });
+  // Read-only view of the bot and both channels (needs BOT_TOKEN; uses only get* methods).
+  add("GET", "/api/telegram", async (c) => {
+    if (!c.env.BOT_TOKEN) return json({ configured: false });
+    const tg = new SendOnlyTelegram({ token: c.env.BOT_TOKEN, previewChatId: c.config.previewChatId, requirePreview: c.config.requirePreview });
+    const safe = (p) => p.then((v) => v).catch((e) => ({ error: String(e.message).slice(0, 120) }));
+    const channel = async (chatId) => {
+      if (!chatId) return null;
+      const [chat, members] = await Promise.all([safe(tg.call("getChat", { chat_id: chatId })), safe(tg.call("getChatMemberCount", { chat_id: chatId }))]);
+      return chat.error ? { error: chat.error } : { title: chat.title, type: chat.type, username: chat.username || null, members: typeof members === "number" ? members : null };
+    };
+    const [me, hook, pub, vip] = await Promise.all([safe(tg.call("getMe", {})), safe(tg.call("getWebhookInfo", {})),
+      channel(c.config.publicChannel), channel(c.config.vipChannelId)]);
+    return json({
+      configured: true,
+      bot: me.error ? me : { username: me.username, name: me.first_name, can_join_groups: me.can_join_groups },
+      // Only whether a webhook is set and its health; the URL itself is not shown.
+      webhook: hook.error ? hook : { set: !!hook.url, pending_updates: hook.pending_update_count ?? 0, last_error_at: hook.last_error_date || null,
+        last_error: hook.last_error_message || null, allowed_updates: hook.allowed_updates || [] },
+      channels: { public: pub, vip },
+    });
+  });
   // On-demand copy to the backup D1 (the same as the daily 03:10 IST backup).
   add("POST", "/api/backup/now", async (c) => {
     if (!c.env.BACKUP_DB) throw new OpsError("No backup database is linked to this deployment");
@@ -183,7 +205,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now();
@@ -331,12 +353,15 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
   const config = loadConfig(env);
   const mode = automationMode(env, config);
   const ops = new Ops(getDB(env), () => now);
-  if (mode === "locked") {
-    console.warn("Staging lock: BOT_TOKEN is set but PREVIEW_CHAT_ID is not; automation paused");
-    await ops.setSetting("heartbeat:worker", now);
-    return { mode };
-  }
   const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl });
+  if (mode === "locked") {
+    // A token without a preview chat: nothing is sent, but read-only work (member sync, backups) continues.
+    await ops.setSetting("heartbeat:worker", now);
+    const out = { mode };
+    if (env.BACKUP_DB && new Date(now * 1000).toISOString().slice(11, 16) === config.backupAt) out.backup = await runBackup(ops, env.BACKUP_DB, now).catch((e) => ({ error: e.message }));
+    else if (env.LIVE_DB && (await ops.featureEnabled("member_sync"))) out.member_sync = await syncLiveBot(env.LIVE_DB, ops, now).catch((e) => ({ error: e.message }));
+    return out;
+  }
   const cfg = cloudinaryConfig(env);
   const listAssets = cfg ? (folder) => listFolder(cfg, folder, fetchImpl) : null;
   const hhmm = new Date(now * 1000).toISOString().slice(11, 16);

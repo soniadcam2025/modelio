@@ -62,10 +62,13 @@ export async function syncLiveBot(liveDb, ops, now) {
   await upsertMany(ops, "INSERT INTO payments (telegram_payment_charge_id, user_id, plan, amount, currency, payload, created_at, status)",
     "ON CONFLICT(telegram_payment_charge_id) DO NOTHING", paymentRows, 8);
 
-  // Profiles, so every live member appears in Subscribers.
-  const users = [...new Set([...members, ...events, ...trials].map((r) => r.user_id))];
-  await upsertMany(ops, "INSERT INTO profiles (user_id, source, first_seen, last_seen)", "ON CONFLICT(user_id) DO NOTHING",
-    users.map((u) => [u, "vip-bot", now, now]), 4);
+  // Profiles, so every live member appears in Subscribers; "seen" times come from the live rows, not the sync.
+  const seen = new Map();
+  const note = (u, t) => { t = Number(t) || 0; const v = seen.get(u) || [t, t]; seen.set(u, [Math.min(v[0], t), Math.max(v[1], t)]); };
+  members.forEach((m) => note(m.user_id, m.checked_at)); events.forEach((e) => note(e.user_id, e.event_date)); trials.forEach((t) => note(t.user_id, t.updated_at));
+  await upsertMany(ops, "INSERT INTO profiles (user_id, source, first_seen, last_seen)",
+    "ON CONFLICT(user_id) DO UPDATE SET last_seen = CASE WHEN excluded.last_seen > profiles.last_seen THEN excluded.last_seen ELSE profiles.last_seen END",
+    [...seen].map(([u, [first, last]]) => [u, "vip-bot", first, last]), 4);
 
   const next = {
     members: members.length ? Math.max(since.members, ...members.map((m) => Number(m.checked_at))) : since.members,

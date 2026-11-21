@@ -195,3 +195,50 @@ test("Back up now: signed-in only, needs a linked backup database, audited", asy
   const noDb = { ...env, BACKUP_DB: undefined };
   assert.equal((await worker.fetch(new Request(ORIGIN + "/api/backup/now", { method: "POST", headers: { cookie, "x-csrf-token": csrf } }), noDb)).status, 400);
 });
+
+test("Bot & channels view is read-only and hides the webhook URL", async () => {
+  const env = { DB: makeD1(), DASHBOARD_PASSWORD_HASH: HASH, DASHBOARD_SECRET: "s".repeat(40), ENVIRONMENT: "production", REQUIRE_PREVIEW: "true",
+    VIP_CHANNEL_ID: "-100777", PUBLIC_CHANNEL: "@yourshakhira" };
+  const r = await worker.fetch(new Request(ORIGIN + "/api/login", { method: "POST", body: JSON.stringify({ password: PASSWORD }), headers: { "cf-connecting-ip": "1.1.1.3" } }), env);
+  const cookie = r.headers.get("set-cookie").split(";")[0];
+  const get = (e) => worker.fetch(new Request(ORIGIN + "/api/telegram", { headers: { cookie } }), e);
+  assert.deepEqual(await (await get(env)).json(), { configured: false });
+  const realFetch = globalThis.fetch, methods = [];
+  globalThis.fetch = async (url, init) => {
+    const m = String(url).split("/").pop(); methods.push(m);
+    const result = { getMe: { username: "ShakhiraVIPBot", first_name: "Shakhira" }, getWebhookInfo: { url: "https://secret-host.example/telegram", pending_update_count: 0, allowed_updates: ["message"] },
+      getChat: { title: JSON.parse(init.body).chat_id === "-100777" ? "VIP" : "Public", type: "channel" }, getChatMemberCount: 42 }[m];
+    return new Response(JSON.stringify({ ok: true, result }));
+  };
+  try {
+    const d = await (await get({ ...env, BOT_TOKEN: "1:T" })).json();
+    assert.equal(d.bot.username, "ShakhiraVIPBot");
+    assert.equal(d.webhook.set, true);
+    assert.equal(JSON.stringify(d).includes("secret-host"), false);
+    assert.equal(d.channels.vip.title, "VIP");
+    assert.equal(d.channels.public.members, 42);
+    assert.ok(methods.every((m) => m.startsWith("get")), methods.join(","));
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("locked mode (token, no preview chat) sends nothing but still syncs members", async () => {
+  const { db, shim } = liveDb();
+  db.exec(`INSERT INTO members VALUES ('-100', 61, 'member', ${NOW + 86400 * 30}, ${NOW - 10});`);
+  const env = { DB: makeD1(), LIVE_DB: shim, BOT_TOKEN: "1:T", ENVIRONMENT: "production", REQUIRE_PREVIEW: "true" };
+  await new Ops(env.DB).setSetting("feature:member_sync", "1");
+  await new Ops(env.DB).setSetting("feature:scheduled_posts", "1");
+  const calls = [];
+  const out = await runScheduled(env, NOW, async (u) => { calls.push(u); return new Response("{}"); });
+  assert.equal(out.mode, "locked");
+  assert.deepEqual(out.member_sync, { members: 1, events: 0, trials: 0 });
+  assert.equal(calls.length, 0);
+});
+
+test("synced profiles carry the live bot's own timestamps", async () => {
+  const { db, shim } = liveDb();
+  db.exec(`INSERT INTO members VALUES ('-100', 71, 'member', ${NOW + 86400}, ${NOW - 7200}); INSERT INTO events VALUES (5, '-100', 71, 'member', NULL, ${NOW - 90000});`);
+  const ops = new Ops(makeD1(), () => NOW);
+  await syncLiveBot(shim, ops, NOW);
+  const p = await ops.one("SELECT first_seen, last_seen FROM profiles WHERE user_id = 71");
+  assert.deepEqual([p.first_seen, p.last_seen], [NOW - 90000, NOW - 7200]);
+});

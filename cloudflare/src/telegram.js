@@ -20,6 +20,11 @@ export class TelegramError extends Error {
   }
 }
 
+// Read-only lookups for the dashboard's "Bot & channels" view. They change nothing in Telegram and are allowed
+// even under the staging lock. (getWebhookInfo only reads; setWebhook/deleteWebhook remain impossible.)
+export const READ_ONLY_METHODS = new Set(["getMe", "getWebhookInfo", "getChat", "getChatMemberCount", "getChatMember"]);
+for (const m of READ_ONLY_METHODS) ALLOWED_METHODS.add(m);
+
 export class SendOnlyTelegram {
   constructor({ token, previewChatId = null, requirePreview = false, fetchImpl = fetch }) {
     this.token = token || "";
@@ -35,12 +40,12 @@ export class SendOnlyTelegram {
 
   async call(method, params) {
     if (!ALLOWED_METHODS.has(method)) throw new Error(`Telegram method ${method} is not allowed for this Worker`);
-    if (this.requirePreview) {
+    if (this.requirePreview && !READ_ONLY_METHODS.has(method)) {
       if (!this.previewChatId && !this.simulating) throw new Error("Staging lock: PREVIEW_CHAT_ID is required to send anything");
       const chatBound = method.startsWith("send") || method === "deleteMessage" || method === "stopPoll";
       if (chatBound && !this.simulating && String(params.chat_id) !== this.previewChatId)
         throw new Error("Staging lock: messages may only go to the preview chat");
-      if (!chatBound && method !== "getChatMember" && !this.simulating)
+      if (!chatBound && !this.simulating)
         throw new Error(`Staging lock: ${method} is not allowed in staging`);
     }
     if (this.simulating) {
