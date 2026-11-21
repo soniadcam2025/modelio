@@ -271,7 +271,9 @@ async function pageOverview(main) {
     o.environment === "staging" || ["simulated", "preview", "locked"].includes(o.automation) ? h("div", { class: "banner warn" },
       `${String(o.environment || "").toUpperCase()}: ` + (o.automation === "preview"
         ? "automation sends only to the private preview chat. Nothing reaches the channels or members."
-        : o.automation === "locked" ? "a bot token is set but no preview chat, so automation is paused."
+        : o.automation === "locked" ? (o.environment === "production"
+          ? "read-only mode. Posting, payments and member actions are off until approved; viewing, member sync and backups are active."
+          : "a bot token is set but no preview chat, so automation is paused.")
         : o.automation === "simulated" ? "automation is simulated (no bot token). Nothing is sent to Telegram."
         : "automation is live.")) : null,
     offCount === Object.keys(o.features).length
@@ -291,10 +293,28 @@ async function pageOverview(main) {
         o.upcoming.length ? h("ul", { class: "list" }, o.upcoming.map((i) => h("li", {},
           h("div", {}, h("div", { class: "clip" }, i.text || KIND_LABEL[i.kind]), h("div", { class: "small muted" }, `${KIND_LABEL[i.kind]} → ${i.target === "vip" ? "VIP channel" : "public channel"}`)),
           h("span", { class: "small" }, when(i.scheduled_at))))) : h("p", { class: "empty" }, "Nothing scheduled"))),
+    can("telegram_status") ? telegramCard() : null,
     o.attention.length ? h("section", { class: "card", style: null }, h("h2", {}, "Needs attention"),
       table([{ label: "Post", render: (i) => `#${i.id} ${KIND_LABEL[i.kind]}` }, { label: "Status", render: (i) => chip(i.status) },
         { label: "Problem", render: (i) => i.last_error }], o.attention, { onRow: () => (location.hash = "#content") })) : null,
   );
+}
+
+// Bot & channels: read-only status, loaded after the page so a slow Telegram reply never delays the overview.
+function telegramCard() {
+  const box = h("section", { class: "card" }, h("h2", {}, "Bot & channels"), h("p", { class: "muted small" }, "Checking Telegram…"));
+  api("/api/telegram").then((t) => {
+    if (!t.configured) { put(box, h("h2", {}, "Bot & channels"), h("p", { class: "muted" }, "Add the BOT_TOKEN secret to this Worker to see the bot and channel status here (read-only).")); return; }
+    const row = (label, value) => h("div", { class: "toggle-row" }, h("div", {}, label), value);
+    const ch = (c, name) => !c ? chip("pending", "not configured") : c.error ? chip("failed", c.error) : chip("posted", `${c.title}${c.members !== null ? ` · ${num(c.members)} members` : ""}`);
+    const w = t.webhook || {};
+    put(box, h("h2", {}, "Bot & channels"),
+      row("Bot", t.bot.error ? chip("failed", t.bot.error) : chip("posted", `@${t.bot.username}`)),
+      row("Webhook (live bot)", w.error ? chip("failed", w.error) : chip(w.set && !w.last_error ? "posted" : "failed",
+        w.set ? `${w.last_error ? "error: " + w.last_error : "receiving"} · ${num(w.pending_updates)} waiting` : "not set")),
+      row("Public channel", ch(t.channels.public)), row("VIP channel", ch(t.channels.vip)));
+  }).catch((e) => put(box, h("h2", {}, "Bot & channels"), h("p", { class: "muted" }, e.message)));
+  return box;
 }
 
 const kpi = (label, value, sub) => h("div", { class: "card kpi" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value), h("div", { class: "sub" }, sub));

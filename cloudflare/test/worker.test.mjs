@@ -246,8 +246,11 @@ test("the client can never call update-taking methods, and staging refuses other
   const tg = new SendOnlyTelegram({ token: "1:T", previewChatId: "5", requirePreview: true, fetchImpl: async () => { throw new Error("x"); } });
   // The allowlist holds even with the staging lock off (production-style client).
   const prod = new SendOnlyTelegram({ token: "1:T", requirePreview: false, fetchImpl: async () => { throw new Error("must not be reached"); } });
-  for (const m of ["getUpdates", "setWebhook", "deleteWebhook", "logOut", "close", "getWebhookInfo"])
+  for (const m of ["getUpdates", "setWebhook", "deleteWebhook", "logOut", "close", "setMyCommands", "createChatInviteLink"])
     await assert.rejects(prod.call(m, {}), /is not allowed for this Worker/);
+  // Read-only lookups pass the staging lock (they reach the network, which this stub refuses).
+  for (const m of ["getMe", "getWebhookInfo", "getChat", "getChatMemberCount"])
+    await assert.rejects(tg.call(m, { chat_id: -100 }), /network error/);
   await assert.rejects(tg.call("sendMessage", { chat_id: "@yourshakhira", text: "x" }), /preview chat/);
   await assert.rejects(tg.call("banChatMember", { chat_id: -100, user_id: 1 }), /not allowed in staging/);
 });

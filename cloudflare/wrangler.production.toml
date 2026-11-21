@@ -5,7 +5,7 @@
 #   - BOT_TOKEN is not set, so every Telegram call is SIMULATED (nothing is sent);
 #   - REQUIRE_PREVIEW = "true", so even with a token only PREVIEW_CHAT_ID could receive anything;
 #   - every feature switch is off in the new database;
-#   - LIVE_DB (the live bot's shakhira-vip) is NOT bound. The live bot, its D1 and its webhook are unchanged.
+#   - LIVE_DB (the live bot's shakhira-vip) is bound READ-ONLY. The live bot, its D1 and its webhook are unchanged.
 name = "shakhira-admin"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
@@ -22,19 +22,19 @@ binding = "BACKUP_DB"
 database_name = "shakhira-backups"
 database_id = "75d99f93-715e-4cbb-bf81-c3f82066c92c"
 
-# Approval E1 (read-only member sync): uncomment, deploy, then switch on "member_sync" in Features & settings.
-# The code only ever runs SELECT on this binding (src/live.js readOnly()).
-# [[d1_databases]]
-# binding = "LIVE_DB"
-# database_name = "shakhira-vip"
-# database_id = "54eb917a-7ff9-4a3b-96b6-2608cebecd1b"
+# The live bot's database, READ-ONLY: the code only ever runs SELECT on this binding (src/live.js readOnly()),
+# used by the "member_sync" feature to show real members, trials and trial payments in Subscribers.
+# Restore point recorded before linking (D1 Time Travel). To unlink: comment out and deploy.
+[[d1_databases]]
+binding = "LIVE_DB"
+database_name = "shakhira-vip"
+database_id = "54eb917a-7ff9-4a3b-96b6-2608cebecd1b"
 
 [vars]
 ENVIRONMENT = "production"
 REQUIRE_PREVIEW = "true"
 PREVIEW_CHAT_ID = ""
 PUBLIC_CHANNEL = "@yourshakhira"
-VIP_CHANNEL_ID = ""
 DISCUSSION_GROUP_ID = ""
 ADMIN_CHAT_ID = ""
 BOT_USERNAME = "ShakhiraVIPBot"
@@ -44,6 +44,7 @@ AUTH_MODE = "supabase"
 
 # Secrets (wrangler secret put -c wrangler.production.toml <NAME>; never committed):
 #   SUPABASE_SECRET_KEY  shakhira-prod secret key
+#   VIP_CHANNEL_ID       the VIP channel's ID (same as the live bot's VIP_CHAT_ID; kept out of this public repo)
 #   DASHBOARD_SECRET     48+ random characters (rotating it signs everyone out)
 #   UPDATE_SECRET        shared with the live bot for forwarded updates (approval D2)
 #   BOT_TOKEN            set by you at launch (approval B2)
