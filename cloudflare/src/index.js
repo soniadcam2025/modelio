@@ -5,6 +5,7 @@ import { LoginLimiter, Sessions, readCookie, verifyPassword } from "./auth.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
+import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
 export const SECURITY_HEADERS = {
@@ -214,11 +215,21 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
   return { mode, summary, simulated: tg.simulated.length };
 }
 
+export function serveStatic(request, env) {
+  if (env.ASSETS) return env.ASSETS.fetch(request);
+  const { pathname } = new URL(request.url);
+  const file = BUNDLED_ASSETS[pathname] || (pathname === "/index.html" ? BUNDLED_ASSETS["/"] : null);
+  if (!file || !["GET", "HEAD"].includes(request.method)) return new Response("Not found", { status: 404 });
+  return new Response(request.method === "HEAD" ? null : file.body, {
+    headers: { "content-type": file.type, "cache-control": pathname === "/" ? "no-cache" : "public, max-age=300" },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const isApi = url.pathname.startsWith("/api/");
-    const response = isApi ? await handleApi(request, env) : await env.ASSETS.fetch(request);
+    const response = isApi ? await handleApi(request, env) : await serveStatic(request, env);
     return withHeaders(response, isApi);
   },
   async scheduled(_event, env, ctx) {

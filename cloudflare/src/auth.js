@@ -3,6 +3,7 @@
 
 export const SESSION_SECONDS = 12 * 3600;
 export const MAX_FAILURES = 5;
+export const MAX_GLOBAL_FAILURES = 20; // across all addresses: stops guessing spread over many IPs
 export const FAILURE_WINDOW = 15 * 60;
 export const MAX_PBKDF2_ITERATIONS = 100_000; // the Workers runtime refuses more
 
@@ -94,9 +95,10 @@ export class LoginLimiter {
     this.now = now;
   }
   async blocked(client) {
-    const row = await this.db.prepare("SELECT COUNT(*) AS n FROM login_failures WHERE client = ? AND at > ?")
-      .bind(client, this.now() - FAILURE_WINDOW).first();
-    return (row?.n || 0) >= MAX_FAILURES;
+    const since = this.now() - FAILURE_WINDOW;
+    const row = await this.db.prepare("SELECT COUNT(*) AS n, SUM(client = ?) AS mine FROM login_failures WHERE at > ?")
+      .bind(client, since).first();
+    return (row?.mine || 0) >= MAX_FAILURES || (row?.n || 0) >= MAX_GLOBAL_FAILURES;
   }
   async failed(client) {
     await this.db.prepare("INSERT INTO login_failures (client, at) VALUES (?, ?)").bind(client, this.now()).run();

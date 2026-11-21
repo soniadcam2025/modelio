@@ -15,7 +15,7 @@ shared with the Python version (`dashboard/static`).
 | Contacting members | In staging, admin actions (DMs, removals, approvals) and reminders never run. |
 | Double posting with GitHub Actions | This Worker never posts Cloudinary media. The 5 AM / 10 PM IST auto-posts and smart rotation stay entirely in GitHub Actions; the calendar only *shows* those slots. Each scheduled item is claimed atomically in D1 before it is sent, and never re-sent after an uncertain result. |
 | New features switching on by surprise | Every feature flag starts **off**. |
-| Dashboard access | Password (PBKDF2-SHA256, 100,000 iterations), HMAC-signed HttpOnly/Secure/SameSite=Strict session, CSRF header on every change, 5 failed logins per 15 min per IP, revocable sessions in D1, strict CSP, `noindex`. |
+| Dashboard access | Password (PBKDF2-SHA256, 100,000 iterations), HMAC-signed HttpOnly/Secure/SameSite=Strict session, CSRF header on every change, 5 failed logins per 15 min per IP **and** 20 per 15 min account-wide (stops guessing spread over many IPs; the trade-off is that a flood can lock the login for 15 min), revocable sessions in D1, strict CSP, `noindex`. To unlock early: `npx wrangler d1 execute shakhira-staging --remote --command "DELETE FROM login_failures"`. |
 
 ## Free-plan fit (audited 20 Nov 2026)
 
@@ -25,6 +25,17 @@ shared with the Python version (`dashboard/static`).
 | Cron triggers | 1 (every 5 min) | 1 (every minute) | 5 per account |
 | Requests/day | ~290 | ~1,440 cron + dashboard use | 100,000 |
 | D1 | not used | 1 database, a few MB | 10 databases, 5 GB, 5 M reads and 100 k writes per day |
+
+## Staging status (21 Nov 2026)
+
+- **Deployed:** `shakhira-admin-staging` on the account's workers.dev subdomain, bound to D1 `shakhira-staging` (region ENAM).
+- **Automation:** simulated (no `BOT_TOKEN`). The cron runs every minute.
+- **Remote smoke test:** 40/40 checks passed (`test/remote/staging-smoke.mjs`).
+- **Browsers:** desktop, iPhone 13 and Pixel 7 checked on all pages.
+- **Workers Logs:** 0 errors.
+- **Not shown here:** the URL and password. This repository is public; the owner has them.
+- Cron triggers take about 10–15 minutes to start after the first deploy.
+- The dashboard frontend is bundled into the script by `build.mjs`. A separate static-asset upload is not used, because it fails behind proxies that rewrite the Authorization header.
 
 ## Deploy staging
 

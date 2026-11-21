@@ -283,3 +283,22 @@ test("unknown API paths are 404 and handleApi works directly", async () => {
   const e = env();
   assert.equal((await handleApi(req("/api/nope"), e)).status, 404);
 });
+
+test("bundled frontend is served with security headers (no ASSETS binding)", async () => {
+  const { execSync } = await import("node:child_process");
+  execSync("node build.mjs", { cwd: new URL("..", import.meta.url) });
+  const e = env({ ASSETS: undefined });
+  const page = await worker.fetch(req("/"), e);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Shakhira Admin/);
+  assert.equal(page.headers.get("x-frame-options"), "DENY");
+  assert.match((await worker.fetch(req("/static/app.js"), e)).headers.get("content-type"), /javascript/);
+  assert.equal((await worker.fetch(req("/nope.txt"), e)).status, 404);
+});
+
+test("login guessing spread over many IPs hits the account-wide cap", async () => {
+  const e = env();
+  for (let i = 0; i < 20; i++)
+    assert.equal((await worker.fetch(req("/api/login", { method: "POST", body: { password: "nope" }, ip: `198.51.100.${i}` }), e)).status, 401);
+  assert.equal((await worker.fetch(req("/api/login", { method: "POST", body: { password: PASSWORD }, ip: "203.0.113.200" }), e)).status, 429);
+});
