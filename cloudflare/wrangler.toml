@@ -19,6 +19,19 @@ database_name = "shakhira-staging"
 database_id = "9f817e23-7415-416c-8f7b-bb15eeeab6c4"
 migrations_dir = "migrations"
 
+# Daily off-site backup of the dashboard database (03:10 IST), kept 14 days.
+[[d1_databases]]
+binding = "BACKUP_DB"
+database_name = "shakhira-backups-staging"
+database_id = "1371af9e-4cc2-444c-9605-5718f12d3bd6"
+
+# STAGING stand-in for the live bot's database: same tables, made-up people (seed/live-sim.sql).
+# Staging is never linked to the real shakhira-vip.
+[[d1_databases]]
+binding = "LIVE_DB"
+database_name = "shakhira-vip-sim"
+database_id = "925439c1-169c-4cae-bb81-3a81d0474496"
+
 [vars]
 ENVIRONMENT = "staging"
 # Staging lock: never publish to the channels. Without BOT_TOKEN the automation is simulated
@@ -30,15 +43,22 @@ VIP_CHANNEL_ID = ""
 BOT_USERNAME = "ShakhiraVIPBot"
 # UTC times of the GitHub Actions poster (5 AM and 10 PM IST), shown in the calendar only.
 POST_SLOTS_UTC = "16:30,23:30"
-# The cron is only the clock: each minute it sends one signed request to the Vercel backend, which runs the
-# cycle next to the Supabase database. Needs the CYCLE_SECRET secret (same value as on Vercel). Remove to run on D1 again.
-CYCLE_URL = "https://shakhira-admin-staging.vercel.app/api/internal/cycle"
+# Same architecture as production: this Worker serves the dashboard and runs the cron itself, on the staging
+# Supabase project (secret SUPABASE_SECRET_KEY). Without the secret it falls back to the D1 binding above.
+SUPABASE_URL = "https://ynelyodswfooxjzenizv.supabase.co"
+AUTH_MODE = "supabase"
 
 # Secrets (set with `wrangler secret put`, never committed):
 #   DASHBOARD_PASSWORD_HASH  from `node tools/hash-password.mjs`
 #   DASHBOARD_SECRET         at least 32 random characters
+#   SUPABASE_SECRET_KEY      staging project's secret key (server only)
+#   UPDATE_SECRET            signs updates forwarded by the live bot (only after approval D2)
 #   BOT_TOKEN                optional; leave unset in staging to simulate all sends
 
 # Workers Logs (included in the free plan): cron runs and errors are visible in the Cloudflare dashboard.
+# Smart Placement (free): runs the Worker near its database (Supabase, Mumbai) instead of near each visitor.
+[placement]
+mode = "smart"
+
 [observability]
 enabled = true

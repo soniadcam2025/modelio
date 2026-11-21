@@ -1,3 +1,4 @@
+import { syncLiveBot } from "./live.js";
 // Send-only automation, run by the Worker's cron trigger. A port of shakhira_bot/scheduler.py.
 // Every part is off until its feature flag is on. A post is claimed before it is sent and is never re-sent
 // after an uncertain result. This Worker never posts the Cloudinary media that the GitHub Actions poster
@@ -59,7 +60,7 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}) {
     counts.uncertain++;
     await alert(`Scheduled post #${stale.id} may or may not have been sent. It will NOT be sent again automatically.`);
   }
-  for (const item of await ops.all("SELECT * FROM content_items WHERE status='scheduled' AND scheduled_at <= ? ORDER BY scheduled_at, id", now)) {
+  for (const item of await ops.all("SELECT * FROM content_items WHERE status='scheduled' AND scheduled_at <= ? ORDER BY scheduled_at, id LIMIT ?", now, MAX_POSTS_PER_CYCLE)) {
     if (!(await claim(ops, item.id, now))) continue;
     let text = item.text;
     if (!text && item.use_caption_library) text = (await ops.nextCaption(now)) || "";
@@ -225,18 +226,57 @@ export async function queueAutoPaidMedia(ops, now, listAssets) {
   return queued;
 }
 
-export async function runCycle(tg, ops, config, now, alert, { listAssets = null } = {}) {
+// At most this many posts per minute: keeps each run inside the Workers Free limit of 50 outbound requests
+// (each post is ~3 database calls on Supabase plus 1 Telegram call). The rest go out in the next minutes.
+export const MAX_POSTS_PER_CYCLE = 8;
+const REMINDERS_PER_CYCLE = 5;
+
+// Trial (24 h before the end) and renewal (3 days before Telegram renews) reminders, each sent once.
+export async function sendReminders(tg, ops, config, now, { trials = true, renewals = true } = {}) {
+  const out = { trial: 0, renewal: 0, failed: 0 };
+  const due = [];
+  if (trials) {
+    for (const t of await ops.all("SELECT user_id, charge_id, expires_at FROM trials WHERE status='active' AND expires_at > ? AND expires_at <= ?", now, now + 86400))
+      due.push({ key: `trial:${t.charge_id}`, kind: "trial", user: t.user_id,
+        text: `Your Shakhira VIP trial ends ${new Date(t.expires_at * 1000).toUTCString()}. To keep access, choose VIP Monthly (${config.monthlyPrice} ⭐ / 30 days) with /subscribe.` });
+  }
+  if (renewals) {
+    for (const m of await ops.all("SELECT user_id, subscription_until FROM member_events WHERE invite_link_name='live:status' AND event='joined' AND subscription_until > ? AND subscription_until <= ?", now, now + 3 * 86400))
+      due.push({ key: `renew:${m.user_id}:${m.subscription_until}`, kind: "renewal", user: m.user_id,
+        text: `Your Shakhira VIP subscription renews on ${new Date(m.subscription_until * 1000).toUTCString()} for ${config.monthlyPrice} ⭐. Nothing to do if you'd like to stay. To stop, cancel in Telegram Settings → My Stars → Subscriptions.` });
+  }
+  let sent = 0;
+  for (const d of due) {
+    if (sent >= REMINDERS_PER_CYCLE) break;
+    const claim = await ops.run("INSERT INTO reminders_sent (key, sent_at) VALUES (?, ?) ON CONFLICT DO NOTHING", d.key, now);
+    if (claim.meta.changes !== 1) continue;
+    sent++;
+    try { await tg.call("sendMessage", { chat_id: d.user, text: d.text }); out[d.kind]++; } catch { out.failed++; }
+  }
+  return out;
+}
+
+export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null } = {}) {
   await ops.setSetting("heartbeat:worker", now);
+  // Read-only mirror of the live bot's members and trials (needs the LIVE_DB binding and the feature switched on).
+  const summary = {};
+  const f = await ops.features();
+  const on = (name) => !!f[name]?.enabled;
+  if (liveDb && on("member_sync")) {
+    try { summary.member_sync = await syncLiveBot(liveDb, ops, now); } catch (e) { summary.member_sync = { error: String(e.message).slice(0, 200) }; }
+  }
   // Housekeeping: forget expired session revocations and old login failures.
   await ops.run("DELETE FROM revoked_sessions WHERE expires_at < ?", now);
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
-  const summary = {};
-  if (await ops.featureEnabled("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
-  if (await ops.featureEnabled("scheduled_posts")) summary.posts = await publishDue(tg, ops, config, now, alert);
-  if (await ops.featureEnabled("poll_auto_close")) summary.polls_closed = await closeDuePolls(tg, ops, config, now);
-  if (await ops.featureEnabled("post_expiry")) summary.expired = await expirePosts(tg, ops, config, now);
+  await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
+  if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
+  if (on("scheduled_posts")) summary.posts = await publishDue(tg, ops, config, now, alert);
+  if (on("poll_auto_close")) summary.polls_closed = await closeDuePolls(tg, ops, config, now);
+  if (on("post_expiry")) summary.expired = await expirePosts(tg, ops, config, now);
   // Preview/staging touches no real member: no admin actions, no reminders.
   if (config.previewChatId || config.requirePreview) return summary;
-  if (await ops.featureEnabled("admin_actions")) summary.actions = await runAdminActions(tg, ops, config, now);
+  if (on("admin_actions")) summary.actions = await runAdminActions(tg, ops, config, now);
+  const trials = on("trial_reminders"), renewals = on("renewal_reminders");
+  if (trials || renewals) summary.reminders = await sendReminders(tg, ops, config, now, { trials, renewals });
   return summary;
 }

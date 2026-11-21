@@ -3,6 +3,8 @@
 
 import { LoginLimiter, Sessions, constantTimeEqual, readCookie, verifyPassword } from "./auth.js";
 import { SupabaseDB } from "./pg.js";
+import { runBackup } from "./backup.js";
+import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
@@ -77,6 +79,12 @@ export function loadConfig(env) {
     botUsername: env.BOT_USERNAME || "ShakhiraVIPBot",
     slotTimes: slots,
     adminName: "admin",
+    discussionGroupId: String(env.DISCUSSION_GROUP_ID || "").trim() || null,
+    adminChatId: String(env.ADMIN_CHAT_ID || "").trim() || null,
+    monthlyPrice: 499,
+    trialPrice: 49,
+    // Daily backup minute (UTC "HH:MM"); 21:40 UTC = 03:10 IST, away from the 5 AM / 10 PM IST posts.
+    backupAt: String(env.BACKUP_AT_UTC || "21:40"),
   };
 }
 
@@ -120,9 +128,11 @@ function routes() {
   add("GET", "/api/health", async (c) => {
     const database = { kind: c.env.SUPABASE_URL && c.env.SUPABASE_SECRET_KEY ? "supabase" : "d1", ok: false };
     try { const t0 = Date.now(); await c.ops.one("SELECT 1 AS ok"); database.ok = true; database.ms = Date.now() - t0; } catch { /* reported as ok:false */ }
-    const hb = database.ok ? await c.ops.getSetting("heartbeat:worker").catch(() => null) : null;
+    const [hb, backup, sync] = database.ok ? await Promise.all(["heartbeat:worker", "backup:last", "live_sync:last"].map((k) => c.ops.getSetting(k).catch(() => null))) : [];
+    const n = (v) => (v ? Number(v) : null);
     return json({ ok: database.ok, environment: c.config.environment, automation: automationMode(c.env, c.config), auth: authMode(c.env),
-      database, scheduler_last_seen: hb ? Number(hb) : null }, database.ok ? 200 : 503);
+      database, scheduler_last_seen: n(hb), backup_last: n(backup), member_sync_last: n(sync),
+      backup_configured: !!c.env.BACKUP_DB, live_bot_linked: !!c.env.LIVE_DB }, database.ok ? 200 : 503);
   }, { auth: false });
   add("POST", "/api/login", async (c) => {
     const client = clientAddress(c.request);
@@ -150,6 +160,14 @@ function routes() {
     if (!(await cycleAuthorized(c.request, c.env, Math.floor(Date.now() / 1000)))) return err("Not allowed", 403);
     return json(await runScheduled(c.env));
   }, { auth: false });
+  // On-demand copy to the backup D1 (the same as the daily 03:10 IST backup).
+  add("POST", "/api/backup/now", async (c) => {
+    if (!c.env.BACKUP_DB) throw new OpsError("No backup database is linked to this deployment");
+    const r = await runBackup(c.ops, c.env.BACKUP_DB, c.ops.now());
+    await c.ops.audit(c.actor, "backup_now", `${r.rows} rows, ${r.bytes} bytes, id ${r.backup_id}`);
+    return json(r);
+  });
+  add("GET", "/api/backup/log", async (c) => json(await c.ops.all("SELECT * FROM backups_log ORDER BY id DESC LIMIT 30")));
   // Backup: download every dashboard table as JSON.
   add("GET", "/api/backup", async (c) => {
     const data = await c.ops.exportAll();
@@ -165,7 +183,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now();
@@ -233,10 +251,11 @@ function routes() {
   add("DELETE", "/api/moderation/rules/(\\d+)", async (c, m) => { await c.ops.deleteModerationRule(m[1], c.actor); return json({ ok: true }); });
 
   add("GET", "/api/analytics", async (c) => json(await c.ops.analytics(c.ops.now(), Math.max(1, Math.min(Number(c.url.searchParams.get("days")) || 30, 365)))));
-  add("GET", "/api/settings", async (c) => json({
-    features: await c.ops.features(), join_policies: Object.fromEntries(await Promise.all(TARGETS.map(async (t) => [t, await c.ops.joinPolicy(t)]))),
-    join_policy_options: JOIN_POLICIES, public_channel: c.config.publicChannel,
-  }));
+  add("GET", "/api/settings", async (c) => {
+    const [features, ...policies] = await Promise.all([c.ops.features(), ...TARGETS.map((t) => c.ops.joinPolicy(t))]);
+    return json({ features, join_policies: Object.fromEntries(TARGETS.map((t, i) => [t, policies[i]])),
+      join_policy_options: JOIN_POLICIES, public_channel: c.config.publicChannel });
+  });
   add("PUT", "/api/settings/features/(\\w+)", async (c, m) => {
     if (!(m[1] in FEATURES)) return err("Unknown feature", 404);
     await c.ops.setFeature(m[1], !!(await body(c.request)).enabled, c.actor);
@@ -298,19 +317,53 @@ export async function handleApi(request, env, now = () => Math.floor(Date.now() 
   }
 }
 
+// Alerts go to ADMIN_CHAT_ID (an admin's own Telegram chat), at most one per key per hour; otherwise to the log.
+function makeAlert(tg, ops, config, now) {
+  return async (msg, key = "general") => {
+    console.warn("ALERT", msg);
+    if (!config.adminChatId || tg.simulating) return;
+    const claim = await ops.run("INSERT INTO reminders_sent (key, sent_at) VALUES (?, ?) ON CONFLICT DO NOTHING", `alert:${key}:${Math.floor(now / 3600)}`, now);
+    if (claim.meta.changes === 1) await tg.call("sendMessage", { chat_id: config.adminChatId, text: `⚠️ Shakhira: ${msg}` }).catch(() => {});
+  };
+}
+
 export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fetchImpl = fetch) {
   const config = loadConfig(env);
   const mode = automationMode(env, config);
+  const ops = new Ops(getDB(env), () => now);
   if (mode === "locked") {
     console.warn("Staging lock: BOT_TOKEN is set but PREVIEW_CHAT_ID is not; automation paused");
-    await new Ops(getDB(env)).setSetting("heartbeat:worker", now);
+    await ops.setSetting("heartbeat:worker", now);
     return { mode };
   }
   const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl });
   const cfg = cloudinaryConfig(env);
   const listAssets = cfg ? (folder) => listFolder(cfg, folder, fetchImpl) : null;
-  const summary = await runCycle(tg, new Ops(getDB(env), () => now), config, now, async (msg) => console.warn("ALERT", msg), { listAssets });
+  const hhmm = new Date(now * 1000).toISOString().slice(11, 16);
+  if (env.BACKUP_DB && hhmm === config.backupAt) {
+    // The backup gets its own run (no posting in the same minute) to stay inside the per-run request limit.
+    try { return { mode, backup: await runBackup(ops, env.BACKUP_DB, now) }; }
+    catch (e) { await makeAlert(tg, ops, config, now)(`Daily backup failed: ${e.message}`, "backup"); return { mode, backup_error: e.message }; }
+  }
+  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null });
   return { mode, summary, simulated: tg.simulated.length };
+}
+
+// A copy of one Telegram update, forwarded by the live bot (service binding or HTTPS) and signed with UPDATE_SECRET.
+export async function receiveForwardedUpdate(request, env, now = Math.floor(Date.now() / 1000)) {
+  const body = await request.text();
+  if (body.length > 200_000 || !(await verifyUpdate(env.UPDATE_SECRET, request.headers, body, now))) return err("Not allowed", 403);
+  let update;
+  try { update = JSON.parse(body); } catch { return err("Invalid JSON", 400); }
+  const config = loadConfig(env);
+  const ops = new Ops(getDB(env), () => now);
+  const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview });
+  try {
+    return json({ result: await handleUpdate(update, { ops, tg, config, now, alert: makeAlert(tg, ops, config, now) }) });
+  } catch (e) {
+    console.error("update error", e.message);
+    return err("Temporary failure", 503); // the live bot ignores this; it never affects members
+  }
 }
 
 export function serveStatic(request, env) {
@@ -326,6 +379,7 @@ export function serveStatic(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/internal/update" && request.method === "POST") return withHeaders(await receiveForwardedUpdate(request, env), true);
     const isApi = url.pathname.startsWith("/api/");
     const response = isApi ? await handleApi(request, env) : await serveStatic(request, env);
     return withHeaders(response, isApi);

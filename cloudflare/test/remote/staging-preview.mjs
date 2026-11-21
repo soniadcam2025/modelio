@@ -8,7 +8,7 @@ if (!BASE?.includes("staging") || health.environment !== "staging" || health.aut
 }
 const results = [];
 const check = (name, ok, detail = "") => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`); };
-const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: PW }) });
+const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: process.env.STAGING_EMAIL, password: PW }) });
 const s = { cookie: r.headers.get("set-cookie").split(";")[0], csrf: (await r.json()).csrf };
 const api = async (path, { method = "GET", body } = {}) => (await fetch(BASE + path, { method,
   headers: { "content-type": "application/json", cookie: s.cookie, "x-csrf-token": s.csrf }, body: body === undefined ? undefined : JSON.stringify(body) })).json();

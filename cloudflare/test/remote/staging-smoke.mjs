@@ -8,7 +8,7 @@ const results = [];
 const check = (name, ok, detail = "") => { results.push({ name, ok, detail }); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`); };
 
 async function login() {
-  const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: PW }) });
+  const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: process.env.STAGING_EMAIL, password: PW }) });
   const cookie = (r.headers.get("set-cookie") || "").split(";")[0];
   return { status: r.status, cookie, setCookie: r.headers.get("set-cookie") || "", csrf: r.ok ? (await r.json()).csrf : null };
 }
@@ -94,7 +94,7 @@ check("logout revokes the session", (await api(s, "/api/me")).status === 401);
 
 if (process.env.SKIP_RATE_LIMIT !== "1") {
   let last = 0;
-  for (let i = 0; i < 6; i++) last = (await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "wrong-password-" + i }) })).status;
+  for (let i = 0; i < 6; i++) last = (await fetch(BASE + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: process.env.STAGING_EMAIL, password: "wrong-password-" + i }) })).status;
   check("login rate limit (6th wrong attempt blocked)", last === 429, String(last));
 }
 

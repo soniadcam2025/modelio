@@ -8,7 +8,7 @@
 
 export const ALLOWED_METHODS = new Set([
   "sendMessage", "sendPhoto", "sendVideo", "sendAnimation", "sendPoll", "stopPoll", "sendPaidMedia", "deleteMessage",
-  "approveChatJoinRequest", "declineChatJoinRequest", "banChatMember", "unbanChatMember", "getChatMember",
+  "approveChatJoinRequest", "declineChatJoinRequest", "banChatMember", "unbanChatMember", "getChatMember", "restrictChatMember",
 ]);
 
 export class TelegramError extends Error {

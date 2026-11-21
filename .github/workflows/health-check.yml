@@ -1,0 +1,45 @@
+name: Dashboard health check
+
+# Every 30 minutes, checks each dashboard's /api/health: database reachable, scheduler ran in the last
+# 10 minutes, and (once configured) a daily backup in the last 30 hours. A failed run makes GitHub email
+# the repository owner. The URLs come from the HEALTH_URLS secret (space-separated) so they never appear
+# in this public repository or its logs. Read-only: it changes nothing anywhere.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check
+        env:
+          HEALTH_URLS: ${{ secrets.HEALTH_URLS }}
+        run: |
+          if [ -z "$HEALTH_URLS" ]; then echo "::notice::HEALTH_URLS secret not set; nothing to check"; exit 0; fi
+          fail=0; i=0
+          for base in $HEALTH_URLS; do
+            i=$((i+1)); echo "::add-mask::$base"
+            body=$(curl -s --max-time 20 "$base/api/health" || true)
+            verdict=$(printf '%s' "$body" | python3 -c '
+          import json, sys, time
+          try: d = json.load(sys.stdin)
+          except Exception: print("unreachable"); sys.exit()
+          now = time.time(); bad = []
+          if not d.get("ok"): bad.append("database down")
+          s = d.get("scheduler_last_seen")
+          if not s or now - s > 600: bad.append("scheduler stale")
+          b = d.get("backup_last")
+          if d.get("backup_configured") and b and now - b > 30 * 3600: bad.append("backup stale")
+          print(", ".join(bad) or "ok")')
+            echo "dashboard $i ($(printf '%s' "$body" | python3 -c 'import json,sys
+          try: print(json.load(sys.stdin).get("environment"))
+          except Exception: print("?")')): $verdict"
+            [ "$verdict" = "ok" ] || fail=1
+          done
+          exit $fail
