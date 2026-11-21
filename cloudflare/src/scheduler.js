@@ -1,3 +1,4 @@
+import { botAllows } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 // Send-only automation, run by the Worker's cron trigger. A port of shakhira_bot/scheduler.py.
 // Every part is off until its feature flag is on. A post is claimed before it is sent and is never re-sent
@@ -13,7 +14,14 @@ const VIDEO_EXT = [".mp4", ".mov", ".m4v", ".webm"];
 
 export function targetChat(config, target) {
   if (config.previewChatId) return config.previewChatId;
+  if (String(target).startsWith("chat:")) return String(target).slice(5);
   return target === "vip" ? config.vipChannelId : config.publicChannel;
+}
+
+// Which posts a run may touch: the primary bot's (no bot, or the registered primary) or one other bot's.
+function scope(botScope) {
+  if (!botScope || botScope.primary) return botScope?.primaryId ? [" AND (bot_id IS NULL OR bot_id = ?)", [botScope.primaryId]] : [" AND bot_id IS NULL", []];
+  return [" AND bot_id = ?", [botScope.botId]];
 }
 
 function markup(item, config) {
@@ -53,15 +61,21 @@ async function claim(ops, id, now) {
 const setStatus = (ops, id, status, error, now) =>
   ops.run("UPDATE content_items SET status=?, last_error=?, updated_at=? WHERE id=?", status, String(error).slice(0, 500), now, id);
 
-export async function publishDue(tg, ops, config, now, alert = async () => {}) {
+export async function publishDue(tg, ops, config, now, alert = async () => {}, botScope = null) {
+  const [sc, sa] = scope(botScope);
   const counts = { posted: 0, simulated: 0, failed: 0, uncertain: 0, retry: 0 };
-  for (const stale of await ops.all("SELECT * FROM content_items WHERE status='sending' AND sending_since < ?", now - STALE_SENDING_SECONDS)) {
+  for (const stale of await ops.all("SELECT * FROM content_items WHERE status='sending' AND sending_since < ?" + sc, now - STALE_SENDING_SECONDS, ...sa)) {
     await setStatus(ops, stale.id, "uncertain", "the worker stopped while sending; check the channel", now);
     counts.uncertain++;
     await alert(`Scheduled post #${stale.id} may or may not have been sent. It will NOT be sent again automatically.`);
   }
-  for (const item of await ops.all("SELECT * FROM content_items WHERE status='scheduled' AND scheduled_at <= ? ORDER BY scheduled_at, id LIMIT ?", now, MAX_POSTS_PER_CYCLE)) {
+  for (const item of await ops.all("SELECT * FROM content_items WHERE status='scheduled' AND scheduled_at <= ?" + sc + " ORDER BY scheduled_at, id LIMIT ?", now, ...sa, MAX_POSTS_PER_CYCLE)) {
     if (!(await claim(ops, item.id, now))) continue;
+    if (botScope?.bot && !botAllows(botScope.bot, item.kind)) {
+      await setStatus(ops, item.id, "failed", `@${botScope.bot.username} does not have permission for ${item.kind} posts`, now);
+      counts.failed++;
+      continue;
+    }
     let text = item.text;
     if (!text && item.use_caption_library) text = (await ops.nextCaption(now)) || "";
     if (item.hashtags && !["poll", "quiz"].includes(item.kind)) text = text ? `${text}\n\n${item.hashtags}` : item.hashtags;
@@ -92,10 +106,11 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}) {
   return counts;
 }
 
-export async function closeDuePolls(tg, ops, config, now) {
+export async function closeDuePolls(tg, ops, config, now, botScope = null) {
+  const [sc, sa] = scope(botScope);
   let closed = 0;
   const due = await ops.all("SELECT * FROM content_items WHERE kind IN ('poll','quiz') AND status IN ('posted','simulated') AND poll_closed_at IS NULL " +
-    "AND close_after_minutes IS NOT NULL AND posted_at + close_after_minutes * 60 <= ?", now);
+    "AND close_after_minutes IS NOT NULL AND posted_at + close_after_minutes * 60 <= ?" + sc, now, ...sa);
   for (const item of due) {
     let results;
     if (item.status === "simulated") {
@@ -154,10 +169,11 @@ export async function runAdminActions(tg, ops, config, now) {
 }
 
 // Posts with an expiry are deleted once it passes. Telegram allows bots to delete for 48 hours.
-export async function expirePosts(tg, ops, config, now) {
+export async function expirePosts(tg, ops, config, now, botScope = null) {
+  const [sc, sa] = scope(botScope);
   let expired = 0;
   const due = await ops.all("SELECT * FROM content_items WHERE status IN ('posted','simulated') AND expire_after_minutes IS NOT NULL " +
-    "AND expired_at IS NULL AND posted_at + expire_after_minutes * 60 <= ?", now);
+    "AND expired_at IS NULL AND posted_at + expire_after_minutes * 60 <= ?" + sc, now, ...sa);
   for (const item of due) {
     let note = "";
     if (item.status === "posted" && item.message_id) {
@@ -256,7 +272,7 @@ export async function sendReminders(tg, ops, config, now, { trials = true, renew
   return out;
 }
 
-export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null } = {}) {
+export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null, bots = [], tgForBot = async () => null } = {}) {
   await ops.setSetting("heartbeat:worker", now);
   // Read-only mirror of the live bot's members and trials (needs the LIVE_DB binding and the feature switched on).
   const summary = {};
@@ -270,11 +286,28 @@ export async function runCycle(tg, ops, config, now, alert, { listAssets = null,
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
   if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
-  if (on("scheduled_posts")) summary.posts = await publishDue(tg, ops, config, now, alert);
-  if (on("poll_auto_close")) summary.polls_closed = await closeDuePolls(tg, ops, config, now);
-  if (on("post_expiry")) summary.expired = await expirePosts(tg, ops, config, now);
+  // Primary bot (@ShakhiraVIPBot): runs unless it is registered with its automation switched off.
+  const primary = bots.find((b) => Number(b.is_primary));
+  const primaryScope = { primary: true, primaryId: primary?.id ?? null, bot: primary || null };
+  if (!primary || (Number(primary.automation_enabled) && primary.status === "active")) {
+    if (on("scheduled_posts")) summary.posts = await publishDue(tg, ops, config, now, alert, primaryScope);
+    if (on("poll_auto_close")) summary.polls_closed = await closeDuePolls(tg, ops, config, now, primaryScope);
+    if (on("post_expiry")) summary.expired = await expirePosts(tg, ops, config, now, primaryScope);
+  }
+  // Every other bot: only its own posts, with its own token, when its own automation switch is on.
+  for (const bot of bots.filter((b) => !Number(b.is_primary) && Number(b.automation_enabled) && b.status === "active")) {
+    const botTg = await tgForBot(bot);
+    if (!botTg) continue;
+    const sc = { botId: bot.id, bot };
+    const out = {};
+    if (on("scheduled_posts")) out.posts = await publishDue(botTg, ops, config, now, alert, sc);
+    if (on("poll_auto_close")) out.polls_closed = await closeDuePolls(botTg, ops, config, now, sc);
+    if (on("post_expiry")) out.expired = await expirePosts(botTg, ops, config, now, sc);
+    (summary.bots ||= {})[bot.username] = out;
+  }
   // Preview/staging touches no real member: no admin actions, no reminders.
   if (config.previewChatId || config.requirePreview) return summary;
+  if (primary && !JSON.parse(primary.permissions_json || "{}").member_actions) return summary;
   if (on("admin_actions")) summary.actions = await runAdminActions(tg, ops, config, now);
   const trials = on("trial_reminders"), renewals = on("renewal_reminders");
   if (trials || renewals) summary.reminders = await sendReminders(tg, ops, config, now, { trials, renewals });

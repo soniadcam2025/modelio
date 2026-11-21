@@ -30,7 +30,7 @@ export class SendOnlyTelegram {
     this.token = token || "";
     this.previewChatId = previewChatId ? String(previewChatId) : null;
     this.requirePreview = requirePreview;
-    this.fetch = fetchImpl;
+    this.fetch = (...args) => fetchImpl(...args); // never call fetch as a method: Workers throws "Illegal invocation"
     this.simulated = [];
   }
 

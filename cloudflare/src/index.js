@@ -4,6 +4,7 @@
 import { LoginLimiter, Sessions, constantTimeEqual, readCookie, verifyPassword } from "./auth.js";
 import { SupabaseDB } from "./pg.js";
 import { runBackup } from "./backup.js";
+import { BotStore, PERMISSIONS } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
@@ -23,6 +24,22 @@ export function getDB(env) {
   if (!env.DB) throw new Error("No database configured");
   return env.DB;
 }
+// Credentials saved in Settings → Bots & integrations (encrypted) fill in what the Worker secrets don't set.
+// Worker secrets always win. Returns a copy; the original env is never modified.
+export async function effectiveEnv(env, ops) {
+  if (!env.CREDENTIALS_KEY) return env;
+  const store = new BotStore(ops, env, { botUsername: env.BOT_USERNAME });
+  const eff = { ...env };
+  const needToken = !env.BOT_TOKEN, needCloud = !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET);
+  const [token, cloud] = await Promise.all([
+    needToken ? store.primaryToken(env).catch(() => null) : null,
+    needCloud ? store.cloudinaryCreds().catch(() => null) : null,
+  ]);
+  if (token) eff.BOT_TOKEN = token;
+  if (cloud) Object.assign(eff, { CLOUDINARY_CLOUD_NAME: cloud.cloud, CLOUDINARY_API_KEY: cloud.key, CLOUDINARY_API_SECRET: cloud.secret });
+  return eff;
+}
+
 const authMode = (env) => (String(env.AUTH_MODE || "").toLowerCase() === "supabase" && env.SUPABASE_URL ? "supabase" : "password");
 
 // The caller's address for the login limiter: Cloudflare's or Vercel's own header (both set by the platform, not the client).
@@ -161,6 +178,34 @@ function routes() {
     if (!(await cycleAuthorized(c.request, c.env, Math.floor(Date.now() / 1000)))) return err("Not allowed", 403);
     return json(await runScheduled(c.env));
   }, { auth: false });
+  // ---- Bots & integrations. Changing a credential needs a fresh password check, not just the session. ----
+  const fresh = async (c, b) => {
+    const client = clientAddress(c.request);
+    if (await c.limiter.blocked(client)) throw new OpsError("Too many attempts. Wait 15 minutes.");
+    let ok;
+    if (authMode(c.env) === "supabase") ok = !!(await supabaseSignIn(c.env, String(b.email || "").trim().toLowerCase(), String(b.password || "")));
+    else ok = await verifyPassword(String(b.password || ""), c.env.DASHBOARD_PASSWORD_HASH || "");
+    if (!ok) { await c.limiter.failed(client); throw new OpsError("Password check failed: enter your sign-in email and password again"); }
+  };
+  const store = (c) => {
+    if (!c.env.CREDENTIALS_KEY) throw new OpsError("Credential storage is not set up on this Worker (CREDENTIALS_KEY secret missing)");
+    return new BotStore(c.ops, c.env, { botUsername: c.config.botUsername });
+  };
+  add("GET", "/api/bots", async (c) => json({ bots: await store(c).list(), permissions: PERMISSIONS }));
+  add("POST", "/api/bots", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).add(b.token, c.actor)); });
+  add("POST", "/api/bots/(\\d+)/test", async (c, m) => json(await store(c).test(m[1], c.actor)));
+  add("PUT", "/api/bots/(\\d+)/token", async (c, m) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).replace(m[1], b.token, c.actor)); });
+  add("DELETE", "/api/bots/(\\d+)/token", async (c, m) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).disconnect(m[1], c.actor)); });
+  add("PUT", "/api/bots/(\\d+)/automation", async (c, m) => json(await store(c).setAutomation(m[1], !!(await body(c.request)).enabled, c.actor)));
+  add("PUT", "/api/bots/(\\d+)/permissions", async (c, m) => json(await store(c).setPermissions(m[1], (await body(c.request)).permissions, c.actor)));
+  add("POST", "/api/bots/(\\d+)/channels", async (c, m) => { const b = await body(c.request); return json(await store(c).assignChannel(m[1], b.chat_id, b.kind, c.actor)); });
+  add("DELETE", "/api/bots/(\\d+)/channels/([^/]+)", async (c, m) => json(await store(c).unassignChannel(m[1], decodeURIComponent(m[2]), c.actor)));
+  add("GET", "/api/bots/(\\d+)/history", async (c, m) => json(await store(c).history(m[1])));
+  add("GET", "/api/integrations/cloudinary", async (c) => json(await store(c).cloudinaryView()));
+  add("PUT", "/api/integrations/cloudinary", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).cloudinarySave(b, c.actor)); });
+  add("POST", "/api/integrations/cloudinary/test", async (c) => json(await store(c).cloudinaryRecheck(c.actor)));
+  add("DELETE", "/api/integrations/cloudinary", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).cloudinaryDisconnect(c.actor)); });
+
   // Read-only view of the bot and both channels (needs BOT_TOKEN; uses only get* methods).
   add("GET", "/api/telegram", async (c) => {
     if (!c.env.BOT_TOKEN) return json({ configured: false });
@@ -205,7 +250,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now();
@@ -322,6 +367,7 @@ export async function handleApi(request, env, now = () => Math.floor(Date.now() 
   let sessions, db;
   try { db = getDB(env); sessions = new Sessions(env.DASHBOARD_SECRET, db, now); } catch (e) { return err("Dashboard is not configured: " + e.message, 503); }
   const c = { request, env, url, config, sessions, limiter: new LoginLimiter(db, now), ops: new Ops(db, now), actor: config.adminName, token: null };
+  try { c.env = await effectiveEnv(env, c.ops); } catch { /* the database check in /api/health reports problems */ }
   if (route.auth) {
     c.token = readCookie(request, SESSION_COOKIE);
     if (!(await sessions.valid(c.token))) return err("Please sign in", 401);
@@ -350,9 +396,11 @@ function makeAlert(tg, ops, config, now) {
 }
 
 export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fetchImpl = fetch) {
+  const ops = new Ops(getDB(env), () => now);
+  const rawEnv = env;
+  env = await effectiveEnv(env, ops);
   const config = loadConfig(env);
   const mode = automationMode(env, config);
-  const ops = new Ops(getDB(env), () => now);
   const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl });
   if (mode === "locked") {
     // A token without a preview chat: nothing is sent, but read-only work (member sync, backups) continues.
@@ -370,7 +418,14 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
     try { return { mode, backup: await runBackup(ops, env.BACKUP_DB, now) }; }
     catch (e) { await makeAlert(tg, ops, config, now)(`Daily backup failed: ${e.message}`, "backup"); return { mode, backup_error: e.message }; }
   }
-  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null });
+  const store = new BotStore(ops, rawEnv, { fetchImpl, botUsername: env.BOT_USERNAME });
+  const bots = rawEnv.CREDENTIALS_KEY ? await ops.all("SELECT * FROM bots") : [];
+  // Other bots use the same staging lock and preview chat as the primary bot.
+  const tgForBot = async (bot) => {
+    const token = await store.token(bot.id).catch(() => null);
+    return token ? new SendOnlyTelegram({ token, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl }) : null;
+  };
+  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null, bots, tgForBot });
   return { mode, summary, simulated: tg.simulated.length };
 }
 

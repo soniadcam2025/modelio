@@ -19,7 +19,7 @@ if (D1 === "shakhira-vip") { console.error("Refusing: shakhira-vip is the live b
 
 // Columns with identity ids, whose sequences must move past the restored rows.
 const ID_TABLES = ["content_items", "captions", "join_requests", "admin_actions", "moderation_rules", "moderation_log", "audit_log",
-  "payments", "trials", "member_events"];
+  "payments", "trials", "member_events", "bots", "bot_channels"];
 
 function d1(sql) {
   const out = execFileSync("npx", ["wrangler", "d1", "execute", D1, "--remote", "--json", "--command", sql],
