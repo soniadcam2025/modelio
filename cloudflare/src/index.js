@@ -292,11 +292,10 @@ function routes() {
     return json(contentOut(item));
   });
   add("PUT", "/api/content/(\\d+)", async (c, m) => json(contentOut(await c.ops.updateContent(m[1], await body(c.request), c.actor))));
-  // Real publishing (live mode) needs an explicit confirmation on every schedule / publish request.
-  const confirmIfLive = async (c, b, id) => {
+  // Signed-in admins publish with one click. In live mode the bot must still be permitted to send this post type
+  // (paid media stays locked until approved); the scheduler's claim step prevents duplicate sends.
+  const checkPermitted = async (c, id) => {
     if (automationMode(c.env, c.config) !== "live") return;
-    if (b.confirm !== true) throw new OpsError("Confirm that this post will be published to the channel");
-    // Only post types the bot is permitted to send can be queued for real (e.g. paid media stays off until approved).
     const item = await c.ops.content(id);
     if (!item) throw new OpsError("Not found");
     const bot = item.bot_id ? await c.ops.one("SELECT * FROM bots WHERE id = ?", item.bot_id) : await c.ops.one("SELECT * FROM bots WHERE is_primary = 1");
@@ -304,13 +303,12 @@ function routes() {
       throw new OpsError(`@${bot.username} is not permitted to publish ${item.kind === "paid_media" ? "paid media" : item.kind + " posts"} yet (Bots & integrations → Manage → Permissions)`);
   };
   add("POST", "/api/content/(\\d+)/schedule", async (c, m) => {
-    const b = await body(c.request); await confirmIfLive(c, b, m[1]);
-    if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} scheduled`);
+    const b = await body(c.request); await checkPermitted(c, m[1]);
     return json(contentOut(await c.ops.scheduleContent(m[1], b.scheduled_at, c.actor)));
   });
   add("POST", "/api/content/(\\d+)/publish", async (c, m) => {
-    const b = await body(c.request); await confirmIfLive(c, b, m[1]);
-    if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} now`);
+    await checkPermitted(c, m[1]);
+    await c.ops.audit(c.actor, "publish_now", `#${m[1]}`);
     return json(contentOut(await c.ops.scheduleContent(m[1], c.ops.now(), c.actor)));
   });
   add("POST", "/api/content/(\\d+)/stop-series", async (c, m) => json(await c.ops.stopSeries(m[1], c.actor)));
