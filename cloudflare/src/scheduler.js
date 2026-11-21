@@ -63,6 +63,7 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}) {
     if (!(await claim(ops, item.id, now))) continue;
     let text = item.text;
     if (!text && item.use_caption_library) text = (await ops.nextCaption(now)) || "";
+    if (item.hashtags && !["poll", "quiz"].includes(item.kind)) text = text ? `${text}\n\n${item.hashtags}` : item.hashtags;
     let result;
     try {
       result = await sendItem(tg, config, item, text);
@@ -189,14 +190,14 @@ export function dueSlots(times, now, windowSeconds = 30 * 60) {
 }
 
 // Automated paid media: at each configured time, queue the next unused asset from its own Cloudinary folder.
-// The slot is claimed in D1 first (INSERT OR IGNORE), so one slot can never create two posts.
+// The slot is claimed in D1 first (INSERT … ON CONFLICT DO NOTHING), so one slot can never create two posts.
 // Used assets are remembered in D1, never as Cloudinary tags. The GitHub poster's folder is refused.
 export async function queueAutoPaidMedia(ops, now, listAssets) {
   const cfg = await ops.paidMediaConfig();
   if (!cfg.folder || !cfg.times_utc.length || cfg.folder.toLowerCase() === GITHUB_POSTER_FOLDER || !listAssets) return [];
   const queued = [];
   for (const { slot } of dueSlots(cfg.times_utc, now)) {
-    const claim = await ops.run("INSERT OR IGNORE INTO auto_paid_runs (slot, created_at) VALUES (?, ?)", slot, now);
+    const claim = await ops.run("INSERT INTO auto_paid_runs (slot, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING", slot, now);
     if (claim.meta.changes !== 1) continue; // this slot was already handled
     let assets;
     try {
@@ -217,7 +218,7 @@ export async function queueAutoPaidMedia(ops, now, listAssets) {
       text: next.caption || cfg.caption || "", expire_after_minutes: cfg.expire_after_minutes, source: `auto:${next.public_id}`,
     }, "automation");
     await ops.scheduleContent(item.id, now, "automation");
-    await ops.run("INSERT OR IGNORE INTO auto_paid_posted (public_id, content_id, posted_at) VALUES (?, ?, ?)", next.public_id, item.id, now);
+    await ops.run("INSERT INTO auto_paid_posted (public_id, content_id, posted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", next.public_id, item.id, now);
     await ops.run("UPDATE auto_paid_runs SET public_id=?, content_id=? WHERE slot=?", next.public_id, item.id, slot);
     queued.push(item.id);
   }

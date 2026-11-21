@@ -80,7 +80,7 @@ export class Sessions {
   async revoke(token) {
     if (!token || token.split(".").length !== 3) return;
     const [expiry, nonce] = token.split(".");
-    await this.db.prepare("INSERT OR IGNORE INTO revoked_sessions (nonce, expires_at) VALUES (?, ?)")
+    await this.db.prepare("INSERT INTO revoked_sessions (nonce, expires_at) VALUES (?, ?) ON CONFLICT DO NOTHING")
       .bind(nonce, Number(expiry) || this.now()).run();
   }
 
@@ -96,7 +96,7 @@ export class LoginLimiter {
   }
   async blocked(client) {
     const since = this.now() - FAILURE_WINDOW;
-    const row = await this.db.prepare("SELECT COUNT(*) AS n, SUM(client = ?) AS mine FROM login_failures WHERE at > ?")
+    const row = await this.db.prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN client = ? THEN 1 ELSE 0 END) AS mine FROM login_failures WHERE at > ?")
       .bind(client, since).first();
     return (row?.mine || 0) >= MAX_FAILURES || (row?.n || 0) >= MAX_GLOBAL_FAILURES;
   }

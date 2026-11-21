@@ -80,7 +80,10 @@ test("security headers on pages and API; API not cached", async () => {
   assert.equal(page.headers.get("x-robots-tag"), "noindex, nofollow");
   const api = await worker.fetch(req("/api/health"), e);
   assert.equal(api.headers.get("cache-control"), "no-store");
-  assert.deepEqual(await api.json(), { ok: true, environment: "staging", automation: "simulated" });
+  const h = await api.json();
+  assert.equal(h.ok, true); assert.equal(h.environment, "staging"); assert.equal(h.automation, "simulated");
+  assert.equal(h.auth, "password"); assert.equal(h.database.ok, true);
+  assert.equal(JSON.stringify(h).includes("s".repeat(40)), false);
 });
 
 test("missing secret gives a clear 503, not a crash", async () => {

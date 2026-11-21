@@ -1,7 +1,8 @@
 // Shakhira admin dashboard + send-only automation as a Cloudflare Worker (staging).
 // Same /api routes as dashboard/app.py, so the dashboard frontend is shared unchanged.
 
-import { LoginLimiter, Sessions, readCookie, verifyPassword } from "./auth.js";
+import { LoginLimiter, Sessions, constantTimeEqual, readCookie, verifyPassword } from "./auth.js";
+import { SupabaseDB } from "./pg.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
@@ -9,6 +10,50 @@ import { cloudinaryConfig, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, pos
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
+
+// The database: Supabase (Postgres) when its URL and secret key are configured, otherwise the Worker's D1 binding.
+export function getDB(env) {
+  if (env.SUPABASE_URL && env.SUPABASE_SECRET_KEY) {
+    env.__pg ||= new SupabaseDB({ url: env.SUPABASE_URL, key: env.SUPABASE_SECRET_KEY });
+    return env.__pg;
+  }
+  if (!env.DB) throw new Error("No database configured");
+  return env.DB;
+}
+const authMode = (env) => (String(env.AUTH_MODE || "").toLowerCase() === "supabase" && env.SUPABASE_URL ? "supabase" : "password");
+
+// The caller's address for the login limiter: Cloudflare's or Vercel's own header (both set by the platform, not the client).
+function clientAddress(request) {
+  const h = request.headers;
+  return h.get("cf-connecting-ip") || h.get("x-real-ip") || (h.get("x-forwarded-for") || "").split(",")[0].trim() || "unknown";
+}
+
+// Supabase Auth: password grant, then require app_metadata.shakhira_admin (set only by the service key, never by users).
+async function supabaseSignIn(env, email, password, fetchImpl = fetch) {
+  const res = await fetchImpl(`${env.SUPABASE_URL.replace(/\/+$/, "")}/auth/v1/token?grant_type=password`, {
+    method: "POST", headers: { "content-type": "application/json", apikey: env.SUPABASE_SECRET_KEY },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.user?.app_metadata?.shakhira_admin === true ? data.user : null;
+}
+
+async function hmacHex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return [...new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(message)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+// Signed request from the Cloudflare cron to the Vercel backend: HMAC(CYCLE_SECRET, "cycle:<unix time>"), valid for 2 minutes.
+export async function signCycle(secret, now = Math.floor(Date.now() / 1000)) {
+  return { "x-cycle-time": String(now), "x-cycle-signature": await hmacHex(secret, `cycle:${now}`) };
+}
+async function cycleAuthorized(request, env, now) {
+  if (!env.CYCLE_SECRET || env.CYCLE_SECRET.length < 32) return false;
+  const t = Number(request.headers.get("x-cycle-time"));
+  if (!Number.isInteger(t) || Math.abs(now - t) > 120) return false;
+  return constantTimeEqual(request.headers.get("x-cycle-signature") || "", await hmacHex(env.CYCLE_SECRET, `cycle:${t}`));
+}
 export const SECURITY_HEADERS = {
   "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; media-src https:; style-src 'self'; " +
     "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
@@ -72,21 +117,47 @@ function routes() {
   const r = [];
   const add = (method, pattern, handler, { auth = true } = {}) => r.push({ method, re: new RegExp(`^${pattern}$`), handler, auth });
 
-  add("GET", "/api/health", async (c) => json({ ok: true, environment: c.config.environment, automation: automationMode(c.env, c.config) }), { auth: false });
+  add("GET", "/api/health", async (c) => {
+    const database = { kind: c.env.SUPABASE_URL && c.env.SUPABASE_SECRET_KEY ? "supabase" : "d1", ok: false };
+    try { const t0 = Date.now(); await c.ops.one("SELECT 1 AS ok"); database.ok = true; database.ms = Date.now() - t0; } catch { /* reported as ok:false */ }
+    const hb = database.ok ? await c.ops.getSetting("heartbeat:worker").catch(() => null) : null;
+    return json({ ok: database.ok, environment: c.config.environment, automation: automationMode(c.env, c.config), auth: authMode(c.env),
+      database, scheduler_last_seen: hb ? Number(hb) : null }, database.ok ? 200 : 503);
+  }, { auth: false });
   add("POST", "/api/login", async (c) => {
-    const client = c.request.headers.get("cf-connecting-ip") || "unknown";
+    const client = clientAddress(c.request);
     if (await c.limiter.blocked(client)) return err("Too many attempts. Wait 15 minutes.", 429);
     const b = await body(c.request);
-    if (!(await verifyPassword(String(b.password ?? ""), c.env.DASHBOARD_PASSWORD_HASH || ""))) {
+    let who = c.config.adminName;
+    if (authMode(c.env) === "supabase") {
+      const email = String(b.email ?? "").trim().toLowerCase().slice(0, 200);
+      const user = email ? await supabaseSignIn(c.env, email, String(b.password ?? "").slice(0, 200)) : null;
+      if (!user) { await c.limiter.failed(client); return err("Wrong email or password", 401); }
+      who = email;
+    } else if (!(await verifyPassword(String(b.password ?? ""), c.env.DASHBOARD_PASSWORD_HASH || ""))) {
       await c.limiter.failed(client);
       return err("Wrong password", 401);
     }
     await c.limiter.succeeded(client);
+    await c.ops.audit(who, "login", `from ${client}`);
     const token = await c.sessions.issue();
     const res = json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(token) });
     res.headers.set("Set-Cookie", `${SESSION_COOKIE}=${token}; Max-Age=43200; Path=/; HttpOnly; Secure; SameSite=Strict`);
     return res;
   }, { auth: false });
+  // Cron hand-off from the Cloudflare staging Worker (one signed request per minute) so the cycle runs next to the database.
+  add("POST", "/api/internal/cycle", async (c) => {
+    if (!(await cycleAuthorized(c.request, c.env, Math.floor(Date.now() / 1000)))) return err("Not allowed", 403);
+    return json(await runScheduled(c.env));
+  }, { auth: false });
+  // Backup: download every dashboard table as JSON.
+  add("GET", "/api/backup", async (c) => {
+    const data = await c.ops.exportAll();
+    await c.ops.audit(c.actor, "backup_export", Object.entries(data.tables).map(([t, r]) => `${t}:${r.length}`).join(" ").slice(0, 500));
+    const res = json(data);
+    res.headers.set("Content-Disposition", `attachment; filename="shakhira-backup-${new Date(data.exported_at * 1000).toISOString().slice(0, 10)}.json"`);
+    return res;
+  });
   add("POST", "/api/logout", async (c) => {
     await c.sessions.revoke(c.token);
     const res = json({ ok: true });
@@ -94,7 +165,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now(), stats = await c.ops.analytics(now, 30);
@@ -204,9 +275,9 @@ export async function handleApi(request, env, now = () => Math.floor(Date.now() 
   const route = ROUTES.find((rt) => rt.method === request.method && rt.re.test(url.pathname));
   if (!route) return err("Not found", 404);
   const config = loadConfig(env);
-  let sessions;
-  try { sessions = new Sessions(env.DASHBOARD_SECRET, env.DB, now); } catch (e) { return err("Dashboard is not configured: " + e.message, 503); }
-  const c = { request, env, url, config, sessions, limiter: new LoginLimiter(env.DB, now), ops: new Ops(env.DB, now), actor: config.adminName, token: null };
+  let sessions, db;
+  try { db = getDB(env); sessions = new Sessions(env.DASHBOARD_SECRET, db, now); } catch (e) { return err("Dashboard is not configured: " + e.message, 503); }
+  const c = { request, env, url, config, sessions, limiter: new LoginLimiter(db, now), ops: new Ops(db, now), actor: config.adminName, token: null };
   if (route.auth) {
     c.token = readCookie(request, SESSION_COOKIE);
     if (!(await sessions.valid(c.token))) return err("Please sign in", 401);
@@ -229,13 +300,13 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
   const mode = automationMode(env, config);
   if (mode === "locked") {
     console.warn("Staging lock: BOT_TOKEN is set but PREVIEW_CHAT_ID is not; automation paused");
-    await new Ops(env.DB).setSetting("heartbeat:worker", now);
+    await new Ops(getDB(env)).setSetting("heartbeat:worker", now);
     return { mode };
   }
   const tg = new SendOnlyTelegram({ token: env.BOT_TOKEN, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl });
   const cfg = cloudinaryConfig(env);
   const listAssets = cfg ? (folder) => listFolder(cfg, folder, fetchImpl) : null;
-  const summary = await runCycle(tg, new Ops(env.DB, () => now), config, now, async (msg) => console.warn("ALERT", msg), { listAssets });
+  const summary = await runCycle(tg, new Ops(getDB(env), () => now), config, now, async (msg) => console.warn("ALERT", msg), { listAssets });
   return { mode, summary, simulated: tg.simulated.length };
 }
 
@@ -257,6 +328,12 @@ export default {
     return withHeaders(response, isApi);
   },
   async scheduled(_event, env, ctx) {
+    // With CYCLE_URL set, this Worker is only the clock: it asks the Vercel backend (next to Supabase) to run the cycle.
+    if (env.CYCLE_URL && env.CYCLE_SECRET) {
+      ctx.waitUntil(fetch(env.CYCLE_URL, { method: "POST", headers: await signCycle(env.CYCLE_SECRET) })
+        .then(async (r) => console.log("cycle via backend", r.status, (await r.text()).slice(0, 300))));
+      return;
+    }
     ctx.waitUntil(runScheduled(env).then((r) => console.log("cycle", JSON.stringify(r))));
   },
 };

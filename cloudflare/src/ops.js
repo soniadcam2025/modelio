@@ -95,7 +95,16 @@ export function validateContent(data) {
     scheduledAt = toInt(scheduledAt);
     if (Number.isNaN(scheduledAt)) throw new OpsError("Invalid schedule time");
   }
+  // Hashtags: up to 10 tags of letters, digits or _; stored without duplicates as "#a #b".
+  const rawTags = Array.isArray(data.hashtags) ? data.hashtags.join(" ") : String(data.hashtags ?? "");
+  const tags = [...new Set(rawTags.split(/[\s,]+/).map((t) => t.replace(/^#+/, "")).filter(Boolean))];
+  for (const t of tags) if (!/^[\p{L}\p{N}_]{1,40}$/u.test(t)) throw new OpsError(`Hashtag #${t} may use only letters, digits and _`);
+  if (tags.length > 10) throw new OpsError("Use at most 10 hashtags");
+  const hashtags = tags.map((t) => "#" + t).join(" ");
+  if (hashtags && !["poll", "quiz"].includes(kind) && text.length + hashtags.length + 2 > limit)
+    throw new OpsError(`Text plus hashtags must fit in ${limit} characters`);
   return {
+    hashtags,
     kind, target, text, media_url: mediaUrl, options_json: JSON.stringify(options), correct_option: correct, explanation,
     multiple_answers: data.multiple_answers && kind === "poll" ? 1 : 0, close_after_minutes: closeAfter, star_count: stars,
     button_text: buttonText, button_url: buttonUrl,
@@ -103,6 +112,10 @@ export function validateContent(data) {
     expire_after_minutes: expireAfter,
   };
 }
+
+export const BACKUP_TABLES = ["settings", "content_items", "captions", "profiles", "join_requests", "admin_actions", "moderation_rules",
+  "moderation_log", "reaction_counts", "reminders_sent", "audit_log", "payments", "trials", "member_events", "pending_unbans",
+  "auto_paid_runs", "auto_paid_posted"];
 
 export class Ops {
   constructor(db, now = () => Math.floor(Date.now() / 1000)) {
@@ -151,10 +164,10 @@ export class Ops {
     const r = await this.run(
       "INSERT INTO content_items (kind, target, text, media_url, options_json, correct_option, explanation, multiple_answers, " +
       "close_after_minutes, star_count, button_text, button_url, use_caption_library, status, scheduled_at, created_by, created_at, updated_at, " +
-      "expire_after_minutes, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)",
+      "expire_after_minutes, source, hashtags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers,
       v.close_after_minutes, v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, actor, now, now,
-      v.expire_after_minutes, String(data.source || "").slice(0, 200));
+      v.expire_after_minutes, String(data.source || "").slice(0, 200), v.hashtags);
     const id = r.meta.last_row_id;
     await this.audit(actor, "content_create", `#${id} ${v.kind} -> ${v.target}`);
     return this.content(id);
@@ -170,9 +183,9 @@ export class Ops {
     const v = validateContent({ ...item, options: JSON.parse(item.options_json), ...data });
     await this.run(
       "UPDATE content_items SET kind=?, target=?, text=?, media_url=?, options_json=?, correct_option=?, explanation=?, multiple_answers=?, " +
-      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, updated_at=? WHERE id=?",
+      "close_after_minutes=?, star_count=?, button_text=?, button_url=?, use_caption_library=?, scheduled_at=?, expire_after_minutes=?, hashtags=?, updated_at=? WHERE id=?",
       v.kind, v.target, v.text, v.media_url, v.options_json, v.correct_option, v.explanation, v.multiple_answers, v.close_after_minutes,
-      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, this.now(), Number(id));
+      v.star_count, v.button_text, v.button_url, v.use_caption_library, v.scheduled_at, v.expire_after_minutes, v.hashtags, this.now(), Number(id));
     await this.audit(actor, "content_update", `#${id}`);
     return this.content(id);
   }
@@ -266,9 +279,9 @@ export class Ops {
   async touchProfile(userId, username = "", firstName = "", source = "", now = this.now()) {
     await this.run(
       "INSERT INTO profiles (user_id, username, first_name, source, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?) " +
-      "ON CONFLICT(user_id) DO UPDATE SET username = CASE WHEN excluded.username != '' THEN excluded.username ELSE username END, " +
-      "first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE first_name END, " +
-      "source = CASE WHEN source = '' THEN excluded.source ELSE source END, last_seen = excluded.last_seen",
+      "ON CONFLICT(user_id) DO UPDATE SET username = CASE WHEN excluded.username != '' THEN excluded.username ELSE profiles.username END, " +
+      "first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE profiles.first_name END, " +
+      "source = CASE WHEN profiles.source = '' THEN excluded.source ELSE profiles.source END, last_seen = excluded.last_seen",
       userId, username || "", firstName || "", source || "", now, now);
   }
   async updateProfile(userId, tags, notes, actor) {
@@ -363,13 +376,26 @@ export class Ops {
   async deleteModerationRule(id, actor) { await this.run("DELETE FROM moderation_rules WHERE id=?", Number(id)); await this.audit(actor, "moderation_rule_delete", `#${id}`); }
   moderationLog(limit = 200) { return this.all("SELECT * FROM moderation_log ORDER BY id DESC LIMIT ?", limit); }
 
+  // Backup: every dashboard table as JSON (sessions and login failures left out: they are short-lived security data).
+  async exportAll() {
+    const out = { format: "shakhira-backup-v1", exported_at: this.now(), tables: {} };
+    for (const t of BACKUP_TABLES) out.tables[t] = await this.all(`SELECT * FROM ${t}`);
+    return out;
+  }
+
   // Analytics
   async analytics(now, days = 30) {
     const start = now - days * 86400;
-    const revenue = await this.all(
-      "SELECT date(created_at, 'unixepoch') AS day, SUM(amount) AS stars, COUNT(*) AS payments FROM payments " +
-      "WHERE created_at >= ? AND currency='XTR' AND (status IS NULL OR status='accepted') GROUP BY day ORDER BY day", start);
-    const t = (await this.one("SELECT COUNT(*) AS started, SUM(status='converted') AS converted, SUM(status='active') AS active, SUM(joined_at IS NOT NULL) AS joined FROM trials WHERE starts_at >= ?", start)) || {};
+    // Grouped by UTC day here rather than in SQL, so the same code runs on D1 (SQLite) and Supabase (Postgres).
+    const byDay = new Map();
+    for (const p of await this.all("SELECT created_at, amount FROM payments WHERE created_at >= ? AND currency='XTR' AND (status IS NULL OR status='accepted')", start)) {
+      const day = new Date(Number(p.created_at) * 1000).toISOString().slice(0, 10);
+      const d = byDay.get(day) || { day, stars: 0, payments: 0 };
+      d.stars += Number(p.amount); d.payments += 1; byDay.set(day, d);
+    }
+    const revenue = [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1));
+    const n = (expr) => `SUM(CASE WHEN ${expr} THEN 1 ELSE 0 END)`;
+    const t = (await this.one(`SELECT COUNT(*) AS started, ${n("status='converted'")} AS converted, ${n("status='active'")} AS active, ${n("joined_at IS NOT NULL")} AS joined FROM trials WHERE starts_at >= ?`, start)) || {};
     const posts = await this.all("SELECT kind, COUNT(*) AS count FROM content_items WHERE status='posted' AND posted_at >= ? GROUP BY kind", start);
     const polls = (await this.all("SELECT id, kind, text, poll_results_json, target FROM content_items WHERE poll_results_json IS NOT NULL ORDER BY poll_closed_at DESC LIMIT 10"))
       .map((r) => ({ id: r.id, kind: r.kind, question: r.text, target: r.target, ...JSON.parse(r.poll_results_json) }));

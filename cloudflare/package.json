@@ -5,6 +5,7 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "test:supabase": "TEST_DB=supabase node --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
     "deploy:staging": "node build.mjs && wrangler deploy"
   },
   "devDependencies": {

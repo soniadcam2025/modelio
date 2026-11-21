@@ -1,0 +1,13 @@
+{
+  "name": "shakhira-admin-vercel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "cd ../cloudflare && node build.mjs && cd ../vercel && node build.mjs",
+    "deploy": "npm run build && vercel deploy --prebuilt --prod"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "vercel": "48.2.0"
+  }
+}
