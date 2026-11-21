@@ -207,3 +207,16 @@ test("Bot & channels shows each channel's reaction settings from Telegram (read-
     assert.equal(t.channels.public.reactions, "all");
   } finally { globalThis.fetch = orig; }
 });
+
+test("live mode: a post type the bot isn't permitted to send can't be queued (paid media stays off)", async () => {
+  const e = env({ REQUIRE_PREVIEW: "false" }), s = await login(e);
+  const bot = (await call(e, s, "/api/bots", "POST", { token: TOKEN, password: PASSWORD })).body;
+  await call(e, s, `/api/bots/${bot.id}/permissions`, "PUT", { permissions: { posts: true, polls: true, promos: true, paid_media: false } });
+  const paid = (await call(e, s, "/api/content", "POST", { kind: "paid_media", target: "vip", media_url: "https://res.cloudinary.com/x/p.jpg", star_count: 5 })).body;
+  const r = await call(e, s, `/api/content/${paid.id}/publish`, "POST", { confirm: true });
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /not permitted to publish paid media/);
+  assert.equal((await call(e, s, `/api/content/${paid.id}/schedule`, "POST", { confirm: true, scheduled_at: 2_000_000_000 })).status, 400);
+  const txt = (await call(e, s, "/api/content", "POST", { kind: "text", target: "public", text: "ok" })).body;
+  assert.equal((await call(e, s, `/api/content/${txt.id}/publish`, "POST", { confirm: true })).status, 200);
+});
