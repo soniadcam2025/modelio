@@ -93,3 +93,31 @@ export function libraryEntries(assets, limit = 200) {
       bytes: a.bytes, created_at: a.created_at, caption: a.caption, note: note || "" };
   });
 }
+
+// ---- Direct uploads from the dashboard (signed by the Worker; the API secret never reaches the browser) ----
+// Uploads land in the dashboard's own folder or the paid-media folder; `tgpub` (the GitHub auto-poster's queue)
+// can receive uploads but nothing is ever deleted from it here.
+export const ADMIN_MEDIA_FOLDER = "shakhira_admin";
+export const UPLOAD_TAG = "shakhira_admin";
+
+async function sha1Hex(text) {
+  const d = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+// Cloudinary's signature: SHA-1 of the sorted "key=value" pairs joined with "&", followed by the API secret.
+export async function signParams(params, secret) {
+  const base = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join("&");
+  return sha1Hex(base + secret);
+}
+export async function uploadSignature(cfg, folder, now = Math.floor(Date.now() / 1000)) {
+  const params = { asset_folder: folder, folder, tags: UPLOAD_TAG, timestamp: now };
+  return { upload_url: `https://api.cloudinary.com/v1_1/${encodeURIComponent(cfg.cloud)}/auto/upload`, api_key: cfg.key,
+    ...params, signature: await signParams(params, cfg.secret) };
+}
+export async function deleteAsset(cfg, publicId, resourceType, fetchImpl = fetch) {
+  const url = `https://api.cloudinary.com/v1_1/${encodeURIComponent(cfg.cloud)}/resources/${resourceType === "video" ? "video" : "image"}/upload?public_ids[]=${encodeURIComponent(publicId)}`;
+  const r = await fetchImpl(url, { method: "DELETE", headers: { authorization: "Basic " + btoa(`${cfg.key}:${cfg.secret}`) } });
+  if (!r.ok) throw new Error(`Cloudinary ${r.status}`);
+  const body = await r.json();
+  return body.deleted?.[publicId] === "deleted";
+}

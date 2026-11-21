@@ -53,6 +53,45 @@ There is still exactly **one Telegram webhook receiver**: the live bot `shakhira
 | **L8** | Join requests, moderation, reactions | Claude | Change the live bot, following `LIVE_BOT_INTEGRATION.md`: about 15 lines plus a service binding. Then switch on **join_requests**, **moderation** and **reaction_tracking**. | Roll back the bot version in Cloudflare. |
 | **L9** | Retire Vercel staging | Claude | Delete the Vercel project once the production Worker has run for a week. | Redeploy from `vercel/` in one command. |
 
+## Content management (built 21 Nov 2026): activation order
+
+Everything below works in the dashboard now. While posting is locked, nothing reaches a channel.
+
+1. **Connect the bot and Cloudinary**
+   - **Owner:** you.
+   - **Where:** Bots & integrations → Add bot (@ShakhiraVIPBot's token) and Cloudinary → Connect.
+   - **Effect:** uploads and the media library start working.
+2. **Private preview**
+   - **Owner:** you.
+   - **Steps:**
+     1. Send `/start` to @ShakhiraVIPBot from your own account.
+     2. In Automation → Private preview chat, enter your Telegram user ID and confirm with your password.
+   - **Result:** the dashboard is in **preview mode**. **Send preview to me** and every scheduled post go only to your chat. Members receive nothing, and member actions and reminders stay off.
+3. **Your check**
+   - **Owner:** you.
+   - **Steps:** create one post of each type and use **Send preview to me**:
+     - text, photo, video, GIF, poll, quiz, VIP promo
+     - paid media at 1 ⭐, with protected content on
+   - **Check:** the paid media shows "⭐ unlock" and can't be forwarded.
+4. **Production switch**
+   - **Owner:** Claude, after you approve in writing.
+   - **Steps:**
+     1. Set `REQUIRE_PREVIEW = "false"` in `wrangler.production.toml` and deploy.
+     2. In the dashboard, switch on **scheduled_posts**. Switch on **poll_auto_close**, **post_expiry** and **auto_paid_media** only if wanted.
+   - **Confirmation:** every real **Publish now**, **Schedule** and **Retry** asks for confirmation, and the server rejects unconfirmed requests in live mode.
+   - **Not affected:** reminders, member actions and member-changing features stay locked by their own switches and the primary bot's `member_actions` permission.
+   - **Undo:** Automation → pause *Dashboard posting* (instant), or redeploy with `REQUIRE_PREVIEW = "true"`.
+5. **GitHub poster pause switch (optional)**
+   - **Owner:** you.
+   - **Step:** add the GitHub secret `POSTER_CONTROL_URL` = `<dashboard URL>/api/public/automation`.
+   - **Effect:** Automation → *GitHub auto-poster* then pauses or resumes the 5 AM / 10 PM job.
+   - **Fail-safe:** if the dashboard is unreachable, the job posts as normal.
+
+**Paid media is not view-once**
+- Telegram's native paid media (`sendPaidMedia`) lets everyone who paid open it again at any time.
+- *Protected content* stops forwarding and saving in Telegram apps, but not screenshots or screen recording.
+- *Delete automatically after* (up to 48 hours) removes the post from the channel.
+
 ## Bots & integrations (multi-bot)
 
 **What it does**

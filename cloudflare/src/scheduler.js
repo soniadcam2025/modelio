@@ -34,21 +34,23 @@ export async function sendItem(tg, config, item, text) {
   const chat_id = targetChat(config, item.target);
   const reply_markup = markup(item, config);
   const caption = text || undefined;
+  // Telegram's "protected content": no forwarding or saving in official apps. Screenshots and other apps can still copy it.
+  const protect_content = Number(item.protect_content) ? true : undefined;
   switch (item.kind) {
-    case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup });
-    case "photo": return tg.call("sendPhoto", { chat_id, photo: item.media_url, caption, reply_markup });
-    case "video": return tg.call("sendVideo", { chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true });
-    case "animation": return tg.call("sendAnimation", { chat_id, animation: item.media_url, caption, reply_markup });
+    case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content });
+    case "photo": return tg.call("sendPhoto", { chat_id, photo: item.media_url, caption, reply_markup, protect_content });
+    case "video": return tg.call("sendVideo", { chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
+    case "animation": return tg.call("sendAnimation", { chat_id, animation: item.media_url, caption, reply_markup, protect_content });
     case "poll": case "quiz": {
       const params = { chat_id, question: text, options: JSON.parse(item.options_json).map((t) => ({ text: t })),
-        is_anonymous: true, allows_multiple_answers: !!item.multiple_answers };
+        is_anonymous: true, allows_multiple_answers: !!item.multiple_answers, protect_content };
       if (item.kind === "quiz") Object.assign(params, { type: "quiz", correct_option_id: item.correct_option, explanation: item.explanation || undefined });
       return tg.call("sendPoll", params);
     }
     case "paid_media": {
       const path = item.media_url.toLowerCase().split("?")[0];
       const type = VIDEO_EXT.some((e) => path.endsWith(e)) ? "video" : "photo";
-      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption });
+      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption, protect_content });
     }
     default: throw new Error(`Unknown content kind ${item.kind}`);
   }
@@ -99,6 +101,7 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}, b
       continue;
     }
     const status = result?.simulated ? "simulated" : "posted";
+    if (item.repeat_json) await ops.scheduleNextOccurrence(item, now);
     await ops.run("UPDATE content_items SET status=?, message_id=?, posted_at=?, last_error=?, text=?, updated_at=? WHERE id=?",
       status, result?.message_id ?? null, now, result?.simulated ? "Simulated in staging: nothing was sent to Telegram" : "", text, now, item.id);
     counts[status]++;
@@ -278,6 +281,8 @@ export async function runCycle(tg, ops, config, now, alert, { listAssets = null,
   const summary = {};
   const f = await ops.features();
   const on = (name) => !!f[name]?.enabled;
+  // Master pause (Automation page): nothing is sent while paused; read-only work (sync, backups) continues.
+  const paused = (await ops.getSetting("automation_paused", "0")) === "1";
   if (liveDb && on("member_sync")) {
     try { summary.member_sync = await syncLiveBot(liveDb, ops, now); } catch (e) { summary.member_sync = { error: String(e.message).slice(0, 200) }; }
   }
@@ -286,6 +291,7 @@ export async function runCycle(tg, ops, config, now, alert, { listAssets = null,
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
   if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
+  if (paused) { summary.paused = true; return summary; }
   // Primary bot (@ShakhiraVIPBot): runs unless it is registered with its automation switched off.
   const primary = bots.find((b) => Number(b.is_primary));
   const primaryScope = { primary: true, primaryId: primary?.id ?? null, bot: primary || null };

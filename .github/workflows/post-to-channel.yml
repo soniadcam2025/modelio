@@ -76,6 +76,9 @@ jobs:
           # Scheduled runs have no inputs, so they always post.
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'post' }}
           TEST_CHANNEL: ${{ inputs.channel }}
+          # Optional pause switch from the admin dashboard (its /api/public/automation URL, kept as a secret).
+          # Unset or unreachable = post as normal.
+          POSTER_CONTROL_URL: ${{ secrets.POSTER_CONTROL_URL }}
         run: |
           args=()
           case "$MODE" in

@@ -257,3 +257,14 @@ button.primary {
   .card, .nav, .login .card, dialog, .toast { background: var(--surface); }
 }
 @media (prefers-reduced-motion: reduce) { .nav a { transition: none; } }
+
+/* Content management additions */
+.post-preview { white-space: normal; }
+.post-preview img, .post-preview video { max-width: 100%; max-height: 260px; border-radius: 12px; display: block; margin: 8px 0; }
+.post-preview .pre { white-space: pre-wrap; }
+.paid-badge { display: inline-block; margin: 6px 0; padding: 2px 10px; border-radius: 999px; background: var(--warn-bg); color: var(--warn); font-weight: 600; }
+.media-tile video { width: 100%; max-height: 160px; border-radius: 10px; }
+.media-tile.pick { text-align: left; padding: 6px; }
+.picker { margin-top: 16px; border-top: 1px solid var(--glass-edge); padding-top: 12px; }
+label.btn { cursor: pointer; }
+label.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }

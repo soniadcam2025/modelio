@@ -57,6 +57,21 @@ def github_run_time(http: httpx.Client, repository: str, token: str):
     return lookup
 
 
+def dashboard_paused(http: httpx.Client, url: str) -> bool:
+    """True only when the admin dashboard explicitly says the poster is paused.
+
+    Fail-open: if the dashboard can't be reached or answers anything else, the post goes ahead as scheduled,
+    so the 5 AM / 10 PM posts never depend on the dashboard being up.
+    """
+    if not url:
+        return False
+    try:
+        r = http.get(url, timeout=10.0)
+        return r.status_code == 200 and r.json().get("poster_paused") is True
+    except Exception:  # noqa: BLE001 - any failure means "not paused"
+        return False
+
+
 def main(argv: list[str] | None = None, env: dict | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m poster")
     parser.add_argument("--dry-run", action="store_true", help="choose an asset but do not post or tag anything")
@@ -113,6 +128,12 @@ def main(argv: list[str] | None = None, env: dict | None = None) -> int:
                          text, env)
             return 0
 
+        # Pause switch in the admin dashboard (Automation → GitHub poster). Only scheduled production posts.
+        if slot and not args.dry_run and not channel and dashboard_paused(http, (env.get("POSTER_CONTROL_URL") or "").strip()):
+            log.warning("Paused from the admin dashboard: slot %s skipped (nothing posted, nothing tagged)", slot)
+            monitor.emit([monitor.annotation("warning", "Poster paused", f"Slot {slot} skipped: paused in the admin dashboard")],
+                         f"Slot {slot} skipped: the poster is paused in the admin dashboard.", env)
+            return 0
         result = runner.run(cfg, source, publisher, http, dry_run=args.dry_run, channel=channel, slot=slot,
                             run_time=run_time)
         target = channel or cfg.public_channel

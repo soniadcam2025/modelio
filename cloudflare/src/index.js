@@ -8,9 +8,9 @@ import { BotStore, PERMISSIONS } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
-import { runCycle } from "./scheduler.js";
+import { runCycle, sendItem } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
-import { cloudinaryConfig, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory } from "./cloudinary.js";
+import { ADMIN_MEDIA_FOLDER, cloudinaryConfig, deleteAsset, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory, uploadSignature } from "./cloudinary.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
@@ -27,7 +27,13 @@ export function getDB(env) {
 // Credentials saved in Settings → Bots & integrations (encrypted) fill in what the Worker secrets don't set.
 // Worker secrets always win. Returns a copy; the original env is never modified.
 export async function effectiveEnv(env, ops) {
-  if (!env.CREDENTIALS_KEY) return env;
+  if (!env.CREDENTIALS_KEY) {
+    if (String(env.REQUIRE_PREVIEW || "true").toLowerCase() === "true" && !String(env.PREVIEW_CHAT_ID || "").trim()) {
+      const chat = await ops.getSetting("preview_chat_id").catch(() => null);
+      if (chat) return { ...env, PREVIEW_CHAT_ID: chat };
+    }
+    return env;
+  }
   const store = new BotStore(ops, env, { botUsername: env.BOT_USERNAME });
   const eff = { ...env };
   const needToken = !env.BOT_TOKEN, needCloud = !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET);
@@ -36,6 +42,11 @@ export async function effectiveEnv(env, ops) {
     needCloud ? store.cloudinaryCreds().catch(() => null) : null,
   ]);
   if (token) eff.BOT_TOKEN = token;
+  // While the preview lock is on, the preview chat saved in the dashboard (your own Telegram chat) is used.
+  if (String(env.REQUIRE_PREVIEW || "true").toLowerCase() === "true" && !String(env.PREVIEW_CHAT_ID || "").trim()) {
+    const chat = await ops.getSetting("preview_chat_id").catch(() => null);
+    if (chat) eff.PREVIEW_CHAT_ID = chat;
+  }
   if (cloud) Object.assign(eff, { CLOUDINARY_CLOUD_NAME: cloud.cloud, CLOUDINARY_API_KEY: cloud.key, CLOUDINARY_API_SECRET: cloud.secret });
   return eff;
 }
@@ -76,7 +87,7 @@ async function cycleAuthorized(request, env, now) {
 }
 export const SECURITY_HEADERS = {
   "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; media-src https:; style-src 'self'; " +
-    "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "script-src 'self'; connect-src 'self' https://api.cloudinary.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   "X-Frame-Options": "DENY",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
@@ -250,7 +261,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots", "content_v2"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now();
@@ -279,7 +290,111 @@ function routes() {
     return json(contentOut(item));
   });
   add("PUT", "/api/content/(\\d+)", async (c, m) => json(contentOut(await c.ops.updateContent(m[1], await body(c.request), c.actor))));
-  add("POST", "/api/content/(\\d+)/schedule", async (c, m) => json(contentOut(await c.ops.scheduleContent(m[1], (await body(c.request)).scheduled_at, c.actor))));
+  // Real publishing (live mode) needs an explicit confirmation on every schedule / publish request.
+  const confirmIfLive = (c, b) => {
+    if (automationMode(c.env, c.config) === "live" && b.confirm !== true)
+      throw new OpsError("Confirm that this post will be published to the channel");
+  };
+  add("POST", "/api/content/(\\d+)/schedule", async (c, m) => {
+    const b = await body(c.request); confirmIfLive(c, b);
+    if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} scheduled`);
+    return json(contentOut(await c.ops.scheduleContent(m[1], b.scheduled_at, c.actor)));
+  });
+  add("POST", "/api/content/(\\d+)/publish", async (c, m) => {
+    const b = await body(c.request); confirmIfLive(c, b);
+    if (b.confirm === true) await c.ops.audit(c.actor, "publish_confirmed", `#${m[1]} now`);
+    return json(contentOut(await c.ops.scheduleContent(m[1], c.ops.now(), c.actor)));
+  });
+  add("POST", "/api/content/(\\d+)/stop-series", async (c, m) => json(await c.ops.stopSeries(m[1], c.actor)));
+  // Send one post to YOUR preview chat only (never a channel), with the post's bot. Nothing is marked as posted.
+  add("POST", "/api/content/(\\d+)/preview", async (c, m) => {
+    const item = await c.ops.content(m[1]);
+    if (!item) throw new OpsError("Not found");
+    const chat = await c.ops.getSetting("preview_chat_id");
+    if (!chat) throw new OpsError("Set your preview chat (your Telegram user ID) in Automation first");
+    if (item.last_preview_at && c.ops.now() - Number(item.last_preview_at) < 15) throw new OpsError("Wait a few seconds between previews");
+    let token = null;
+    if (item.bot_id) token = await new BotStore(c.ops, c.env, { botUsername: c.config.botUsername }).token(item.bot_id).catch(() => null);
+    else token = c.env.BOT_TOKEN || null;
+    if (!token) throw new OpsError("Connect this post's bot (Bots & integrations) to send a preview");
+    await c.ops.run("UPDATE content_items SET last_preview_at = ? WHERE id = ?", c.ops.now(), item.id);
+    const tg = new SendOnlyTelegram({ token, previewChatId: chat, requirePreview: true });
+    let text = item.text || (item.use_caption_library ? "[a caption from the library is added when published]" : "");
+    if (item.hashtags && !["poll", "quiz"].includes(item.kind)) text = text ? `${text}\n\n${item.hashtags}` : item.hashtags;
+    try {
+      const r = await sendItem(tg, { ...c.config, previewChatId: chat }, item, text);
+      await c.ops.audit(c.actor, "content_preview", `#${item.id} sent to the preview chat`);
+      return json({ ok: true, message_id: r?.message_id ?? null });
+    } catch (e) {
+      await c.ops.audit(c.actor, "content_preview_failed", `#${item.id}: ${String(e.message).slice(0, 150)}`);
+      throw new OpsError(`Preview failed: ${String(e.message).slice(0, 150)}. Did you send /start to the bot from that account?`);
+    }
+  });
+
+  // ---- Automation controls ----
+  add("GET", "/api/automation", async (c) => {
+    const [paused, poster, chat] = await Promise.all(["automation_paused", "poster_paused", "preview_chat_id"].map((k) => c.ops.getSetting(k)));
+    return json({ automation_paused: paused === "1", poster_paused: poster === "1", preview_chat_id: chat || null,
+      mode: automationMode(c.env, c.config), require_preview: c.config.requirePreview,
+      poster_control_path: "/api/public/automation", poster_slots_ist: c.config.slotTimes.map(slotLabel) });
+  });
+  add("PUT", "/api/automation", async (c) => {
+    const b = await body(c.request);
+    for (const k of ["automation_paused", "poster_paused"]) if (k in b) {
+      await c.ops.setSetting(k, b[k] ? "1" : "0");
+      await c.ops.audit(c.actor, b[k] ? `${k.replace("_paused", "")}_pause` : `${k.replace("_paused", "")}_resume`, "");
+    }
+    return json({ ok: true });
+  });
+  add("PUT", "/api/automation/preview-chat", async (c) => {
+    const b = await body(c.request); await fresh(c, b);
+    const chat = String(b.preview_chat_id ?? "").trim();
+    if (chat && !/^-?\d{5,20}$/.test(chat)) throw new OpsError("Use your numeric Telegram user ID (from @userinfobot)");
+    await c.ops.setSetting("preview_chat_id", chat);
+    await c.ops.audit(c.actor, "preview_chat_set", chat ? `ends ${chat.slice(-3)}` : "cleared");
+    return json({ preview_chat_id: chat || null });
+  });
+  // Read by the GitHub poster before each scheduled post (fail-open). Contains nothing private.
+  add("GET", "/api/public/automation", async (c) => json({ poster_paused: (await c.ops.getSetting("poster_paused")) === "1" }), { auth: false });
+
+  // ---- Media library: direct uploads to Cloudinary ----
+  const mediaCfg = (c) => { const cfg = cloudinaryConfig(c.env); if (!cfg) throw new OpsError("Connect Cloudinary in Bots & integrations first"); return cfg; };
+  const uploadFolders = async (c) => {
+    const paid = (await c.ops.paidMediaConfig()).folder;
+    return [{ folder: ADMIN_MEDIA_FOLDER, label: "Dashboard library", deletable: true },
+      ...(paid ? [{ folder: paid, label: "Paid media (automation folder)", deletable: true }] : []),
+      { folder: GITHUB_POSTER_FOLDER, label: "GitHub auto-poster queue (5 AM / 10 PM)", deletable: false }];
+  };
+  add("GET", "/api/media/folders", async (c) => json(await uploadFolders(c)));
+  add("POST", "/api/media/upload-signature", async (c) => {
+    const cfg = mediaCfg(c), b = await body(c.request);
+    const f = (await uploadFolders(c)).find((x) => x.folder === b.folder);
+    if (!f) throw new OpsError("Choose a folder");
+    await c.ops.audit(c.actor, "media_upload_start", f.folder);
+    return json(await uploadSignature(cfg, f.folder));
+  });
+  add("GET", "/api/media/library", async (c) => {
+    const cfg = mediaCfg(c), folder = c.url.searchParams.get("folder") || ADMIN_MEDIA_FOLDER;
+    const f = (await uploadFolders(c)).find((x) => x.folder === folder);
+    if (!f) throw new OpsError("Unknown folder");
+    const [assets, scheduled] = await Promise.all([listFolder(cfg, folder),
+      c.ops.all("SELECT media_url FROM content_items WHERE status IN ('scheduled','draft','sending') AND media_url != ''")]);
+    const inUse = new Set(scheduled.map((r) => r.media_url));
+    return json({ folder: f, items: assets.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 200).map((a) => ({
+      public_id: a.public_id, resource_type: a.resource_type, format: a.format, bytes: a.bytes, url: a.secure_url, created_at: a.created_at,
+      in_use: inUse.has(a.secure_url) })) });
+  });
+  add("POST", "/api/media/delete", async (c) => {
+    const cfg = mediaCfg(c), b = await body(c.request);
+    const id = String(b.public_id || "");
+    const f = (await uploadFolders(c)).find((x) => x.deletable && id.startsWith(x.folder + "/"));
+    if (!f || id.startsWith(GITHUB_POSTER_FOLDER + "/")) throw new OpsError("Only media in the dashboard library or the paid-media folder can be removed here");
+    const used = await c.ops.one("SELECT id FROM content_items WHERE status IN ('scheduled','draft','sending') AND media_url LIKE ?", `%/${id}.%`);
+    if (used) throw new OpsError(`Post #${used.id} still uses this file`);
+    if (!(await deleteAsset(cfg, id, b.resource_type))) throw new OpsError("Cloudinary did not delete it");
+    await c.ops.audit(c.actor, "media_delete", id);
+    return json({ ok: true });
+  });
   add("POST", "/api/content/(\\d+)/cancel", async (c, m) => json(contentOut(await c.ops.cancelContent(m[1], c.actor))));
   add("POST", "/api/content/(\\d+)/duplicate", async (c, m) => json(contentOut(await c.ops.duplicateContent(m[1], c.actor))));
   add("DELETE", "/api/content/(\\d+)", async (c, m) => { await c.ops.deleteContent(m[1], c.actor); return json({ ok: true }); });
@@ -367,7 +482,7 @@ export async function handleApi(request, env, now = () => Math.floor(Date.now() 
   let sessions, db;
   try { db = getDB(env); sessions = new Sessions(env.DASHBOARD_SECRET, db, now); } catch (e) { return err("Dashboard is not configured: " + e.message, 503); }
   const c = { request, env, url, config, sessions, limiter: new LoginLimiter(db, now), ops: new Ops(db, now), actor: config.adminName, token: null };
-  try { c.env = await effectiveEnv(env, c.ops); } catch { /* the database check in /api/health reports problems */ }
+  try { c.env = await effectiveEnv(env, c.ops); c.config = loadConfig(c.env); } catch { /* the database check in /api/health reports problems */ }
   if (route.auth) {
     c.token = readCookie(request, SESSION_COOKIE);
     if (!(await sessions.valid(c.token))) return err("Please sign in", 401);

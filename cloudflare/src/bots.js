@@ -156,7 +156,12 @@ export class BotStore {
     if (!/^(@[A-Za-z0-9_]{5,32}|-?\d{5,20})$/.test(chatId)) throw new OpsError("Use the channel's @username or numeric ID");
     const owner = await this.ops.one("SELECT bot_id FROM bot_channels WHERE chat_id = ?", chatId);
     if (owner) throw new OpsError(Number(owner.bot_id) === Number(b.id) ? "Already assigned to this bot" : "That channel belongs to another bot");
-    const chat = await tgGet(this.fetch, await this.token(id), "getChat", { chat_id: chatId });
+    const token = await this.token(id);
+    const chat = await tgGet(this.fetch, token, "getChat", { chat_id: chatId });
+    // The bot must be an admin that can post there; otherwise publishing would fail later.
+    const me = await tgGet(this.fetch, token, "getChatMember", { chat_id: chatId, user_id: Number(b.bot_user_id) });
+    if (!["administrator", "creator"].includes(me.status)) throw new OpsError(`@${b.username} is not an admin of ${chat.title || chatId}`);
+    if (chat.type === "channel" && me.can_post_messages === false) throw new OpsError(`@${b.username} can't post in ${chat.title || chatId}`);
     const k = ["public", "vip"].includes(kind) && Number(b.is_primary) ? kind : "channel";
     if (k !== "channel" && (await this.ops.one("SELECT id FROM bot_channels WHERE kind = ?", k))) throw new OpsError(`A ${k} channel is already assigned`);
     await this.ops.run("INSERT INTO bot_channels (bot_id, chat_id, title, kind, created_at) VALUES (?, ?, ?, ?, ?)", b.id, chatId, chat.title || chatId, k, this.ops.now());
