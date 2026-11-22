@@ -193,12 +193,17 @@ To restore from a downloaded file instead of D1, use `--file backup.json` in pla
 - **GitHub poster:** its 5 AM / 10 PM IST schedule and smart rotation.
 - **Paid services:** none are activated.
 
-## Social media dashboard (22 Nov 2026)
+## Telegram-only dashboard and photo fix (22 Nov 2026)
 
-**Navigation:** Overview (all platforms) · Social media → Telegram (Overview, Bots & channels, Create post, Scheduled posts, Media library, Paid media, VIP subscribers, Join requests, Moderation, Automations, Features & settings, Analytics) · Social media → My.Club (Overview, Connection, Create post, Scheduled content, Media library, Paid content, Subscribers, Analytics) · Unified calendar · Shared media library · Integrations · Security & backups · Activity log. Old links (`#content`, `#media`, `#bots`…) still work. Groups collapse and remember their state; on phones the sidebar is a slide-in menu.
+**My.Club removed** from the dashboard at the owner's request: no menus, pages, routes or API. Its saved data stays in the `myclub:workspace` setting (in every backup); `src/myclub.js` is kept, unused, for a possible restore.
 
-**My.Club limits (checked 22 Nov 2026):** My.Club publishes no public API for sign-in, publishing or statistics, so the dashboard never logs in to or posts on My.Club and stores no My.Club credentials. Workflow: draft here → Export (caption, media links, price, steps) → schedule in My.Club's own planner → mark *Scheduled in My.Club* / *Published*. Subscriber and revenue figures are entered manually as snapshots.
+**Navigation:** Overview · Publishing (Create post, Scheduled posts, Calendar, Media library, Paid media) · VIP audience (Subscribers, Join requests, Moderation) · Automation (Automations, Features & settings, Bots & channels) · Analytics · System (Security & backups, Activity log). Old links still work.
 
-**Separation:** My.Club data lives in the single settings key `myclub:workspace` (already in every backup). The Telegram scheduler never reads it; no schema change; Telegram posting is unaffected. The unified calendar and shared media library reference items, never copy them.
-
-**Deploy (UI + API only, no migration):** `npm run deploy:staging`, check, then `npm run deploy:production`. Rollback: `wrangler rollback -c wrangler.production.toml`.
+**Photo posts (`sendPhoto: failed to get HTTP URL content`):**
+- **Root cause (checked 22 Nov 2026):** the Cloudinary account `m4upuaai` now refuses public delivery. Every `res.cloudinary.com` image answers **HTTP 401, `x-cld-error: ACL deny`**, including photos that posted fine on 21 Nov. Telegram downloads photo links itself, so it gets the 401 and reports this error.
+- **Fix:**
+  1. Cloudinary photos are requested as a JPEG of at most 2560 px.
+  2. If Telegram refuses the link (400), the Worker downloads the image itself: first the public link, then Cloudinary's **signed Admin-API download** using the dashboard's own Cloudinary keys, which isn't affected by the delivery restriction.
+  3. It checks the real bytes (JPEG/PNG/WebP/GIF, ≤ 10 MB) and uploads the file. The same applies to paid-media photos and private previews.
+- **No duplicates:** a 400 means nothing was posted, so the fallback can't post twice.
+- **No automatic retries:** failed posts are never retried automatically; use **Retry**.
