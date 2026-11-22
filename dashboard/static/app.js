@@ -1018,7 +1018,8 @@ async function uploadFolderFor(kind, target, file) {
   return src[`${t}_${video ? "videos" : "photos"}`] || `${t}/${video ? "videos" : "photos"}`;
 }
 
-const fileUrl = (key, download = false) => `/api/media/file?key=${encodeURIComponent(key)}${download ? "&download=1" : ""}`;
+// v = the file's upload time: a name reused after a delete gets a new URL, so the browser never shows the old file.
+const fileUrl = (key, download = false, v = 0) => `/api/media/file?key=${encodeURIComponent(key)}${download ? "&download=1" : ""}${v ? `&v=${v}` : ""}`;
 const isVideoRef = (ref) => /\.(mp4|mov|webm)(\?|$)/i.test(ref);
 const mb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 const KIND_NAME = { image: "Photo", gif: "GIF", video: "Video" };
@@ -1084,7 +1085,7 @@ async function putThumb(key, jpeg) {
   await fetch(`/api/media/thumb?key=${encodeURIComponent(key)}`, { method: "PUT", body: jpeg, credentials: "same-origin", headers: { "X-CSRF-Token": state.csrf || "" } });
 }
 async function saveThumbFromFile(file, key) { await putThumb(key, await thumbFromBlob(file, file.type)); }
-const thumbUrl = (key) => `/api/media/thumb?key=${encodeURIComponent(key)}`;
+const thumbUrl = (key, v = 0) => `/api/media/thumb?key=${encodeURIComponent(key)}${v ? `&v=${v}` : ""}`;
 
 // Older files without a thumbnail: made once, only when the card is on screen, two at a time.
 const backfill = { queue: [], running: 0 };
@@ -1097,7 +1098,7 @@ function pumpBackfill() {
     const [m, img] = backfill.queue.shift();
     backfill.running++;
     (async () => {
-      const res = await fetch(fileUrl(m.key), { credentials: "same-origin" });
+      const res = await fetch(fileUrl(m.key, false, m.uploaded), { credentials: "same-origin" });
       const jpeg = await thumbFromBlob(await res.blob(), m.type);
       await putThumb(m.key, jpeg);
       img.src = URL.createObjectURL(jpeg); img.classList.remove("ph-img");
@@ -1113,7 +1114,7 @@ const seen = typeof IntersectionObserver === "function" ? new IntersectionObserv
 function thumbEl(m) {
   const img = h("img", { alt: m.name, class: "ph-img", decoding: "async" });
   const load = () => {
-    img.src = thumbUrl(m.key);
+    img.src = thumbUrl(m.key, m.uploaded);
     img.onload = () => img.classList.remove("ph-img");
     img.onerror = () => { img.onerror = null; if (m.size <= 50 * 1024 * 1024) queueBackfill(m, img); };
   };
@@ -1161,7 +1162,7 @@ function lightbox(m) {
   const wrap = h("div", { class: "lightbox", role: "dialog", "aria-label": m.name, onclick: (e) => { if (e.target === wrap) close(); } },
     h("div", { class: "lightbox-bar" }, h("span", { class: "clip" }, `${m.original_name || m.name} · ${mb(m.size)}`),
       h("a", { class: "btn", href: fileUrl(m.key, true) }, "Download"), h("button", { onclick: close }, "✕ Close")),
-    m.kind === "video" ? h("video", { src: fileUrl(m.key), controls: true, autoplay: true }) : h("img", { src: fileUrl(m.key), alt: m.name }));
+    m.kind === "video" ? h("video", { src: fileUrl(m.key, false, m.uploaded), controls: true, autoplay: true }) : h("img", { src: fileUrl(m.key, false, m.uploaded), alt: m.name }));
   const onKey = (e) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", onKey); } };
   document.addEventListener("keydown", onKey);
   document.body.append(wrap);
@@ -1174,11 +1175,13 @@ function menu(items) {
   const btn = h("button", { type: "button", class: "menu-btn-dots", "aria-label": "Actions", "aria-haspopup": "menu", onclick: (e) => {
     e.stopPropagation();
     document.querySelectorAll(".menu-list").forEach((l) => { if (l !== list) l.hidden = true; });
+    document.querySelectorAll(".menu-open").forEach((t) => t.classList.remove("menu-open"));
     list.hidden = !list.hidden;
+    if (!list.hidden) btn.closest(".media-tile")?.classList.add("menu-open"); // above the neighbouring cards
   } }, "⋯");
   return h("div", { class: "menu" }, btn, list);
 }
-document.addEventListener("click", () => document.querySelectorAll(".menu-list").forEach((l) => { l.hidden = true; }));
+document.addEventListener("click", () => { document.querySelectorAll(".menu-list").forEach((l) => { l.hidden = true; }); document.querySelectorAll(".menu-open").forEach((t) => t.classList.remove("menu-open")); });
 
 const PAGE = 60;
 function treeOpen() { try { return JSON.parse(localStorage.getItem("media_tree") || "{}"); } catch { return {}; } }

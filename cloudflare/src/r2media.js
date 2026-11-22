@@ -118,6 +118,7 @@ export class MediaStore {
       if (!(await this.b.head(`${f}/${MARKER}`))) await this.b.put(`${f}/${MARKER}`, "", { customMetadata: { folder: "1" } });
     }
     await this.ops.setSetting("r2:defaults", "1");
+    await this.dirty();
   }
 
   async #all(prefix = "") {
@@ -134,6 +135,7 @@ export class MediaStore {
 
   // Folder counts and storage usage need a full listing, so they are cached (10 min) and cleared on every change.
   async #summary() {
+    await this.ensureDefaults(); // default folders exist before any summary is built or cached
     try {
       const c = JSON.parse((await this.ops.getSetting(SUMMARY_KEY)) || "null");
       if (c && this.ops.now() - c.at < SUMMARY_TTL) return c;

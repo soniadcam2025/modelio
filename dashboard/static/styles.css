@@ -412,3 +412,8 @@ body.composing .drawer-bg { z-index: 45; }
   .upload-row { grid-template-columns: 1fr auto; }
   .media-grid.list .media-tile { grid-template-columns: 28px 56px 1fr auto; }
 }
+
+/* The tile must not clip its action menu (the thumbnail clips itself). */
+.media-grid .media-tile, .picker .media-tile { overflow: visible; }
+.media-grid .media-tile .menu-list { z-index: 35; }
+.media-tile.menu-open { z-index: 40; }

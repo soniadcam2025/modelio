@@ -54,7 +54,8 @@ test("media library end to end (signed-in only)", async () => {
 
   // Delivery: inline, download, range; private caching
   const f = await call(e, s, "/api/media/file?key=" + encodeURIComponent(a.key));
-  assert.equal(f.status, 200); assert.match(f.headers.get("cache-control"), /^private, max-age=/); assert.doesNotMatch(f.headers.get("cache-control"), /public/); assert.equal(f.body.byteLength, 2000);
+  assert.equal(f.status, 200); assert.equal(f.headers.get("cache-control"), "private, no-cache");
+  assert.match((await call(e, s, "/api/media/file?v=1&key=" + encodeURIComponent(a.key))).headers.get("cache-control"), /^private, max-age=/); assert.doesNotMatch(f.headers.get("cache-control"), /public/); assert.equal(f.body.byteLength, 2000);
   assert.match((await call(e, s, `/api/media/file?download=1&key=${encodeURIComponent(a.key)}`)).headers.get("content-disposition"), /^attachment/);
   const part = await worker.fetch(new Request(ORIGIN + "/api/media/file?key=" + encodeURIComponent(v.key), { headers: { cookie: s.cookie, range: "bytes=0-99", "cf-connecting-ip": "7.7.7.7" } }), e);
   assert.equal(part.status, 206); assert.equal((await part.arrayBuffer()).byteLength, 100);
@@ -194,8 +195,9 @@ test("paging, folder-only listing, cached summary refreshed after changes, priva
   assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg", "PUT", JPEG(500), true)).status, 200);
   assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg", "PUT", MP4(), true)).status, 400);
   assert.equal((await call(e, null, "/api/media/thumb?key=public/photos/p1.jpg")).status, 401);
-  const t = await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg");
-  assert.equal(t.status, 200); assert.match(t.headers.get("cache-control"), /^private/);
+  const t = await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg&v=123");
+  assert.equal(t.status, 200); assert.match(t.headers.get("cache-control"), /^private, max-age/);
+  assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg")).headers.get("cache-control"), "private, no-cache", "unversioned URLs are revalidated");
   assert.ok(!(await call(e, s, "/api/media/folders")).body.some((f) => f.path.startsWith("_thumbs")), "thumbnails never listed as a folder");
   assert.equal((await call(e, s, "/api/media/files?recursive=1&q=p1")).body.filter((m) => m.key.includes("_thumbs")).length, 0);
   assert.equal((await call(e, s, "/api/media/file?key=_thumbs/public/photos/p1.jpg")).status, 400, "hidden prefix can't be addressed");
@@ -203,4 +205,11 @@ test("paging, folder-only listing, cached summary refreshed after changes, priva
   assert.equal((await call(e, s, "/api/media/thumb?key=archive/p1.jpg")).status, 200);
   await call(e, s, "/api/media/delete", "POST", { keys: ["archive/p1.jpg"] });
   assert.ok(![...e.MEDIA.store.keys()].some((k) => k.includes("p1.jpg")), "file and thumbnail both deleted");
+});
+
+test("a fresh bucket: status before folders still shows the default folders", async () => {
+  const e = env(); const s = await login(e);
+  assert.equal((await call(e, s, "/api/media/status")).status, 200);
+  const folders = (await call(e, s, "/api/media/folders")).body.map((f) => f.path);
+  for (const f of DEFAULT_FOLDERS) assert.ok(folders.includes(f), f);
 });

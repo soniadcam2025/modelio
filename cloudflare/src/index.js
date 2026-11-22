@@ -424,7 +424,7 @@ function routes() {
     if (m) r = m[2] ? { offset: Number(m[1]), length: Number(m[2]) - Number(m[1]) + 1 } : { offset: Number(m[1]) };
     const o = await media(c).get(qp(c, "key"), r);
     const name = o.key.slice(o.key.lastIndexOf("/") + 1);
-    const h = { "content-type": o.httpMetadata?.contentType || "application/octet-stream", "cache-control": "private, max-age=3600",
+    const h = { "content-type": o.httpMetadata?.contentType || "application/octet-stream", "cache-control": qp(c, "v") ? "private, max-age=3600" : "private, no-cache",
       "accept-ranges": "bytes", "content-disposition": `${qp(c, "download") === "1" ? "attachment" : "inline"}; filename="${name.replace(/"/g, "")}"` };
     if (r && o.range) {
       const start = o.range.offset ?? 0, end = start + (o.range.length ?? o.size - start) - 1;
@@ -434,7 +434,7 @@ function routes() {
   });
   add("GET", "/api/media/thumb", async (c) => {
     const o = await media(c).getThumb(qp(c, "key"));
-    return new Response(o.body, { headers: { "content-type": o.httpMetadata?.contentType || "image/jpeg", "cache-control": "private, max-age=604800", "content-length": String(o.size) } });
+    return new Response(o.body, { headers: { "content-type": o.httpMetadata?.contentType || "image/jpeg", "cache-control": qp(c, "v") ? "private, max-age=604800" : "private, no-cache", "content-length": String(o.size) } });
   });
   add("PUT", "/api/media/thumb", async (c) => {
     if (Number(c.request.headers.get("content-length") || 0) > 300 * 1024) throw new OpsError("Thumbnail too large");
