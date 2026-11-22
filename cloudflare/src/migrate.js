@@ -72,14 +72,15 @@ export async function migrateStep(env, ops, now, fetchImpl = fetch) {
     return { inventory: st.total };
   }
   const batch = st.queue.splice(0, PER_RUN);
+  let ok = 0; const errors = [];
   for (const a of batch) {
-    try { st.done[a.public_id] = await copyOne(bucket, cfg, ops, a, now, fetchImpl); }
-    catch (e) { st.failed[a.public_id] = String(e.message).slice(0, 200); }
+    try { st.done[a.public_id] = await copyOne(bucket, cfg, ops, a, now, fetchImpl); ok++; }
+    catch (e) { st.failed[a.public_id] = String(e.message).slice(0, 200); errors.push(`${a.public_id}: ${st.failed[a.public_id]}`); }
   }
   if (!st.queue.length) { st.status = "done"; st.finished_at = now; }
   await save(ops, st);
   if (st.status === "done") await ops.audit("automation", "r2_migration_done", `${Object.keys(st.done).length} copied, ${Object.keys(st.failed).length} failed`);
-  return { copied: batch.length, remaining: st.queue.length };
+  return { copied: ok, failed: errors.length, remaining: st.queue.length, ...(errors.length ? { errors } : {}) };
 }
 
 async function copyOne(bucket, cfg, ops, a, now, fetchImpl) {

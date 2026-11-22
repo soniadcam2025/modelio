@@ -189,7 +189,9 @@ test("Cloudinary → R2 copy: verified copies, posts repointed, failures listed,
   };
   const { migrateStep, migrationStatus } = await import("../src/migrate.js");
   assert.deepEqual(await migrateStep(e, ops, now, fetchImpl), { inventory: 3 });
-  for (let i = 0; i < 3; i++) await migrateStep(e, ops, now, fetchImpl);
+  const step = await migrateStep(e, ops, now, fetchImpl);
+  assert.equal(step.copied + step.failed, 2);
+  for (let i = 0; i < 2; i++) await migrateStep(e, ops, now, fetchImpl);
   const st = await migrationStatus(ops);
   assert.equal(st.status, "done"); assert.equal(st.copied, 2); assert.equal(st.failed.length, 1);
   assert.match(st.failed[0].error, /re-upload/);
