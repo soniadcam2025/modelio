@@ -10,7 +10,9 @@ import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle, sendItem } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
-import { ADMIN_MEDIA_FOLDER, cloudinaryConfig, deleteAsset, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory, uploadSignature } from "./cloudinary.js";
+import { cloudinaryConfig, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory } from "./cloudinary.js";
+import { MediaStore, mediaSources, setMediaSources, SOURCE_LABELS } from "./r2media.js";
+import { migrateStep, migrationStatus } from "./migrate.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
@@ -86,8 +88,8 @@ async function cycleAuthorized(request, env, now) {
   return constantTimeEqual(request.headers.get("x-cycle-signature") || "", await hmacHex(env.CYCLE_SECRET, `cycle:${t}`));
 }
 export const SECURITY_HEADERS = {
-  "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; media-src https:; style-src 'self'; " +
-    "script-src 'self'; connect-src 'self' https://api.cloudinary.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  "Content-Security-Policy": "default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self'; " +
+    "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   "X-Frame-Options": "DENY",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
@@ -117,6 +119,7 @@ export function loadConfig(env) {
   };
   // Cloudinary keys for the photo-upload fallback. Not enumerable, so they never appear in JSON or logs.
   Object.defineProperty(cfg, "cloudinary", { value: cloudinaryConfig(env), enumerable: false });
+  Object.defineProperty(cfg, "media", { value: env.MEDIA || null, enumerable: false });
   return cfg;
 }
 
@@ -333,6 +336,7 @@ function routes() {
     try {
       const pcfg = { ...c.config, previewChatId: chat };
       Object.defineProperty(pcfg, "cloudinary", { value: c.config.cloudinary, enumerable: false });
+      Object.defineProperty(pcfg, "media", { value: c.config.media, enumerable: false });
       const r = await sendItem(tg, pcfg, item, text);
       await c.ops.audit(c.actor, "content_preview", `#${item.id} sent to the preview chat`);
       return json({ ok: true, message_id: r?.message_id ?? null });
@@ -368,43 +372,64 @@ function routes() {
   // Read by the GitHub poster before each scheduled post (fail-open). Contains nothing private.
   add("GET", "/api/public/automation", async (c) => json({ poster_paused: (await c.ops.getSetting("poster_paused")) === "1" }), { auth: false });
 
-  // ---- Media library: direct uploads to Cloudinary ----
-  const mediaCfg = (c) => { const cfg = cloudinaryConfig(c.env); if (!cfg) throw new OpsError("Connect Cloudinary in Bots & integrations first"); return cfg; };
-  const uploadFolders = async (c) => {
-    const paid = (await c.ops.paidMediaConfig()).folder;
-    return [{ folder: ADMIN_MEDIA_FOLDER, label: "Dashboard library", deletable: true },
-      ...(paid ? [{ folder: paid, label: "Paid media (automation folder)", deletable: true }] : []),
-      { folder: GITHUB_POSTER_FOLDER, label: "GitHub auto-poster queue (5 AM / 10 PM)", deletable: false }];
-  };
-  add("GET", "/api/media/folders", async (c) => json(await uploadFolders(c)));
-  add("POST", "/api/media/upload-signature", async (c) => {
-    const cfg = mediaCfg(c), b = await body(c.request);
-    const f = (await uploadFolders(c)).find((x) => x.folder === b.folder);
-    if (!f) throw new OpsError("Choose a folder");
-    await c.ops.audit(c.actor, "media_upload_start", f.folder);
-    return json(await uploadSignature(cfg, f.folder));
+  // ---- Media library: private Cloudflare R2 (binding MEDIA). Every route needs a signed-in admin. ----
+  const media = (c) => new MediaStore(c.env.MEDIA, c.ops);
+  const qp = (c, k) => c.url.searchParams.get(k) || "";
+  add("GET", "/api/media/status", async (c) => {
+    if (!c.env.MEDIA) return json({ connected: false, migration: await migrationStatus(c.ops) });
+    return json({ connected: true, usage: await media(c).usage(), migration: await migrationStatus(c.ops) });
   });
-  add("GET", "/api/media/library", async (c) => {
-    const cfg = mediaCfg(c), folder = c.url.searchParams.get("folder") || ADMIN_MEDIA_FOLDER;
-    const f = (await uploadFolders(c)).find((x) => x.folder === folder);
-    if (!f) throw new OpsError("Unknown folder");
-    const [assets, scheduled] = await Promise.all([listFolder(cfg, folder),
-      c.ops.all("SELECT media_url FROM content_items WHERE status IN ('scheduled','draft','sending') AND media_url != ''")]);
-    const inUse = new Set(scheduled.map((r) => r.media_url));
-    return json({ folder: f, items: assets.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 200).map((a) => ({
-      public_id: a.public_id, resource_type: a.resource_type, format: a.format, bytes: a.bytes, url: a.secure_url, created_at: a.created_at,
-      in_use: inUse.has(a.secure_url) })) });
+  add("GET", "/api/media/folders", async (c) => json(await media(c).folders()));
+  add("POST", "/api/media/folders", async (c) => json(await media(c).createFolder((await body(c.request)).path, c.actor)));
+  add("POST", "/api/media/folders/rename", async (c) => { const b = await body(c.request); return json(await media(c).renameFolder(b.from, b.to, c.actor)); });
+  add("POST", "/api/media/folders/delete", async (c) => json(await media(c).deleteFolder((await body(c.request)).path, c.actor)));
+  add("GET", "/api/media/files", async (c) => json(await media(c).list({ folder: qp(c, "folder"), recursive: qp(c, "recursive") === "1", q: qp(c, "q"),
+    kind: qp(c, "kind"), from: Number(qp(c, "from")) || null, to: Number(qp(c, "to")) || null })));
+  // Raw upload: the request body is the file. Checked by content (type) and Telegram's size limits before storing.
+  add("POST", "/api/media/upload", async (c) => {
+    const len = Number(c.request.headers.get("content-length") || 0);
+    if (len > 52 * 1024 * 1024) throw new OpsError("Files can be at most 50 MB (Telegram's upload limit)");
+    const bytes = new Uint8Array(await c.request.arrayBuffer());
+    if (!bytes.byteLength) throw new OpsError("The file is empty");
+    return json(await media(c).upload(qp(c, "folder"), qp(c, "name"), bytes, c.actor));
   });
+  // File delivery for the signed-in admin only (thumbnails, previews, downloads). No public or signed links exist.
+  add("GET", "/api/media/file", async (c) => {
+    const range = c.request.headers.get("range");
+    let r = null;
+    const m = /^bytes=(\d+)-(\d*)$/.exec(range || "");
+    if (m) r = m[2] ? { offset: Number(m[1]), length: Number(m[2]) - Number(m[1]) + 1 } : { offset: Number(m[1]) };
+    const o = await media(c).get(qp(c, "key"), r);
+    const name = o.key.slice(o.key.lastIndexOf("/") + 1);
+    const h = { "content-type": o.httpMetadata?.contentType || "application/octet-stream", "cache-control": "private, no-store",
+      "accept-ranges": "bytes", "content-disposition": `${qp(c, "download") === "1" ? "attachment" : "inline"}; filename="${name.replace(/"/g, "")}"` };
+    if (r && o.range) {
+      const start = o.range.offset ?? 0, end = start + (o.range.length ?? o.size - start) - 1;
+      return new Response(o.body, { status: 206, headers: { ...h, "content-range": `bytes ${start}-${end}/${o.size}`, "content-length": String(end - start + 1) } });
+    }
+    return new Response(o.body, { headers: { ...h, "content-length": String(o.size) } });
+  });
+  add("POST", "/api/media/move", async (c) => { const b = await body(c.request); return json(await media(c).move(b.from, b.to, c.actor)); });
+  add("POST", "/api/media/copy", async (c) => { const b = await body(c.request); return json(await media(c).copy(b.from, b.to, c.actor)); });
   add("POST", "/api/media/delete", async (c) => {
-    const cfg = mediaCfg(c), b = await body(c.request);
-    const id = String(b.public_id || "");
-    const f = (await uploadFolders(c)).find((x) => x.deletable && id.startsWith(x.folder + "/"));
-    if (!f || id.startsWith(GITHUB_POSTER_FOLDER + "/")) throw new OpsError("Only media in the dashboard library or the paid-media folder can be removed here");
-    const used = await c.ops.one("SELECT id FROM content_items WHERE status IN ('scheduled','draft','sending') AND media_url LIKE ?", `%/${id}.%`);
-    if (used) throw new OpsError(`Post #${used.id} still uses this file`);
-    if (!(await deleteAsset(cfg, id, b.resource_type))) throw new OpsError("Cloudinary did not delete it");
-    await c.ops.audit(c.actor, "media_delete", id);
-    return json({ ok: true });
+    const b = await body(c.request);
+    const keys = Array.isArray(b.keys) ? b.keys : [b.key];
+    return json({ results: await media(c).remove(keys.filter(Boolean), c.actor) });
+  });
+  add("GET", "/api/media/sources", async (c) => json({ sources: await mediaSources(c.ops), labels: SOURCE_LABELS,
+    autopost: Object.fromEntries(await Promise.all(["public", "vip"].map(async (t) => [t, JSON.parse(await c.ops.getSetting(`autopost:${t}`, "{}") || "{}")]))),
+    github_poster_retired: (await c.ops.getSetting("github_poster_retired")) === "1" }));
+  add("PUT", "/api/media/sources", async (c) => json(await setMediaSources(c.ops, (await body(c.request)).sources, c.actor)));
+  add("PUT", "/api/media/autopost/(public|vip)", async (c, m) => {
+    const b = await body(c.request);
+    const times = [...new Set((Array.isArray(b.times_utc) ? b.times_utc : String(b.times_utc || "").split(",")).map((t) => String(t).trim()).filter(Boolean))];
+    for (const t of times) if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new OpsError(`Times must look like 14:30 (UTC), got '${t}'`);
+    if (times.length > 6) throw new OpsError("At most 6 automatic posts a day");
+    const cfg = { enabled: !!b.enabled, times_utc: times };
+    await c.ops.setSetting(`autopost:${m[1]}`, JSON.stringify(cfg));
+    if (m[1] === "public" && b.github_poster_retired !== undefined) await c.ops.setSetting("github_poster_retired", b.github_poster_retired ? "1" : "0");
+    await c.ops.audit(c.actor, "autopost", `${m[1]}: ${cfg.enabled ? "on" : "off"} ${times.join(",")}`);
+    return json(cfg);
   });
   add("POST", "/api/content/(\\d+)/cancel", async (c, m) => json(contentOut(await c.ops.cancelContent(m[1], c.actor))));
   add("POST", "/api/content/(\\d+)/duplicate", async (c, m) => json(contentOut(await c.ops.duplicateContent(m[1], c.actor))));
@@ -416,7 +441,7 @@ function routes() {
     const items = (await c.ops.contentList({ start, end })).filter((i) => i.status !== "cancelled").map(contentOut);
     const slots = [];
     for (let day = Math.floor(start / 86400) * 86400; day < end; day += 86400)
-      for (const [h, mi] of c.config.slotTimes) { const at = day + h * 3600 + mi * 60; if (at >= start && at < end) slots.push({ at, label: "Cloudinary auto-post (GitHub)" }); }
+      for (const [h, mi] of c.config.slotTimes) { const at = day + h * 3600 + mi * 60; if (at >= start && at < end) slots.push({ at, label: "Automatic post (5 AM / 10 PM)" }); }
     return json({ items, poster_slots: slots });
   });
 
@@ -551,7 +576,11 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
     const token = await store.token(bot.id).catch(() => null);
     return token ? new SendOnlyTelegram({ token, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl }) : null;
   };
-  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null, bots, tgForBot });
+  // Cloudinary → R2 copy (a couple of files per minute until done; never deletes anything).
+  let migration = null;
+  try { migration = await migrateStep(env, ops, now, fetchImpl); } catch (e) { migration = { error: String(e.message).slice(0, 200) }; }
+  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null, bots, tgForBot, bucket: env.MEDIA || null });
+  if (migration) summary.r2_migration = migration;
   return { mode, summary, simulated: tg.simulated.length };
 }
 

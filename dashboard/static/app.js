@@ -320,7 +320,7 @@ async function pageOverview(main) {
   const offCount = Object.values(o.features).filter((f) => !f.enabled).length;
   const worker = o.worker_last_seen && Date.now() / 1000 - o.worker_last_seen < 600;
   put(main, 
-    head("Overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
+    head("Overview", `Automatic posts: ${o.poster_slots_ist.join(" and ")} daily`),
     o.environment === "staging" || ["simulated", "preview", "locked"].includes(o.automation) ? h("div", { class: "banner warn" },
       `${String(o.environment || "").toUpperCase()}: ` + (o.automation === "preview"
         ? "automation sends only to the private preview chat. Nothing reaches the channels or members."
@@ -435,7 +435,9 @@ function editor(item, preset = {}) {
   }).catch(() => {});
   const targetValue = () => { const [a, b] = target.value.split("|"); return b ? { bot_id: Number(a), target: b } : { bot_id: null, target: a }; };
   const text = h("textarea", { maxlength: 4096 }); text.value = v.text || "";
-  const mediaUrl = h("input", { type: "url", placeholder: "https://res.cloudinary.com/…", value: v.media_url || "" });
+  const mediaUrl = h("input", { type: "hidden", value: v.media_url || "" });
+  const mediaName = h("div", { class: "mono small" });
+  const showMediaName = () => { const m = mediaUrl.value; mediaName.textContent = m ? (m.startsWith("r2:") ? m.slice(3) : m) : "No file chosen"; };
   const useLib = h("input", { type: "checkbox", checked: !!v.use_caption_library });
   const optsBox = h("div", {});
   const correct = h("select", {});
@@ -481,17 +483,19 @@ function editor(item, preset = {}) {
 
   const groups = {
     text: field("Text", text, "Up to 4,096 characters for text posts, 1,024 for captions, 300 for poll questions."),
-    media: h("div", {}, field("Media link", mediaUrl, "An https link Telegram can download (Cloudinary works). Photos up to 5 MB, other files up to 20 MB by link."),
-      can("content_v2") ? h("div", { class: "row" },
-        h("label", { class: "btn" }, "Upload from this device", h("input", { type: "file", accept: "image/*,video/*", hidden: true, onchange: async (e) => {
+    media: h("div", {}, h("div", { class: "field" }, "Media file", mediaUrl, mediaName,
+        h("span", { class: "hint" }, "From the private media library. Sent to Telegram as an upload: photos up to 10 MB, videos and GIFs up to 50 MB.")),
+      h("div", { class: "row" },
+        h("label", { class: "btn" }, "Upload from this device", h("input", { type: "file", accept: "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm", hidden: true, onchange: async (e) => {
           const f = e.target.files[0]; if (!f) return;
           const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
           e.target.closest(".row").after(bar);
-          const url = await act(() => uploadToCloudinary(f, "shakhira_admin", (pct) => { bar.value = pct; }), "Uploaded to the dashboard library");
+          const folder = await uploadFolderFor(kind.value, target.value, f);
+          const r = await act(() => uploadToLibrary(f, folder, (pct) => { bar.value = pct; }), `Uploaded to ${folder}`);
           bar.remove();
-          if (url) { mediaUrl.value = url; drawPreview(); }
+          if (r) { mediaUrl.value = "r2:" + r.key; showMediaName(); drawPreview(); }
         } })),
-        h("button", { type: "button", onclick: () => pickMedia((url) => { mediaUrl.value = url; drawPreview(); }) }, "Choose from library")) : null),
+        h("button", { type: "button", onclick: () => pickMedia((ref) => { mediaUrl.value = ref; showMediaName(); drawPreview(); }, { kind: kind.value, target: target.value.split("|").pop() }) }, "Choose from library"))),
     lib: h("label", { class: "inline field" }, useLib, "Leave the caption empty and use the caption library"),
     format: h("div", {}, h("label", { class: "inline field" }, html, "Formatting (bold, italic, links with their own text)"),
       h("p", { class: "small muted" }, 'Use <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strike</s>, <tg-spoiler>spoiler</tg-spoiler>, <a href="https://…">link text</a>. Plain links and emoji work without it.')),
@@ -518,8 +522,8 @@ function editor(item, preset = {}) {
   }
   // What the post will look like (approximate; Telegram decides the final layout).
   function drawPreview() {
-    const k = kind.value, url = mediaUrl.value.trim(), isVideo = /\.(mp4|mov|webm)(\?|$)/i.test(url);
-    const media = ["photo", "video", "animation", "paid_media"].includes(k) && url.startsWith("https://")
+    const k = kind.value, ref = mediaUrl.value.trim(), url = ref.startsWith("r2:") ? fileUrl(ref.slice(3)) : ref, isVideo = isVideoRef(ref);
+    const media = ["photo", "video", "animation", "paid_media"].includes(k) && (ref.startsWith("r2:") || ref.startsWith("https://"))
       ? (isVideo ? h("video", { src: url, muted: true, controls: true, preload: "metadata" }) : h("img", { src: url, alt: "", loading: "lazy" })) : null;
     const body = ["poll", "quiz"].includes(k)
       ? h("div", {}, h("strong", {}, text.value || "Question"), h("ul", {}, options.filter(Boolean).map((o, i) => h("li", {}, o, k === "quiz" && String(i) === correct.value ? " ✓" : ""))))
@@ -536,6 +540,7 @@ function editor(item, preset = {}) {
       !["poll", "quiz"].includes(k) ? h("p", { class: "small muted" }, "Reactions under the post follow the channel's own reaction settings in Telegram (shown on Overview → Bot & channels).") : null);
   }
   drawButtons();
+  showMediaName();
   kind.addEventListener("change", () => { show(); drawPreview(); });
   for (const el of [text, mediaUrl, stars, hashtags, target, protect, correct, html]) { el.addEventListener("input", drawPreview); el.addEventListener("change", drawPreview); }
   show();
@@ -617,53 +622,18 @@ async function pageCalendar(main) {
   const data = await api(`/api/calendar?start=${start}&end=${end}`);
   const days = [...Array(7)].map((_, d) => ({ start: start + d * 86400, items: [] }));
   const place = (ts, el) => { const d = Math.floor((ts - start) / 86400); if (d >= 0 && d < 7) days[d].items.push([ts, el]); };
-  data.poster_slots.forEach((sl) => place(sl.at, h("div", { class: "cal-item auto", title: sl.label }, h("div", { class: "t" }, fmtTime.format(new Date(sl.at * 1000))), "Cloudinary auto-post")));
+  data.poster_slots.forEach((sl) => place(sl.at, h("div", { class: "cal-item auto", title: sl.label }, h("div", { class: "t" }, fmtTime.format(new Date(sl.at * 1000))), "Automatic post")));
   data.items.forEach((i) => { const ts = i.posted_at || i.scheduled_at; if (ts) place(ts, h("div", { class: "cal-item", onclick: () => (["draft", "scheduled", "failed"].includes(i.status) ? editor(i) : null) },
     h("div", { class: "t" }, fmtTime.format(new Date(ts * 1000)), " ", chip(i.status)), h("div", { class: "clip" }, `${KIND_LABEL[i.kind]} · ${i.target === "vip" ? "VIP" : "Public"} · ${i.text || ""}`))); });
   const todayIdx = Math.floor((Date.now() / 1000 - start) / 86400);
   put(main, 
-    head("Calendar", "India time. Grey items are the automatic Cloudinary posts from GitHub.",
+    head("Calendar", "India time. Grey items are the automatic 5 AM / 10 PM posts.",
       h("button", { onclick: () => { calendarStart -= 7 * 86400; route(); } }, "← Previous week"),
       h("button", { onclick: () => { calendarStart = null; route(); } }, "This week"),
       h("button", { onclick: () => { calendarStart += 7 * 86400; route(); } }, "Next week →"),
       h("button", { class: "primary", onclick: () => editor() }, "New post")),
     h("div", { class: "cal" }, days.map((d, idx) => h("div", { class: "cal-day" + (idx === todayIdx ? " today" : "") },
       h("h4", {}, fmtDay.format(new Date(d.start * 1000 + 3600 * 1000))), d.items.sort((a, b) => a[0] - b[0]).map((x) => x[1])))));
-}
-
-async function pageMedia(main) {
-  if (can("content_v2")) return pageMediaV2(main);
-  return pageMediaPoster(main);
-}
-
-async function pageMediaPoster(main, { append = false } = {}) {
-  const p = await api("/api/poster");
-  if (append) {
-    if (!p.configured || p.error) return;
-    const inv = p.inventory;
-    main.append(h("section", { class: "card" }, h("h2", {}, `GitHub auto-poster queue “${p.folder}” (5 AM / 10 PM IST)`),
-      h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), "new files"), kpi("Posted", num(inv.posted), `${num(inv.reusable_now)} reusable now (30+ days)`),
-        kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"))));
-    return;
-  }
-  put(main, head("Media library", "The Cloudinary folder the automatic poster uses (read-only)",
-    p.configured ? h("button", { onclick: async () => { await api("/api/poster?refresh=true"); route(); } }, "Refresh") : null));
-  if (!p.configured) {
-    main.append(h("div", { class: "banner" }, "Not connected. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET to the dashboard's .env to see the folder here."));
-    return;
-  }
-  if (p.error) { main.append(h("div", { class: "banner bad" }, p.error)); return; }
-  const inv = p.inventory;
-  main.append(
-    inv.remaining >= 5 ? null : inv.remaining ? h("div", { class: "banner warn" }, `Only ${inv.remaining} new files left. Upload more to “${p.folder}”.`)
-      : inv.reusable_now ? h("div", { class: "banner warn" }, `No new media: the poster is reposting the oldest posts (last posted 30+ days ago). ${num(inv.reusable_now)} can be reposted now. Upload new media to “${p.folder}” to post fresh content.`)
-      : h("div", { class: "banner bad" }, `Nothing can be posted: no new media, and every post is still inside its 30-day cooldown${inv.next_reuse_at ? `. Reposting resumes ${when(inv.next_reuse_at)}` : ""}. Upload new media to “${p.folder}” to post sooner.`),
-    h("div", { class: "grid kpis" }, kpi("Left to post", num(inv.remaining), `in “${p.folder}”`), kpi("Posted", num(inv.posted), `${num(inv.reusable_now)} reusable now (30+ days old)`),
-      kpi("Need a check", num(inv.uncertain + inv.rejected), "uncertain or rejected"), kpi("Unsupported", num(inv.unsupported), "format or size"),
-      p.paid_folder ? kpi("Paid-media folder", num(p.paid_folder.unused), `unused of ${num(p.paid_folder.total)} in “${p.paid_folder.folder}”`) : null),
-    h("section", { class: "card", style: null }, h("h2", {}, "Files"), h("div", { class: "media-grid" }, p.library.map((m) => h("div", { class: "media-tile" },
-      m.thumb ? h("img", { src: m.thumb, alt: m.name, loading: "lazy" }) : h("div", { class: "ph" }, m.kind),
-      h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.name), chip(m.state === "queued" ? "scheduled" : m.state === "posted" ? "posted" : "uncertain", m.state), m.note ? h("span", { class: "muted" }, m.note) : null))))));
 }
 
 async function pageSubscribers(main) {
@@ -812,15 +782,12 @@ async function paidMediaSettings() {
   const caption = h("textarea", { maxlength: 1024, placeholder: "Used when the file has no caption of its own" }); caption.value = cfg.caption || "";
   const istTimes = cfg.times_utc.map((t) => { const [hh, mm] = t.split(":").map(Number); const m = (hh * 60 + mm + 330) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")} IST`; });
   return h("section", { class: "card" }, h("h2", {}, "Paid media automation"),
-    h("p", { class: "muted small" }, "Posts the oldest unused photo or video from its own Cloudinary folder at each time, as paid media. A file's own Cloudinary context ",
-      h("span", { class: "mono" }, "stars=120"), " overrides the default price, and its ", h("span", { class: "mono" }, "caption"),
-      " is used if set. Needs “Post paid media automatically” and “Publish scheduled posts” on. Used files are remembered here, never tagged in Cloudinary."),
+    h("p", { class: "muted small" }, "Posts the oldest unused photo or video from the paid-media folder (Automations → Media sources) at each time, as paid media. Each file is used once. Needs “Post paid media automatically”, “Publish scheduled posts” and the bot's paid-media permission."),
     istTimes.length ? h("p", { class: "small" }, "Current times: ", istTimes.join(", ")) : null,
     h("form", { onsubmit: async (e) => { e.preventDefault();
       if (await act(() => api("/api/settings/paid-media", { method: "PUT", body: { default_stars: stars.value, folder: folder.value, times_utc: times.value,
         target: target.value, expire_after_minutes: expire.value || null, caption: caption.value } }), "Saved")) route(); } },
       h("div", { class: "grid two" }, field("Default price (Stars)", stars), field("Channel", target)),
-      field("Cloudinary folder", folder, "A separate folder. tgpub is refused: it belongs to the free-channel poster."),
       field("Times (UTC, comma-separated)", times, "Up to 6 a day. 16:30 UTC is 10:00 PM IST."),
       field("Delete after (minutes, optional)", expire, "5 to 2,880 (48 hours). Needs “Delete posts automatically” on."),
       field("Default caption (optional)", caption),
@@ -866,12 +833,12 @@ const webhookChip = (w) => !w || w.error ? chip("failed", w?.error || "unknown")
   : chip("none", "no webhook");
 
 async function pageBots(main) {
-  const [{ bots, permissions }, cloud] = await Promise.all([api("/api/bots"), api("/api/integrations/cloudinary")]);
+  const { bots, permissions } = await api("/api/bots");
   const switchFor = (b) => h("button", { class: "switch", role: "switch", "aria-checked": String(b.automation_enabled), "aria-label": `Automation for @${b.username}`,
     disabled: b.status !== "active",
     onclick: async () => { if (await act(() => api(`/api/bots/${b.id}/automation`, { method: "PUT", body: { enabled: !b.automation_enabled } }), b.automation_enabled ? "Automation off" : "Automation on")) route(); } });
   put(main,
-    head("Bots & integrations", "Connect bots and Cloudinary. Credentials are encrypted on the server and only ever shown masked."),
+    head("Bots & channels", "Connect bots and assign their channels. Tokens are encrypted on the server and only ever shown masked."),
     h("div", { class: "banner warn" }, "Safety: connecting a bot here never changes its webhook or starts another receiver. A new bot starts with automation off and no permissions; it can only post to channels assigned to it, and only to the preview chat while the dashboard is in preview or read-only mode."),
     h("section", { class: "card" },
       h("div", { class: "row", style: null }, h("h2", {}, "Bots"), h("span", { style: null }), h("button", { class: "primary", onclick: () => addBotDrawer() }, "Add bot")),
@@ -885,20 +852,7 @@ async function pageBots(main) {
         { label: "", render: (b) => h("div", { class: "row" },
           h("button", { onclick: async (e) => { e.stopPropagation(); if (await act(() => api(`/api/bots/${b.id}/test`, { method: "POST" }), "Checked")) route(); } }, "Test"),
           h("button", { onclick: (e) => { e.stopPropagation(); manageBot(b, permissions); } }, "Manage")) },
-      ], bots, { empty: "No bots connected yet. Add @ShakhiraVIPBot (or another bot) by its token." })),
-    h("section", { class: "card" }, h("h2", {}, "Cloudinary"),
-      cloud.connected ? [
-        h("div", { class: "toggle-row" }, h("div", {}, "Cloud name"), h("span", { class: "mono" }, cloud.cloud_name)),
-        h("div", { class: "toggle-row" }, h("div", {}, "API key"), h("span", { class: "mono" }, cloud.api_key)),
-        h("div", { class: "toggle-row" }, h("div", {}, "API secret"), h("span", { class: "mono" }, cloud.api_secret)),
-        h("div", { class: "toggle-row" }, h("div", {}, "Connection"), cloud.last_check_ok === false ? chip("failed", cloud.last_error || "check failed")
-          : chip("posted", cloud.last_check_at ? `ok · checked ${ago(cloud.last_check_at)}` : "ok")),
-      ] : h("p", { class: "muted" }, "Not connected here. (Worker secrets, if set, are used instead and are not shown.)"),
-      h("div", { class: "row" },
-        cloud.connected ? h("button", { onclick: async () => { if (await act(() => api("/api/integrations/cloudinary/test", { method: "POST" }), "Checked")) route(); } }, "Test") : null,
-        h("button", { onclick: () => cloudinaryDrawer(cloud) }, cloud.connected ? "Update" : "Connect"),
-        cloud.connected ? h("button", { class: "danger", onclick: () => confirmDrawer("Disconnect Cloudinary", "Removes the saved Cloudinary credentials from this dashboard. Cloudinary itself is not changed.",
-          (cred) => api("/api/integrations/cloudinary", { method: "DELETE", body: cred })) } , "Disconnect") : null)));
+      ], bots, { empty: "No bots connected yet. Add @ShakhiraVIPBot (or another bot) by its token." })));
 }
 
 async function addBotDrawer() {
@@ -919,17 +873,6 @@ async function confirmDrawer(title, text, fn) {
   } }, h("p", {}, text), ...re.nodes, h("div", { class: "row end" }, h("button", { class: "danger", type: "submit" }, title))));
 }
 
-async function cloudinaryDrawer(cloud) {
-  const name = h("input", { required: true, value: cloud.cloud_name || "" });
-  const key = h("input", { required: true, inputmode: "numeric", autocomplete: "off" });
-  const secret = h("input", { type: "password", required: true, autocomplete: "off" });
-  const re = await reauthFields();
-  drawer(cloud.connected ? "Update Cloudinary" : "Connect Cloudinary", h("form", { onsubmit: async (e) => {
-    e.preventDefault();
-    if (await act(() => api("/api/integrations/cloudinary", { method: "PUT", body: { cloud_name: name.value, api_key: key.value, api_secret: secret.value, ...re.values() } }), "Cloudinary saved")) { closeDrawer(); route(); }
-  } }, field("Cloud name", name), field("API key", key), field("API secret", secret, "Tested with Cloudinary before saving. A read-only key is best."), ...re.nodes,
-    h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Test and save"))));
-}
 
 async function manageBot(b, permissions) {
   const history = await api(`/api/bots/${b.id}/history`);
@@ -985,78 +928,184 @@ function renderTelegramHtml(src) {
   return walk(doc.body);
 }
 
-// ---------- Uploads, library picker, automation ----------
+// ---------- Media library (private Cloudflare R2) ----------
 
-const MAX_UPLOAD = { image: 10 * 1024 * 1024, video: 100 * 1024 * 1024 };
-// Signed by the Worker; the file goes straight from the browser to Cloudinary (the API secret never reaches the browser).
-async function uploadToCloudinary(file, folder, onProgress = null) {
-  const type = file.type.startsWith("video/") ? "video" : file.type.startsWith("image/") ? "image" : null;
-  if (!type) throw new Error("Choose an image or a video");
-  if (file.size > MAX_UPLOAD[type]) throw new Error(`Too large: ${type === "image" ? "10" : "100"} MB at most`);
-  const sig = await api("/api/media/upload-signature", { method: "POST", body: { folder } });
-  const form = new FormData();
-  form.append("file", file);
-  for (const k of ["api_key", "timestamp", "signature", "folder", "asset_folder", "tags"]) form.append(k, sig[k]);
-  const out = await new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", sig.upload_url);
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100)); };
-    xhr.onload = () => { let b = {}; try { b = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
-      if (xhr.status >= 200 && xhr.status < 300 && b.secure_url) resolve(b); else reject(new Error(b.error?.message || `Upload failed (${xhr.status})`)); };
-    xhr.onerror = () => reject(new Error("Upload failed: network error"));
-    xhr.send(form);
-  });
-  if (type === "image" && file.size > 5 * 1024 * 1024) toast("Uploaded. Note: Telegram accepts photos up to 5 MB by link; use a smaller image for photo posts.", true);
-  return out.secure_url;
+// Upload folder from Automations → Media sources: paid media → paid-media/, VIP → vip/…, otherwise public/…
+async function uploadFolderFor(kind, target, file) {
+  let src = {};
+  try { src = (await api("/api/media/sources")).sources; } catch { /* defaults below */ }
+  const video = file.type.startsWith("video/") || file.type === "image/gif";
+  if (kind === "paid_media") return `${src.paid_media || "paid-media"}/${video ? "videos" : "photos"}`.replace(/\/(photos|videos)\/(photos|videos)$/, "/$1");
+  const t = String(target).split("|").pop() === "vip" ? "vip" : "public";
+  if (file.type === "image/gif" && t === "public") return "public/gifs";
+  return src[`${t}_${video ? "videos" : "photos"}`] || `${t}/${video ? "videos" : "photos"}`;
 }
 
-async function pickMedia(onPick) {
-  let lib;
-  try { lib = await api("/api/media/library?folder=shakhira_admin"); } catch (e) { toast(e.message, true); return; }
-  const grid = h("div", { class: "media-grid" }, lib.items.map((m) => h("button", { type: "button", class: "media-tile pick", onclick: () => { onPick(m.url); document.querySelector(".picker-close")?.click(); } },
-    m.resource_type === "video" ? h("div", { class: "ph" }, "▶ video") : h("img", { src: m.url, alt: m.public_id, loading: "lazy" }),
-    h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.public_id.split("/").pop())))));
-  const box = h("div", { class: "picker" }, h("div", { class: "row" }, h("h3", {}, "Choose from the dashboard library"), h("button", { type: "button", class: "picker-close", onclick: () => box.remove() }, "Close")),
-    lib.items.length ? grid : h("p", { class: "muted" }, "No files yet. Upload one first."));
+const fileUrl = (key, download = false) => `/api/media/file?key=${encodeURIComponent(key)}${download ? "&download=1" : ""}`;
+const isVideoRef = (ref) => /\.(mp4|mov|webm)(\?|$)/i.test(ref);
+const mb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+const KIND_NAME = { image: "Photo", gif: "GIF", video: "Video" };
+
+// Upload one file to an R2 folder (body = the file; checked again on the server). Resolves to the stored file.
+function uploadToLibrary(file, folder, onProgress = null) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 50 * 1024 * 1024) return reject(new Error("Files can be at most 50 MB (Telegram's upload limit)"));
+    if (file.type.startsWith("image/") && !file.type.includes("gif") && file.size > 10 * 1024 * 1024) return reject(new Error("Photos can be at most 10 MB"));
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/media/upload?folder=${encodeURIComponent(folder)}&name=${encodeURIComponent(file.name)}`);
+    if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100)); };
+    xhr.onload = () => { let b = {}; try { b = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300 && b.key) resolve(b); else reject(new Error(b.error || b.detail || `Upload failed (${xhr.status})`)); };
+    xhr.onerror = () => reject(new Error("Upload failed: network error"));
+    xhr.send(file);
+  });
+}
+
+// Which folders a post may use: public posts never see VIP or paid files; paid media only paid-media/.
+function allowedFor(key, { kind, target }) {
+  const top = String(key).split("/")[0];
+  if (kind === "paid_media") return top === "paid-media";
+  if (top === "paid-media") return false;
+  if (target === "public" && top === "vip") return false;
+  return true;
+}
+
+async function pickMedia(onPick, ctx = { kind: "photo", target: "public" }) {
+  let files;
+  try { files = await api("/api/media/files?recursive=1"); } catch (e) { toast(e.message, true); return; }
+  const want = ctx.kind === "video" ? ["video"] : ctx.kind === "animation" ? ["gif", "video"] : ctx.kind === "photo" ? ["image"] : ["image", "video"];
+  const usable = files.filter((m) => allowedFor(m.key, ctx) && want.includes(m.kind));
+  const grid = h("div", { class: "media-grid" }, usable.map((m) => h("button", { type: "button", class: "media-tile pick", onclick: () => { onPick("r2:" + m.key); box.remove(); } },
+    m.kind === "video" ? h("video", { src: fileUrl(m.key), preload: "metadata", muted: true }) : h("img", { src: fileUrl(m.key), alt: m.name, loading: "lazy" }),
+    h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.name), h("span", { class: "muted" }, m.folder)))));
+  const box = h("div", { class: "picker" }, h("div", { class: "row" }, h("h3", {}, "Choose from the media library"), h("button", { type: "button", onclick: () => box.remove() }, "Close")),
+    h("p", { class: "small muted" }, ctx.kind === "paid_media" ? "Only the paid-media folders are shown." : ctx.target === "public" ? "VIP and paid-media files are hidden for the public channel." : "Paid-media files are hidden here."),
+    usable.length ? grid : h("p", { class: "muted" }, "No matching files yet. Upload one first."));
   document.querySelector(".drawer")?.append(box);
   box.scrollIntoView({ behavior: "smooth" });
 }
 
-async function pageMediaV2(main) {
-  const folderParam = new URLSearchParams(location.hash.split("?")[1] || "").get("folder") || "shakhira_admin";
-  let folders = [], lib = null, problem = null;
-  try { folders = await api("/api/media/folders"); lib = await api(`/api/media/library?folder=${encodeURIComponent(folderParam)}`); } catch (e) { problem = e.message; }
-  const current = folders.find((f) => f.folder === folderParam) || folders[0];
-  const picker = h("select", { onchange: (e) => (location.hash = `#media?folder=${encodeURIComponent(e.target.value)}`) },
-    folders.map((f) => h("option", { value: f.folder, selected: f.folder === current?.folder }, f.label)));
-  const status = h("p", { class: "small muted" });
-  const input = h("input", { type: "file", accept: "image/*,video/*", multiple: true, hidden: true, onchange: async (e) => {
-    const files = [...e.target.files];
-    let done = 0;
-    for (const f of files) {
-      status.textContent = `Uploading ${done + 1} of ${files.length}: ${f.name}…`;
-      try { await uploadToCloudinary(f, current.folder, (pct) => { status.textContent = `Uploading ${done + 1} of ${files.length}: ${f.name} — ${pct}%`; }); done++; } catch (err) { toast(`${f.name}: ${err.message}`, true); }
+function storageBar(st) {
+  if (!st?.connected) return h("div", { class: "banner warn" }, "Media storage (Cloudflare R2) is not connected to this deployment yet.");
+  const u = st.usage;
+  return h("div", { class: "card storage" },
+    h("div", { class: "row spread" }, h("strong", {}, "Storage"), h("span", { class: "small muted" }, `${num(u.files)} files · ${mb(u.bytes)} of 10 GB free tier (${u.percent}%)`)),
+    h("progress", { max: 100, value: Math.min(100, u.percent), class: "upload-progress" }),
+    u.warning ? h("p", { class: "small", style: null }, chip("failed", "Warning"), " ", u.warning) : null);
+}
+
+async function pageMedia(main) {
+  const params = new URLSearchParams(location.hash.split("?")[1] || "");
+  const folder = params.get("folder") || "public/photos", q = params.get("q") || "", kind = params.get("kind") || "", days = params.get("days") || "";
+  const go = (o) => { const p = new URLSearchParams({ folder, ...(q ? { q } : {}), ...(kind ? { kind } : {}), ...(days ? { days } : {}), ...o });
+    for (const [k, v] of [...p]) if (!v) p.delete(k); location.hash = "#media?" + p; };
+  const [st, folders] = await Promise.all([api("/api/media/status"), api("/api/media/folders").catch(() => [])]);
+  if (!st.connected) return put(main, head("Media library", "Private storage for your photos and videos"), storageBar(st));
+  const since = days ? Math.floor(Date.now() / 1000) - Number(days) * 86400 : 0;
+  const files = await api(`/api/media/files?folder=${encodeURIComponent(q || kind || days ? "" : folder)}${q || kind || days ? "&recursive=1" : ""}&q=${encodeURIComponent(q)}&kind=${kind}${since ? `&from=${since}` : ""}`);
+  const cur = folders.find((f) => f.path === folder);
+  const selected = new Set();
+  const selCount = h("span", { class: "small muted" }, "");
+  const syncSel = () => { selCount.textContent = selected.size ? `${selected.size} selected` : ""; bulk.hidden = !selected.size; };
+  const folderOptions = (sel) => folders.map((f) => h("option", { value: f.path, selected: f.path === sel }, f.path));
+
+  // Upload: button or drag-and-drop, several files, a progress bar each, then refresh.
+  const queue = h("div", { class: "upload-queue" });
+  const uploadFiles = async (list) => {
+    const arr = [...list]; let ok = 0;
+    for (const f of arr) {
+      const bar = h("progress", { max: 100, value: 0, class: "upload-progress" }), row = h("div", { class: "small" }, `${f.name} `, bar);
+      queue.append(row);
+      try { await uploadToLibrary(f, folder, (pct) => { bar.value = pct; }); ok++; row.replaceChildren(`✓ ${f.name}`); }
+      catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message}`)); }
     }
-    status.textContent = `${done} of ${files.length} uploaded.`;
-    if (done) setTimeout(route, 600);
-  } });
-  put(main, head("Media library", "Upload, preview, reuse and remove media. Files are stored in your Cloudinary account."),
-    problem ? h("div", { class: "banner warn" }, problem) : null,
-    lib ? h("section", { class: "card" },
-      h("div", { class: "row" }, field("Folder", picker), h("label", { class: "btn primary" }, "Upload photos or videos", input)),
-      current && !current.deletable ? h("p", { class: "small muted" }, "Files here are posted automatically at 5 AM and 10 PM IST by the GitHub poster (smart rotation). They are not removed from the dashboard.") : null,
-      status,
-      lib.items.length ? h("div", { class: "media-grid" }, lib.items.map((m) => h("div", { class: "media-tile" },
-        m.resource_type === "video" ? h("video", { src: m.url, preload: "metadata", muted: true, controls: true }) : h("img", { src: m.url, alt: m.public_id, loading: "lazy" }),
-        h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.public_id.split("/").pop()), h("span", { class: "muted" }, `${(m.bytes / 1048576).toFixed(1)} MB`), m.in_use ? chip("scheduled", "in a post") : null),
-        h("div", { class: "row" },
-          h("button", { class: "link", onclick: () => editor(null, { kind: m.resource_type === "video" ? "video" : "photo", media_url: m.url }) }, "New post"),
-          h("button", { class: "link", onclick: () => editor(null, { kind: "paid_media", media_url: m.url, star_count: 50 }) }, "Paid post"),
-          h("button", { class: "link", onclick: async () => { try { await navigator.clipboard.writeText(m.url); toast("Link copied"); } catch { toast(m.url); } } }, "Copy link"),
-          current.deletable ? h("button", { class: "link danger", onclick: async () => {
-            if (confirm("Remove this file from Cloudinary? This cannot be undone.") && await act(() => api("/api/media/delete", { method: "POST", body: { public_id: m.public_id, resource_type: m.resource_type } }), "Removed")) route();
-          } }, "Remove") : null)))) : h("p", { class: "empty" }, "No files in this folder yet.")) : null);
-  await pageMediaPoster(main, { append: true }).catch(() => {});
+    toast(`${ok} of ${arr.length} uploaded`, ok < arr.length);
+    if (ok) setTimeout(route, 400);
+  };
+  const input = h("input", { type: "file", accept: "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm", multiple: true, hidden: true, onchange: (e) => uploadFiles(e.target.files) });
+  const drop = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
+    ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); } },
+    h("label", { class: "btn primary" }, "Upload photos or videos", input), h("span", { class: "small muted" }, ` or drop files here · into ${folder} · photos ≤ 10 MB, videos ≤ 50 MB`));
+
+  const removeKeys = async (keys) => {
+    if (!confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : keys.length + " files"}? This cannot be undone.`)) return;
+    const r = await act(() => api("/api/media/delete", { method: "POST", body: { keys } }));
+    if (!r) return;
+    const bad = r.results.filter((x) => !x.ok);
+    if (bad.length) toast(bad.map((x) => `${x.key.split("/").pop()}: ${x.error}`).join(" · "), true);
+    else toast(keys.length === 1 ? "Deleted" : `${keys.length} files deleted`);
+    route();
+  };
+  const moveDrawer = (keys, copy = false) => {
+    const target = h("select", {}, folderOptions(folder));
+    const name = keys.length === 1 ? h("input", { value: keys[0].split("/").pop() }) : null;
+    drawer(copy ? "Copy to folder" : keys.length === 1 ? "Rename or move" : `Move ${keys.length} files`, h("form", { onsubmit: async (e) => {
+      e.preventDefault();
+      let ok = 0;
+      for (const k of keys) {
+        const to = `${target.value}/${name ? name.value.trim() : k.split("/").pop()}`;
+        if (await act(() => api(copy ? "/api/media/copy" : "/api/media/move", { method: "POST", body: { from: k, to } }))) ok++;
+      }
+      if (ok) { toast(`${ok} file${ok > 1 ? "s" : ""} ${copy ? "copied" : "moved"}`); closeDrawer(); route(); }
+    } }, field("Folder", target), name ? field("File name", name, "Letters, numbers, spaces and . _ - ( ) +") : null,
+      h("p", { class: "small muted" }, "Scheduled and draft posts using a moved file are updated automatically."),
+      h("button", { class: "primary", type: "submit" }, copy ? "Copy" : "Save")));
+  };
+  const bulk = h("div", { class: "row", hidden: true },
+    h("button", { onclick: () => moveDrawer([...selected]) }, "Move selected"),
+    h("button", { class: "danger", onclick: () => removeKeys([...selected]) }, "Delete selected"));
+
+  const tile = (m) => {
+    const cb = h("input", { type: "checkbox", "aria-label": `Select ${m.name}`, onchange: (e) => { e.target.checked ? selected.add(m.key) : selected.delete(m.key); syncSel(); } });
+    const ctx = { kind: m.kind === "video" ? "video" : m.kind === "gif" ? "animation" : "photo", target: m.key.startsWith("vip/") ? "vip" : "public" };
+    return h("div", { class: "media-tile" },
+      h("label", { class: "tile-check" }, cb),
+      m.kind === "video" ? h("video", { src: fileUrl(m.key), preload: "metadata", muted: true, controls: true }) : h("img", { src: fileUrl(m.key), alt: m.name, loading: "lazy" }),
+      h("div", { class: "meta" }, h("span", { class: "clip mono", title: m.key }, m.name),
+        h("span", { class: "muted" }, `${KIND_NAME[m.kind] || m.type} · ${mb(m.size)} · ${m.uploaded ? fmtDay.format(new Date(m.uploaded * 1000)) : ""}`),
+        q || kind || days ? h("span", { class: "muted small" }, m.folder) : null),
+      h("div", { class: "row" },
+        m.key.startsWith("paid-media/") ? h("button", { class: "link", onclick: () => editor(null, { kind: "paid_media", target: "vip", media_url: "r2:" + m.key, star_count: 50 }) }, "Paid post")
+          : h("button", { class: "link", onclick: () => editor(null, { ...ctx, media_url: "r2:" + m.key }) }, "New post"),
+        h("a", { class: "link", href: fileUrl(m.key, true) }, "Download"),
+        h("button", { class: "link", onclick: () => moveDrawer([m.key]) }, "Rename / move"),
+        h("button", { class: "link", onclick: () => moveDrawer([m.key], true) }, "Copy"),
+        h("button", { class: "link danger", onclick: () => removeKeys([m.key]) }, "Delete")));
+  };
+
+  const search = h("input", { type: "search", value: q, placeholder: "Search all folders" });
+  const kindSel = h("select", { onchange: (e) => go({ kind: e.target.value }) }, [["", "All types"], ["image", "Photos"], ["video", "Videos"], ["gif", "GIFs"]].map(([v, l]) => h("option", { value: v, selected: v === kind }, l)));
+  const daySel = h("select", { onchange: (e) => go({ days: e.target.value }) }, [["", "Any date"], ["1", "Last 24 hours"], ["7", "Last 7 days"], ["30", "Last 30 days"]].map(([v, l]) => h("option", { value: v, selected: v === days }, l)));
+  const tree = h("nav", { class: "folder-tree", "aria-label": "Folders" }, folders.map((f) => h("a", { href: `#media?folder=${encodeURIComponent(f.path)}`,
+    class: (f.path === folder && !q && !kind && !days ? "active " : "") + `lvl-${f.path.split("/").length}`, title: f.path },
+    h("span", {}, f.path.split("/").pop()), f.files ? h("span", { class: "count-muted" }, num(f.files)) : null)));
+  const folderTools = h("div", { class: "row" },
+    h("button", { onclick: () => { const n = prompt(`New folder inside ${folder}/ (or a full path like campaigns/december):`); if (n) act(() => api("/api/media/folders", { method: "POST", body: { path: n.includes("/") ? n : `${folder}/${n}` } }), "Folder created").then((r) => r && go({ folder: r.path })); } }, "New folder"),
+    cur && !cur.protected ? h("button", { onclick: () => { const n = prompt("New folder path:", folder); if (n && n !== folder) act(() => api("/api/media/folders/rename", { method: "POST", body: { from: folder, to: n } }), "Folder renamed").then((r) => r && go({ folder: r.path })); } }, "Rename folder") : null,
+    cur && !cur.protected ? h("button", { class: "danger", onclick: () => { if (confirm(`Delete the empty folder ${folder}?`)) act(() => api("/api/media/folders/delete", { method: "POST", body: { path: folder } }), "Folder deleted").then((r) => r && go({ folder: "public/photos" })); } }, "Delete folder") : null);
+
+  put(main, head("Media library", "Private storage (Cloudflare R2). Files are only visible to signed-in admins and sent to Telegram as uploads."),
+    storageBar(st), migrationCard(st.migration),
+    h("div", { class: "media-layout" },
+      h("section", { class: "card" }, h("h3", {}, "Folders"), tree),
+      h("section", { class: "card" },
+        h("form", { class: "row search-row", onsubmit: (e) => { e.preventDefault(); go({ q: search.value.trim() }); } }, search, kindSel, daySel, h("button", { type: "submit" }, "Search"),
+          q || kind || days ? h("button", { type: "button", onclick: () => (location.hash = `#media?folder=${encodeURIComponent(folder)}`) }, "Clear") : null),
+        h("div", { class: "row spread" }, h("h2", {}, q || kind || days ? `Results (${files.length})` : `${folder} (${files.length})`), folderTools),
+        !q && !kind && !days ? drop : null, queue,
+        h("div", { class: "row" }, files.length ? h("label", { class: "inline" }, h("input", { type: "checkbox", onchange: (e) => {
+          main.querySelectorAll(".tile-check input").forEach((c) => { c.checked = e.target.checked; c.dispatchEvent(new Event("change")); }); } }), "Select all") : null, selCount, bulk),
+        files.length ? h("div", { class: "media-grid" }, files.map(tile)) : h("p", { class: "empty" }, "No files here yet."))));
+}
+
+function migrationCard(m) {
+  if (!m || m.status === "not_started") return null;
+  if (m.status === "done" && !m.failed.length) return null;
+  return h("section", { class: "card" }, h("h2", {}, "Copy from the previous media storage"),
+    m.status === "done" ? h("p", {}, `${num(m.copied)} files copied and verified.`) : h("p", {}, `Copying… ${num(m.copied)} of ${num(m.total)} done (a few files a minute).`),
+    m.failed.length ? h("div", {}, h("p", { class: "small" }, chip("failed", `${m.failed.length} need re-upload`), " These could not be copied. Upload them again here:"),
+      h("ul", { class: "list" }, m.failed.map((f) => h("li", {}, h("span", { class: "mono" }, f.public_id), h("span", { class: "small muted" }, f.error))))) : null);
 }
 
 async function pageAutomation(main) {
@@ -1074,10 +1123,11 @@ async function pageAutomation(main) {
     h("div", { class: `banner ${a.mode === "live" ? "" : "warn"}` }, modeText),
     h("section", { class: "card" }, h("h2", {}, "Posting"),
       sw("automation_paused", a.automation_paused, "Dashboard posting", "Scheduled posts, repeating posts, poll closing and post expiry from this dashboard. Member sync and backups keep running."),
-      sw("poster_paused", a.poster_paused, `GitHub auto-poster (${a.poster_slots_ist.join(" and ")})`, "Smart rotation from Cloudinary. When paused, the GitHub job skips its slot and posts nothing."),
+      sw("poster_paused", a.poster_paused, `GitHub auto-poster (${a.poster_slots_ist.join(" and ")})`, "The original scheduled job (GitHub). When paused, it skips its slot and posts nothing. Replaced by the R2 automatic posts below once you retire it."),
       h("p", { class: "small muted" }, "The GitHub poster reads this switch only after its secret POSTER_CONTROL_URL is set to ", h("span", { class: "mono" }, location.origin + a.poster_control_path),
         " (GitHub → Settings → Secrets → Actions). If the dashboard can't be reached, it posts as normal."),
       h("p", { class: "small muted" }, "Individual features (polls, expiry, paid-media automation…) are in ", h("a", { href: "#settings" }, "Features & settings"), ". The dashboard never posts the GitHub poster's media, so nothing is posted twice.")),
+    await mediaSourcesCard(),
     h("section", { class: "card" }, h("h2", {}, "Private preview chat"),
       h("p", { class: "small muted" }, "Your own Telegram user ID (from @userinfobot). Send /start to the bot from that account first. While the preview lock is on, everything is sent only here."),
       h("form", { onsubmit: async (e) => {
@@ -1086,6 +1136,39 @@ async function pageAutomation(main) {
       } }, field("Preview chat ID", chat), ...re.nodes, h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Save")))));
 }
 
+
+// Automations → Media sources: which R2 folder each channel/workflow uses, and the R2 automatic posts.
+async function mediaSourcesCard() {
+  let d, folders;
+  try { [d, folders] = await Promise.all([api("/api/media/sources"), api("/api/media/folders")]); }
+  catch (e) { return h("section", { class: "card" }, h("h2", {}, "Media sources"), h("p", { class: "muted" }, e.message)); }
+  const sel = {};
+  const allowed = (k, f) => (k === "paid_media" ? f.startsWith("paid-media") : !f.startsWith("paid-media") && !(k.startsWith("public_") && f.startsWith("vip")));
+  const rows = Object.entries(d.labels).map(([k, label]) => {
+    sel[k] = h("select", {}, folders.filter((f) => allowed(k, f.path)).map((f) => h("option", { value: f.path, selected: f.path === d.sources[k] }, f.path)));
+    return field(label, sel[k]);
+  });
+  const toIst = (t) => { const [hh, mm] = t.split(":").map(Number); const m = (hh * 60 + mm + 330) % 1440; return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; };
+  const auto = (t, label) => {
+    const c = d.autopost[t] || {};
+    const times = h("input", { value: (c.times_utc || []).join(", "), placeholder: t === "public" ? "default 16:30, 23:30 (5 AM / 10 PM IST)" : "e.g. 14:30 (UTC)" });
+    const on = h("input", { type: "checkbox", checked: !!c.enabled });
+    const retired = t === "public" ? h("input", { type: "checkbox", checked: d.github_poster_retired }) : null;
+    return h("form", { class: "card inner", onsubmit: async (e) => { e.preventDefault();
+      if (await act(() => api(`/api/media/autopost/${t}`, { method: "PUT", body: { enabled: on.checked, times_utc: times.value, ...(retired ? { github_poster_retired: retired.checked } : {}) } }), "Saved")) route(); } },
+      h("h3", {}, label), h("label", { class: "inline field" }, on, `Post automatically from ${d.sources[`${t}_auto`]}`),
+      field("Times (UTC, comma-separated)", times, c.times_utc?.length ? `India time: ${c.times_utc.map(toIst).join(", ")}` : "Empty = the same 5 AM / 10 PM IST slots as before."),
+      retired ? h("label", { class: "inline field" }, retired, "The old GitHub auto-poster is switched off (required, so the same slot is never posted twice)") : null,
+      h("p", { class: "small muted" }, "New files first, then the file posted longest ago after a 30-day cooldown. One post per time slot. Also needs “Automatic posts from R2” in Features & settings."),
+      h("button", { type: "submit" }, "Save"));
+  };
+  return h("section", { class: "card" }, h("h2", {}, "Media sources"),
+    h("p", { class: "small muted" }, "Which private folder each channel and workflow uses. Public workflows can never use VIP or paid-media folders; paid media only uses paid-media folders. Newly uploaded files are never posted unless the matching automation is on."),
+    h("form", { onsubmit: async (e) => { e.preventDefault();
+      if (await act(() => api("/api/media/sources", { method: "PUT", body: { sources: Object.fromEntries(Object.entries(sel).map(([k, el]) => [k, el.value])) } }), "Saved")) route(); } },
+      h("div", { class: "grid two" }, rows), h("button", { class: "primary", type: "submit" }, "Save folders")),
+    h("div", { class: "grid two" }, auto("public", "Public channel automatic posts"), auto("vip", "VIP channel automatic posts")));
+}
 
 // ---------- Telegram pages added with the sidebar restructure ----------
 
@@ -1116,7 +1199,8 @@ async function pageSecurity(main) {
     h("section", { class: "card" }, h("h2", {}, "Protection in place"), h("ul", { class: "list" }, [
       "Supabase Auth sign-in, CSRF tokens, login rate limit (15-minute lockout)",
       "Every credential change needs your password again",
-      "Telegram tokens and Cloudinary secrets encrypted per record; never shown in full",
+      "Telegram tokens encrypted per record; never shown in full",
+      "Media is stored privately in Cloudflare R2: no public bucket, no public links; files reach Telegram as uploads",
       "Every change is written to the activity log",
     ].map((t) => h("li", {}, t))), h("a", { href: "#activity" }, "Open activity log →")),
     can("backup") ? await backupCard() : null);
