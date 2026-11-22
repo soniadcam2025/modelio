@@ -2,11 +2,10 @@ import { botAllows } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 // Send-only automation, run by the Worker's cron trigger. A port of shakhira_bot/scheduler.py.
 // Every part is off until its feature flag is on. A post is claimed before it is sent and is never re-sent
-// after an uncertain result. This Worker never posts the Cloudinary media that the GitHub Actions poster
-// handles, so the two can never post the same thing.
+// after an uncertain result. Media comes from the private R2 library; the GitHub Actions poster's slots are
+// only taken over by R2 automatic posts after it is retired, so the two never post the same slot.
 
 import { TelegramError } from "./telegram.js";
-import { classify, GITHUB_POSTER_FOLDER, privateDownloadUrl } from "./cloudinary.js";
 import { cleanKey, loadForTelegram, mediaKind, mediaSources, zoneAllowed } from "./r2media.js";
 
 const STALE_SENDING_SECONDS = 10 * 60;
@@ -35,47 +34,6 @@ function markup(item, config) {
   return undefined;
 }
 
-// Telegram downloads photos sent by link itself, and refuses them ("failed to get HTTP URL content") when the
-// file is over 5 MB, in a format it can't read (HEIC, some PNG/WebP), or too large in pixels. Uploads from
-// phones are often like that. Cloudinary images are therefore requested as a JPEG of at most 2560 px,
-// which is always within Telegram's photo limits. The original file in Cloudinary is unchanged.
-const PHOTO_TRANSFORM = "f_jpg,q_auto:good,c_limit,w_2560,h_2560";
-export function telegramPhotoUrl(url) {
-  const m = /^(https:\/\/res\.cloudinary\.com\/[^/]+\/image\/upload\/)(.+)$/.exec(String(url || ""));
-  if (!m || m[2].startsWith(PHOTO_TRANSFORM)) return url;
-  return m[1] + PHOTO_TRANSFORM + "/" + m[2];
-}
-
-const URL_FETCH_REFUSED = /failed to get HTTP URL content|wrong file identifier\/HTTP URL|wrong type of the web page content|IMAGE_PROCESS_FAILED|PHOTO_INVALID_DIMENSIONS|failed to get file/i;
-const MAX_PHOTO_UPLOAD = 10 * 1024 * 1024;
-
-// Fallback: download the image here and upload it to Telegram as a file. Only used after Telegram answered
-// 400 to the link, which means nothing was posted, so this can't create a duplicate.
-async function uploadPhoto(tg, params, urls, { method = "sendPhoto", field = "photo" } = {}, fetchImpl = fetch) {
-  const problems = [];
-  for (const url of [...new Set(urls)]) {
-    let res;
-    try { res = await fetchImpl(url, { redirect: "follow" }); } catch { problems.push("network error"); continue; }
-    if (!res.ok) { problems.push(`HTTP ${res.status}${res.headers.get("x-cld-error") ? ` (${res.headers.get("x-cld-error")})` : ""}`); continue; }
-    const blob = await res.blob();
-    if (blob.size > MAX_PHOTO_UPLOAD) { problems.push(`${Math.round(blob.size / 1048576)} MB is over Telegram's 10 MB photo limit`); continue; }
-    // Check the actual bytes (Cloudinary's download API may label files application/octet-stream).
-    const b = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
-    const ext = b[0] === 0xff && b[1] === 0xd8 ? "jpg" : b[0] === 0x89 && b[1] === 0x50 ? "png"
-      : b[0] === 0x47 && b[1] === 0x49 ? "gif" : b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50 ? "webp" : null;
-    if (!ext) { problems.push(`not a JPEG/PNG/WebP/GIF image (${(res.headers.get("content-type") || "unknown").split(";")[0]})`); continue; }
-    return tg.upload(method, params, field, blob, `photo.${ext}`);
-  }
-  throw new TelegramError(`${method}: Telegram could not fetch the image link and the upload fallback failed (${problems.join("; ")}). Check the file in the media library, then use Retry.`, { code: 400 });
-}
-
-// Public link first, then Cloudinary's signed download (as JPEG, then the original format).
-async function fallbackUrls(config, original, link) {
-  const urls = [link, original];
-  for (const fmt of ["jpg", null]) { const u = await privateDownloadUrl(config.cloudinary, original, fmt); if (u) urls.push(u); }
-  return urls;
-}
-
 export async function sendItem(tg, config, item, text) {
   const chat_id = targetChat(config, item.target);
   const reply_markup = markup(item, config);
@@ -97,16 +55,7 @@ export async function sendItem(tg, config, item, text) {
   }
   switch (item.kind) {
     case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content, parse_mode });
-    case "photo": {
-      const params = { parse_mode, chat_id, caption, reply_markup, protect_content };
-      const link = telegramPhotoUrl(item.media_url);
-      try {
-        return await tg.call("sendPhoto", { ...params, photo: link });
-      } catch (err) {
-        if (!(err instanceof TelegramError) || err.code !== 400 || !URL_FETCH_REFUSED.test(err.message)) throw err;
-        return uploadPhoto(tg, params, await fallbackUrls(config, item.media_url, link));
-      }
-    }
+    case "photo": return tg.call("sendPhoto", { parse_mode, chat_id, photo: item.media_url, caption, reply_markup, protect_content });
     case "video": return tg.call("sendVideo", { parse_mode, chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
     case "animation": return tg.call("sendAnimation", { parse_mode, chat_id, animation: item.media_url, caption, reply_markup, protect_content });
     case "poll": case "quiz": {
@@ -118,15 +67,7 @@ export async function sendItem(tg, config, item, text) {
     case "paid_media": {
       const path = item.media_url.toLowerCase().split("?")[0];
       const type = VIDEO_EXT.some((e) => path.endsWith(e)) ? "video" : "photo";
-      const media = type === "photo" ? telegramPhotoUrl(item.media_url) : item.media_url;
-      const params = { chat_id, star_count: item.star_count, caption, parse_mode, protect_content, reply_markup };
-      try {
-        return await tg.call("sendPaidMedia", { ...params, media: [{ type, media }] });
-      } catch (err) {
-        if (type !== "photo" || !(err instanceof TelegramError) || err.code !== 400 || !URL_FETCH_REFUSED.test(err.message)) throw err;
-        return uploadPhoto(tg, { ...params, media: [{ type: "photo", media: "attach://file" }] }, await fallbackUrls(config, item.media_url, media),
-          { method: "sendPaidMedia", field: "file" });
-      }
+      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption, parse_mode, protect_content, reply_markup });
     }
     default: throw new Error(`Unknown content kind ${item.kind}`);
   }
@@ -285,42 +226,31 @@ export function dueSlots(times, now, windowSeconds = 30 * 60) {
   return out;
 }
 
-// Automated paid media: at each configured time, queue the next unused asset from its own Cloudinary folder.
-// The slot is claimed in D1 first (INSERT … ON CONFLICT DO NOTHING), so one slot can never create two posts.
-// Used assets are remembered in D1, never as Cloudinary tags. The GitHub poster's folder is refused.
-// With R2 connected, the files come from the paid-media folder assigned in Automations → Media sources.
-export async function queueAutoPaidMedia(ops, now, listAssets, bucket = null) {
+// Automated paid media: at each configured time, queue the next unused file from the paid-media folder (R2,
+// Automations → Media sources). The slot is claimed first (INSERT … ON CONFLICT DO NOTHING), so one slot can never
+// create two posts, and each file is used once (auto_paid_posted).
+export async function queueAutoPaidMedia(ops, now, bucket) {
   const cfg = await ops.paidMediaConfig();
-  if (bucket) {
-    const folder = (await mediaSources(ops)).paid_media;
-    cfg.folder = folder;
-    listAssets = async (prefix) => (await listR2(bucket, prefix)).map((o) => ({ public_id: "r2:" + o.key, secure_url: "r2:" + o.key,
-      created_at: new Date(o.uploaded).toISOString(), r2kind: mediaKind(o.httpMetadata?.contentType) }));
-  }
-  if (!cfg.folder || !cfg.times_utc.length || cfg.folder.toLowerCase() === GITHUB_POSTER_FOLDER || !listAssets) return [];
+  if (!bucket || !cfg.times_utc.length) return [];
+  const folder = (await mediaSources(ops)).paid_media;
   const queued = [];
   for (const { slot } of dueSlots(cfg.times_utc, now)) {
     const claim = await ops.run("INSERT INTO auto_paid_runs (slot, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING", slot, now);
     if (claim.meta.changes !== 1) continue; // this slot was already handled
-    let assets;
-    try {
-      assets = await listAssets(cfg.folder);
-    } catch (err) {
-      await ops.run("UPDATE auto_paid_runs SET note=? WHERE slot=?", `listing failed: ${err.message}`, slot);
-      continue;
-    }
+    let files;
+    try { files = await listR2(bucket, folder); }
+    catch (err) { await ops.run("UPDATE auto_paid_runs SET note=? WHERE slot=?", `listing failed: ${err.message}`, slot); continue; }
     const used = new Set((await ops.all("SELECT public_id FROM auto_paid_posted")).map((r) => r.public_id));
-    const usable = (a) => (a.r2kind ? ["image", "video"].includes(a.r2kind) && zoneAllowed(a.public_id.slice(3), { kind: "paid_media" })
-      : classify(a).kind && ["photo", "video"].includes(classify(a).kind));
-    const next = assets.filter((a) => usable(a) && !used.has(a.public_id))
-      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.public_id.localeCompare(b.public_id))[0];
+    const next = files.filter((o) => ["image", "video"].includes(mediaKind(o.httpMetadata?.contentType)) && zoneAllowed(o.key, { kind: "paid_media" }) && !used.has("r2:" + o.key))
+      .sort((a, b) => new Date(a.uploaded) - new Date(b.uploaded) || a.key.localeCompare(b.key))
+      .map((o) => ({ public_id: "r2:" + o.key, secure_url: "r2:" + cleanKey(o.key) }))[0];
     if (!next) {
       await ops.run("UPDATE auto_paid_runs SET note='no unused media left in the folder' WHERE slot=?", slot);
       continue;
     }
     const item = await ops.createContent({
-      kind: "paid_media", target: cfg.target, media_url: next.secure_url, star_count: next.stars || cfg.default_stars,
-      text: next.caption || cfg.caption || "", expire_after_minutes: cfg.expire_after_minutes, source: `auto:${next.public_id}`,
+      kind: "paid_media", target: cfg.target, media_url: next.secure_url, star_count: cfg.default_stars,
+      text: cfg.caption || "", expire_after_minutes: cfg.expire_after_minutes, source: `auto:${next.public_id}`,
     }, "automation");
     await ops.scheduleContent(item.id, now, "automation");
     await ops.run("INSERT INTO auto_paid_posted (public_id, content_id, posted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", next.public_id, item.id, now);
@@ -417,7 +347,7 @@ export async function sendReminders(tg, ops, config, now, { trials = true, renew
   return out;
 }
 
-export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null, bots = [], tgForBot = async () => null, bucket = null } = {}) {
+export async function runCycle(tg, ops, config, now, alert, { liveDb = null, bots = [], tgForBot = async () => null, bucket = null } = {}) {
   await ops.setSetting("heartbeat:worker", now);
   // Read-only mirror of the live bot's members and trials (needs the LIVE_DB binding and the feature switched on).
   const summary = {};
@@ -432,7 +362,7 @@ export async function runCycle(tg, ops, config, now, alert, { listAssets = null,
   await ops.run("DELETE FROM revoked_sessions WHERE expires_at < ?", now);
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
-  if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets, bucket)).length;
+  if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, bucket)).length;
   if (on("r2_autopost")) summary.auto_posts_queued = (await queueR2AutoPosts(ops, now, bucket, config.slotTimes, alert)).length;
   if (paused) { summary.paused = true; return summary; }
   // Primary bot (@ShakhiraVIPBot): runs unless it is registered with its automation switched off.

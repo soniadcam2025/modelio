@@ -178,7 +178,23 @@ function drawer(title, body) {
   document.body.append(bg, panel);
   document.addEventListener("keydown", escClose);
 }
-function escClose(e) { if (e.key === "Escape") closeDrawer(); }
+function escClose(e) { if (e.key === "Escape" && !document.querySelector(".composer")) closeDrawer(); }
+
+// Full-screen, centered workspace (Create / edit post). Uses the drawer classes so closeDrawer() closes it too.
+function composer(title, body) {
+  closeDrawer();
+  const bg = h("div", { class: "drawer-bg" });
+  const close = () => { if (confirm("Close the editor? Unsaved changes are lost.")) closeDrawer(); };
+  const panel = h("div", { class: "drawer composer", role: "dialog", "aria-modal": "true", "aria-label": title },
+    h("div", { class: "composer-top" }, h("h1", {}, title), h("button", { type: "button", onclick: close, "aria-label": "Close" }, "✕ Close")), body);
+  document.body.append(bg, panel);
+  document.body.classList.add("composing");
+  const onKey = (e) => { if (e.key === "Escape" && document.querySelector(".composer") && !document.querySelector(".picker")) close(); };
+  document.addEventListener("keydown", onKey);
+  new MutationObserver((_, obs) => { if (!panel.isConnected) { document.body.classList.remove("composing"); document.removeEventListener("keydown", onKey); obs.disconnect(); } })
+    .observe(document.body, { childList: true });
+  panel.querySelector("select, textarea, input")?.focus();
+}
 function closeDrawer() {
   document.querySelectorAll(".drawer, .drawer-bg").forEach((n) => n.remove());
   document.removeEventListener("keydown", escClose);
@@ -436,8 +452,59 @@ function editor(item, preset = {}) {
   const targetValue = () => { const [a, b] = target.value.split("|"); return b ? { bot_id: Number(a), target: b } : { bot_id: null, target: a }; };
   const text = h("textarea", { maxlength: 4096 }); text.value = v.text || "";
   const mediaUrl = h("input", { type: "hidden", value: v.media_url || "" });
-  const mediaName = h("div", { class: "mono small" });
-  const showMediaName = () => { const m = mediaUrl.value; mediaName.textContent = m ? (m.startsWith("r2:") ? m.slice(3) : m) : "No file chosen"; };
+  // Media: choose from the library, or upload here (straight into R2, in the folder for this channel and type).
+  // Removing the attachment only detaches it; the stored file stays in the Media library.
+  const attachBox = h("div", { class: "attach" });
+  const uploadStatus = h("div", { class: "upload-queue" });
+  const curTarget = () => target.value.split("|").pop() === "vip" ? "vip" : "public";
+  const attachProblem = () => {
+    const ref = mediaUrl.value;
+    if (!ref || !ref.startsWith("r2:")) return null;
+    const key = ref.slice(3), k = kind.value;
+    if (!allowedFor(key, { kind: k, target: curTarget() }))
+      return k === "paid_media" ? "Paid media must come from a paid-media folder. Choose or upload it again." : "This file is in a VIP or paid-media folder and can't be used for this channel. Choose another file or move it first.";
+    const video = isVideoRef(key), gif = /\.gif$/i.test(key);
+    if (k === "photo" && (video || gif)) return "This is a video/GIF; choose a photo or change the post type.";
+    if (k === "video" && !video) return "This is a photo; choose a video or change the post type.";
+    if (k === "animation" && !(gif || video)) return "Choose a GIF or a short video for a GIF post.";
+    return null;
+  };
+  function showMediaName() {
+    const ref = mediaUrl.value;
+    if (!ref) { put(attachBox, h("p", { class: "muted small" }, "No media attached yet.")); return; }
+    const url = ref.startsWith("r2:") ? fileUrl(ref.slice(3)) : ref, problem = attachProblem();
+    put(attachBox, h("div", { class: "attach-card" + (problem ? " bad" : "") },
+      isVideoRef(ref) ? h("video", { src: url, controls: true, muted: true, preload: "metadata" }) : h("img", { src: url, alt: "" }),
+      h("div", { class: "attach-meta" }, h("span", { class: "mono small" }, ref.startsWith("r2:") ? ref.slice(3) : ref),
+        problem ? h("span", { class: "bad-text small" }, problem) : h("span", { class: "small muted" }, "Saved in the Media library"),
+        h("div", { class: "row" },
+          h("button", { type: "button", onclick: () => openPicker() }, "Replace"),
+          h("button", { type: "button", class: "danger", onclick: () => { mediaUrl.value = ""; showMediaName(); drawPreview(); } }, "Remove from post")))));
+  }
+  const openPicker = () => pickMedia((ref) => { mediaUrl.value = ref; showMediaName(); drawPreview(); }, { kind: kind.value, target: curTarget() });
+  async function uploadHere(file) {
+    const problem = checkUpload(file);
+    if (problem) { toast(`${file.name}: ${problem}`, true); return; }
+    const folder = await uploadFolderFor(kind.value, target.value, file);
+    const bar = h("progress", { max: 100, value: 0, class: "upload-progress" }), row = h("div", { class: "small" }, `Uploading ${file.name} to ${folder} `, bar);
+    uploadStatus.replaceChildren(row);
+    try {
+      const r = await uploadToLibrary(file, folder, (pct) => { bar.value = pct; });
+      row.replaceChildren(`✓ ${file.name} saved to ${r.key.slice(0, r.key.lastIndexOf("/"))}`);
+      mediaUrl.value = "r2:" + r.key; showMediaName(); drawPreview();
+    } catch (e) {
+      row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${file.name}: ${e.message} `), h("button", { type: "button", onclick: () => uploadHere(file) }, "Retry"));
+    }
+  }
+  const fileInput = h("input", { type: "file", accept: ACCEPT, hidden: true, onchange: (e) => { if (e.target.files[0]) uploadHere(e.target.files[0]); e.target.value = ""; } });
+  const folderHint = h("span", { class: "small muted" });
+  const refreshFolderHint = async () => { folderHint.textContent = `New uploads go to ${await uploadFolderFor(kind.value, target.value, { type: kind.value === "video" ? "video/mp4" : kind.value === "animation" ? "image/gif" : "image/jpeg" })}`; };
+  const dropArea = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); dropArea.classList.add("over"); }, ondragleave: () => dropArea.classList.remove("over"),
+    ondrop: (e) => { e.preventDefault(); dropArea.classList.remove("over"); if (e.dataTransfer.files[0]) uploadHere(e.dataTransfer.files[0]); } },
+    h("label", { class: "btn primary" }, "Upload new", fileInput), h("button", { type: "button", onclick: () => openPicker() }, "Choose from library"),
+    h("span", { class: "small muted" }, "or drop a file here"), folderHint);
+  const mediaPanel = h("div", {}, attachBox, dropArea, uploadStatus,
+    h("p", { class: "small muted" }, "Photos up to 10 MB; videos and GIFs up to 50 MB. Sent to Telegram as an upload from your private storage."));
   const useLib = h("input", { type: "checkbox", checked: !!v.use_caption_library });
   const optsBox = h("div", {});
   const correct = h("select", {});
@@ -483,19 +550,7 @@ function editor(item, preset = {}) {
 
   const groups = {
     text: field("Text", text, "Up to 4,096 characters for text posts, 1,024 for captions, 300 for poll questions."),
-    media: h("div", {}, h("div", { class: "field" }, "Media file", mediaUrl, mediaName,
-        h("span", { class: "hint" }, "From the private media library. Sent to Telegram as an upload: photos up to 10 MB, videos and GIFs up to 50 MB.")),
-      h("div", { class: "row" },
-        h("label", { class: "btn" }, "Upload from this device", h("input", { type: "file", accept: "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm", hidden: true, onchange: async (e) => {
-          const f = e.target.files[0]; if (!f) return;
-          const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
-          e.target.closest(".row").after(bar);
-          const folder = await uploadFolderFor(kind.value, target.value, f);
-          const r = await act(() => uploadToLibrary(f, folder, (pct) => { bar.value = pct; }), `Uploaded to ${folder}`);
-          bar.remove();
-          if (r) { mediaUrl.value = "r2:" + r.key; showMediaName(); drawPreview(); }
-        } })),
-        h("button", { type: "button", onclick: () => pickMedia((ref) => { mediaUrl.value = ref; showMediaName(); drawPreview(); }, { kind: kind.value, target: target.value.split("|").pop() }) }, "Choose from library"))),
+    media: mediaPanel,
     lib: h("label", { class: "inline field" }, useLib, "Leave the caption empty and use the caption library"),
     format: h("div", {}, h("label", { class: "inline field" }, html, "Formatting (bold, italic, links with their own text)"),
       h("p", { class: "small muted" }, 'Use <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strike</s>, <tg-spoiler>spoiler</tg-spoiler>, <a href="https://…">link text</a>. Plain links and emoji work without it.')),
@@ -506,6 +561,11 @@ function editor(item, preset = {}) {
     stars: field("Price in Stars", stars, "Each viewer unlocks it for this many Stars (Telegram's native paid media). It is NOT view-once: anyone who paid can open it again at any time. “Protected content” stops forwarding and saving in Telegram apps, but not screenshots or screen recording."),
     button: h("div", {}, h("h3", {}, "Buttons (optional, up to 6)"), buttonsBox, h("p", { class: "small muted" }, "Each button opens a link. VIP promotions without buttons get a “💎 Join VIP” button automatically.")),
   };
+  let mediaSection = null, buttonsSection = null;
+  function syncSections() {
+    if (mediaSection) mediaSection.hidden = groups.media.hidden;
+    if (buttonsSection) buttonsSection.hidden = groups.button.hidden;
+  }
   function show() {
     const k = kind.value;
     const isMedia = ["photo", "video", "animation", "paid_media"].includes(k);
@@ -519,6 +579,7 @@ function editor(item, preset = {}) {
     groups.button.hidden = ["poll", "quiz"].includes(k);
     groups.format.hidden = ["poll", "quiz"].includes(k);
     groups.text.firstChild.textContent = ["poll", "quiz"].includes(k) ? "Question" : isMedia ? "Caption" : "Text";
+    syncSections();
   }
   // What the post will look like (approximate; Telegram decides the final layout).
   function drawPreview() {
@@ -541,7 +602,9 @@ function editor(item, preset = {}) {
   }
   drawButtons();
   showMediaName();
-  kind.addEventListener("change", () => { show(); drawPreview(); });
+  kind.addEventListener("change", () => { show(); drawPreview(); showMediaName(); refreshFolderHint(); });
+  target.addEventListener("change", () => { showMediaName(); refreshFolderHint(); });
+  refreshFolderHint();
   for (const el of [text, mediaUrl, stars, hashtags, target, protect, correct, html]) { el.addEventListener("input", drawPreview); el.addEventListener("change", drawPreview); }
   show();
   drawPreview();
@@ -561,13 +624,18 @@ function editor(item, preset = {}) {
   async function save(mode) {
     if (busy) return;
     busy = true;
-    const buttonsEls = [...document.querySelectorAll(".drawer .row.end button")];
+    const buttonsEls = [...document.querySelectorAll(".composer-actions button")];
     buttonsEls.forEach((b) => { b.disabled = true; });
     try { await saveInner(mode); } finally { busy = false; buttonsEls.forEach((b) => { b.disabled = false; }); }
   }
   async function saveInner(mode) {
     const body = payload();
     if (mode === true) mode = "schedule";
+    if (["photo", "video", "animation", "paid_media"].includes(body.kind)) {
+      if (!body.media_url) { toast("Attach a photo or video first", true); return; }
+      const problem = attachProblem();
+      if (problem) { toast(problem, true); return; }
+    }
     if (mode === "schedule" && !body.scheduled_at) { toast("Choose when to publish", true); return; }
     const saved = await act(async () => {
       let r = item && item.id ? await api(`/api/content/${item.id}`, { method: "PUT", body }) : await api("/api/content", { method: "POST", body });
@@ -579,21 +647,29 @@ function editor(item, preset = {}) {
     }, { draft: "Saved as draft", schedule: "Scheduled", publish: "Publishing within a minute", preview: "Preview sent to your Telegram (saved as a draft)" }[mode]);
     if (saved && mode !== "preview") { closeDrawer(); location.hash = "#content"; route(); }
   }
-  drawer(item ? `Edit post #${item.id}` : "New post", h("form", { onsubmit: (e) => { e.preventDefault(); save(true); } },
-    h("div", { class: "grid two" }, field("Type", kind), field("Channel", target)),
-    groups.text, groups.format, groups.media, groups.lib, groups.poll, groups.multi, groups.quiz, groups.close, groups.stars, groups.button,
-    can("hashtags") ? field("Hashtags (optional)", hashtags, "Up to 10, added on a new line at the end of the text or caption. Not added to polls or quizzes.") : null,
-    can("post_expiry") ? field("Delete automatically after (minutes, optional)", expire,
-      "5 minutes to 48 hours. Telegram lets bots delete their own posts only within 48 hours. Needs “Delete posts automatically” on.") : null,
-    can("content_v2") ? h("label", { class: "inline field" }, protect, "Protected content (no forwarding or saving in Telegram apps)") : null,
-    field("Publish at (India time)", at, "Posts go out within about a minute of this time, once Scheduled posts is on."),
+  const section = (title, ...kids) => h("section", { class: "card composer-section" }, h("h2", {}, title), ...kids);
+  const settings = section("Publishing",
+    h("div", { class: "grid two" }, field("Publish at (India time)", at, "Posts go out within about a minute of this time, once Scheduled posts is on."),
+      can("post_expiry") ? field("Delete automatically after (minutes)", expire, "Optional. 5 minutes to 48 hours (Telegram's limit for bots).") : h("span")),
     can("content_v2") ? repeatBox : null,
-    can("content_v2") ? previewBox : null,
-    h("div", { class: "row end" },
+    can("content_v2") ? h("label", { class: "inline field" }, protect, "Protected content (no forwarding or saving in Telegram apps)") : null);
+  composer(item ? `Edit post #${item.id}` : "Create post", h("form", { class: "composer-form", onsubmit: (e) => { e.preventDefault(); save(true); } },
+    h("div", { class: "composer-head" }, field("Post type", kind), field("Channel", target)),
+    h("div", { class: "composer-body" },
+      h("div", { class: "composer-main" },
+        section("Content", groups.text, groups.format, groups.lib, groups.poll, groups.multi, groups.quiz, groups.close, groups.stars,
+          can("hashtags") ? field("Hashtags (optional)", hashtags, "Up to 10, added on a new line at the end. Not added to polls or quizzes.") : null),
+        groups.media.hidden !== undefined ? mediaSection = section("Media", groups.media) : null,
+        groups.button.hidden !== undefined ? buttonsSection = section("Buttons & links", groups.button) : null,
+        settings),
+      can("content_v2") ? h("aside", { class: "composer-preview" }, h("h2", {}, "Preview"), previewBox) : null),
+    h("div", { class: "composer-actions" },
       h("button", { type: "button", onclick: () => save("draft") }, "Save draft"),
       can("content_v2") ? h("button", { type: "button", onclick: () => save("preview") }, "Send preview to me") : null,
-      can("content_v2") ? h("button", { type: "button", onclick: () => save("publish") }, "Publish now") : null,
-      h("button", { class: "primary", type: "submit" }, "Schedule"))));
+      h("span", { class: "spacer" }),
+      h("button", { type: "submit" }, "Schedule"),
+      can("content_v2") ? h("button", { type: "button", class: "primary", onclick: () => save("publish") }, "Publish now") : null)));
+  syncSections();
 }
 
 function captionEditor(captions) {
@@ -946,6 +1022,17 @@ const isVideoRef = (ref) => /\.(mp4|mov|webm)(\?|$)/i.test(ref);
 const mb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 const KIND_NAME = { image: "Photo", gif: "GIF", video: "Video" };
 
+const ACCEPT = "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm";
+const OK_TYPES = ACCEPT.split(",");
+// Checked before uploading (the server checks the bytes again).
+function checkUpload(file) {
+  if (!OK_TYPES.includes(file.type)) return /hei[cf]/i.test(file.type + file.name) ? "HEIC photos can't be sent to Telegram; export as JPEG first" : "Only JPEG, PNG, WebP, GIF, MP4, MOV or WebM files";
+  if (file.size > 50 * 1024 * 1024) return "Files can be at most 50 MB (Telegram's upload limit)";
+  if (file.type.startsWith("image/") && file.type !== "image/gif" && file.size > 10 * 1024 * 1024) return "Photos can be at most 10 MB";
+  if (!file.size) return "The file is empty";
+  return null;
+}
+
 // Upload one file to an R2 folder (body = the file; checked again on the server). Resolves to the stored file.
 function uploadToLibrary(file, folder, onProgress = null) {
   return new Promise((resolve, reject) => {
@@ -982,8 +1069,9 @@ async function pickMedia(onPick, ctx = { kind: "photo", target: "public" }) {
   const box = h("div", { class: "picker" }, h("div", { class: "row" }, h("h3", {}, "Choose from the media library"), h("button", { type: "button", onclick: () => box.remove() }, "Close")),
     h("p", { class: "small muted" }, ctx.kind === "paid_media" ? "Only the paid-media folders are shown." : ctx.target === "public" ? "VIP and paid-media files are hidden for the public channel." : "Paid-media files are hidden here."),
     usable.length ? grid : h("p", { class: "muted" }, "No matching files yet. Upload one first."));
-  document.querySelector(".drawer")?.append(box);
-  box.scrollIntoView({ behavior: "smooth" });
+  box.classList.add("picker-modal");
+  (document.querySelector(".composer") || document.querySelector(".drawer"))?.append(box);
+  box.querySelector("button")?.focus();
 }
 
 function storageBar(st) {
@@ -1012,21 +1100,35 @@ async function pageMedia(main) {
 
   // Upload: button or drag-and-drop, several files, a progress bar each, then refresh.
   const queue = h("div", { class: "upload-queue" });
-  const uploadFiles = async (list) => {
-    const arr = [...list]; let ok = 0;
-    for (const f of arr) {
-      const bar = h("progress", { max: 100, value: 0, class: "upload-progress" }), row = h("div", { class: "small" }, `${f.name} `, bar);
-      queue.append(row);
-      try { await uploadToLibrary(f, folder, (pct) => { bar.value = pct; }); ok++; row.replaceChildren(`✓ ${f.name}`); }
-      catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message}`)); }
-    }
-    toast(`${ok} of ${arr.length} uploaded`, ok < arr.length);
-    if (ok) setTimeout(route, 400);
+  // Several files at once, each with its own progress bar and a Retry button if it fails. Checked before uploading.
+  let pending = 0, uploaded = 0;
+  const finish = () => { if (pending === 0 && uploaded) { toast(`${uploaded} file${uploaded > 1 ? "s" : ""} uploaded to ${folder}`); setTimeout(route, 500); } };
+  const uploadOne = async (f, row) => {
+    const problem = checkUpload(f);
+    if (problem) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${problem}`)); return; }
+    const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
+    row.replaceChildren(h("span", {}, `${f.name} (${mb(f.size)}) `), bar);
+    pending++;
+    try { const r = await uploadToLibrary(f, folder, (pct) => { bar.value = pct; }); uploaded++; row.replaceChildren(`✓ ${r.name}`); }
+    catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message} `), h("button", { type: "button", onclick: () => { chain = chain.then(() => uploadOne(f, row)); } }, "Retry")); }
+    finally { pending--; finish(); }
   };
-  const input = h("input", { type: "file", accept: "image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm", multiple: true, hidden: true, onchange: (e) => uploadFiles(e.target.files) });
+  // One at a time (rows for every file appear at once): the server picks a free name per upload, and parallel
+  // uploads of two same-named files could otherwise both claim the same name.
+  let chain = Promise.resolve();
+  const uploadFiles = (list) => {
+    for (const f of [...list]) {
+      const row = h("div", { class: "small upload-row" }, `${f.name}: waiting…`);
+      queue.append(row);
+      chain = chain.then(() => uploadOne(f, row));
+    }
+  };
+  const input = h("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true, onchange: (e) => { uploadFiles(e.target.files); e.target.value = ""; } });
   const drop = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
     ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); } },
-    h("label", { class: "btn primary" }, "Upload photos or videos", input), h("span", { class: "small muted" }, ` or drop files here · into ${folder} · photos ≤ 10 MB, videos ≤ 50 MB`));
+    h("label", { class: "btn primary" }, "Upload photos or videos", input),
+    h("span", {}, "or drop files here — they go into ", h("strong", { class: "mono" }, folder)),
+    h("span", { class: "small muted" }, "JPEG, PNG, WebP, GIF, MP4, MOV, WebM · photos ≤ 10 MB, videos ≤ 50 MB · same names get “-2”, “-3”"));
 
   const removeKeys = async (keys) => {
     if (!confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : keys.length + " files"}? This cannot be undone.`)) return;
@@ -1086,7 +1188,7 @@ async function pageMedia(main) {
     cur && !cur.protected ? h("button", { class: "danger", onclick: () => { if (confirm(`Delete the empty folder ${folder}?`)) act(() => api("/api/media/folders/delete", { method: "POST", body: { path: folder } }), "Folder deleted").then((r) => r && go({ folder: "public/photos" })); } }, "Delete folder") : null);
 
   put(main, head("Media library", "Private storage (Cloudflare R2). Files are only visible to signed-in admins and sent to Telegram as uploads."),
-    storageBar(st), migrationCard(st.migration),
+    storageBar(st),
     h("div", { class: "media-layout" },
       h("section", { class: "card" }, h("h3", {}, "Folders"), tree),
       h("section", { class: "card" },
@@ -1099,14 +1201,6 @@ async function pageMedia(main) {
         files.length ? h("div", { class: "media-grid" }, files.map(tile)) : h("p", { class: "empty" }, "No files here yet."))));
 }
 
-function migrationCard(m) {
-  if (!m || m.status === "not_started") return null;
-  if (m.status === "done" && !m.failed.length) return null;
-  return h("section", { class: "card" }, h("h2", {}, "Copy from the previous media storage"),
-    m.status === "done" ? h("p", {}, `${num(m.copied)} files copied and verified.`) : h("p", {}, `Copying… ${num(m.copied)} of ${num(m.total)} done (a few files a minute).`),
-    m.failed.length ? h("div", {}, h("p", { class: "small" }, chip("failed", `${m.failed.length} need re-upload`), " These could not be copied. Upload them again here:"),
-      h("ul", { class: "list" }, m.failed.map((f) => h("li", {}, h("span", { class: "mono" }, f.public_id), h("span", { class: "small muted" }, f.error))))) : null);
-}
 
 async function pageAutomation(main) {
   const a = await api("/api/automation");

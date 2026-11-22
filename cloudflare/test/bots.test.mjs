@@ -1,5 +1,5 @@
 // Settings → Bots & integrations: encryption, fresh password checks, masking, isolation between bots,
-// per-bot automation, Cloudinary credentials, and backup/rollback of the configuration.
+// per-bot automation, and backup/rollback of the configuration.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -149,21 +149,6 @@ test("isolation: a bot can only use its own channels, permissions and switch", a
   assert.deepEqual((await call(e, s, `/api/bots/${vip.id}/history`)).body.content, [], "separate histories");
 });
 
-test("Cloudinary credentials: fresh password, tested before saving, masked, used by the media library", async () => {
-  const e = env(), s = await login(e);
-  const creds = { cloud_name: "shakhira", api_key: "123456789", api_secret: CLOUD_SECRET };
-  assert.equal((await call(e, s, "/api/integrations/cloudinary", "PUT", creds)).status, 400, "no password");
-  assert.equal((await call(e, s, "/api/integrations/cloudinary", "PUT", { ...creds, api_secret: "wrong-secret-123", password: PASSWORD })).status, 400, "refused by Cloudinary");
-  const r = await call(e, s, "/api/integrations/cloudinary", "PUT", { ...creds, password: PASSWORD });
-  assert.equal(r.status, 200, r.text);
-  assert.deepEqual([r.body.cloud_name, r.body.api_key, r.body.api_secret], ["shakhira", "••••6789", "••••-xyz"]);
-  assert.equal((await call(e, s, "/api/integrations/cloudinary/test", "POST")).body.last_check_ok, true);
-  assert.equal((await call(e, s, "/api/poster")).body.configured, true, "media library now uses the saved credentials");
-  assert.deepEqual(leaks((await call(e, s, "/api/integrations/cloudinary")).text), []);
-  assert.deepEqual(leaks(JSON.stringify((await e.DB.prepare("SELECT * FROM integration_secrets").all()).results)), []);
-  assert.equal((await call(e, s, "/api/integrations/cloudinary", "DELETE", { password: PASSWORD })).body.connected, false);
-});
-
 test("without CREDENTIALS_KEY nothing can be stored", async () => {
   const e = env({ CREDENTIALS_KEY: undefined }), s = await login(e);
   const r = await call(e, s, "/api/bots", "POST", { token: VIP_TOKEN, password: PASSWORD });
@@ -201,7 +186,6 @@ test("no credential appears in logs", async () => {
     const e = env(), s = await login(e);
     const b = (await call(e, s, "/api/bots", "POST", { token: NEW_TOKEN, password: PASSWORD })).body;
     await call(e, s, `/api/bots/${b.id}/token`, "PUT", { token: "2222222222:AAbad", password: PASSWORD });
-    await call(e, s, "/api/integrations/cloudinary", "PUT", { cloud_name: "x1", api_key: "123456789", api_secret: CLOUD_SECRET, password: PASSWORD });
     await runScheduled(e, Math.floor(Date.now() / 1000));
   } finally { Object.assign(console, orig); }
   assert.deepEqual(leaks(lines.join("\n")), []);
@@ -219,7 +203,7 @@ test("fetch is never called as a method (Cloudflare Workers throws 'Illegal invo
   const tg = new SendOnlyTelegram({ token: VIP_TOKEN, fetchImpl: strictFetch });
   assert.equal((await tg.call("getMe", {})).username, "ShakhiraVIPBot");
   const store = new BotStore(new Ops(makeD1()), { CREDENTIALS_KEY: KEY }, { fetchImpl: strictFetch });
-  assert.equal(await store.cloudinaryTest({ cloud: "shakhira", key: "123456789", secret: CLOUD_SECRET }), true);
+  assert.equal((await store.add(VIP_TOKEN, "test").catch((e) => e)).username ?? "ok", "ShakhiraVIPBot");
   const db = new SupabaseDB({ url: "https://p.supabase.co", key: "sb_secret_x", fetchImpl: function (u, i) { if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation"); return Promise.resolve(new Response("[]")); } });
   assert.deepEqual((await db.prepare("SELECT 1").all()).results, []);
 });

@@ -10,9 +10,7 @@ import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle, sendItem } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
-import { cloudinaryConfig, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory } from "./cloudinary.js";
 import { MediaStore, mediaSources, setMediaSources, SOURCE_LABELS } from "./r2media.js";
-import { migrateStep, migrationStatus } from "./migrate.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
@@ -38,18 +36,13 @@ export async function effectiveEnv(env, ops) {
   }
   const store = new BotStore(ops, env, { botUsername: env.BOT_USERNAME });
   const eff = { ...env };
-  const needToken = !env.BOT_TOKEN, needCloud = !(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET);
-  const [token, cloud] = await Promise.all([
-    needToken ? store.primaryToken(env).catch(() => null) : null,
-    needCloud ? store.cloudinaryCreds().catch(() => null) : null,
-  ]);
+  const token = !env.BOT_TOKEN ? await store.primaryToken(env).catch(() => null) : null;
   if (token) eff.BOT_TOKEN = token;
   // While the preview lock is on, the preview chat saved in the dashboard (your own Telegram chat) is used.
   if (String(env.REQUIRE_PREVIEW || "true").toLowerCase() === "true" && !String(env.PREVIEW_CHAT_ID || "").trim()) {
     const chat = await ops.getSetting("preview_chat_id").catch(() => null);
     if (chat) eff.PREVIEW_CHAT_ID = chat;
   }
-  if (cloud) Object.assign(eff, { CLOUDINARY_CLOUD_NAME: cloud.cloud, CLOUDINARY_API_KEY: cloud.key, CLOUDINARY_API_SECRET: cloud.secret });
   return eff;
 }
 
@@ -117,8 +110,7 @@ export function loadConfig(env) {
     // Daily backup minute (UTC "HH:MM"); 21:40 UTC = 03:10 IST, away from the 5 AM / 10 PM IST posts.
     backupAt: String(env.BACKUP_AT_UTC || "21:40"),
   };
-  // Cloudinary keys for the photo-upload fallback. Not enumerable, so they never appear in JSON or logs.
-  Object.defineProperty(cfg, "cloudinary", { value: cloudinaryConfig(env), enumerable: false });
+  // The private R2 media bucket. Not enumerable, so it never appears in JSON or logs.
   Object.defineProperty(cfg, "media", { value: env.MEDIA || null, enumerable: false });
   return cfg;
 }
@@ -218,10 +210,6 @@ function routes() {
   add("POST", "/api/bots/(\\d+)/channels", async (c, m) => { const b = await body(c.request); return json(await store(c).assignChannel(m[1], b.chat_id, b.kind, c.actor)); });
   add("DELETE", "/api/bots/(\\d+)/channels/([^/]+)", async (c, m) => json(await store(c).unassignChannel(m[1], decodeURIComponent(m[2]), c.actor)));
   add("GET", "/api/bots/(\\d+)/history", async (c, m) => json(await store(c).history(m[1])));
-  add("GET", "/api/integrations/cloudinary", async (c) => json(await store(c).cloudinaryView()));
-  add("PUT", "/api/integrations/cloudinary", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).cloudinarySave(b, c.actor)); });
-  add("POST", "/api/integrations/cloudinary/test", async (c) => json(await store(c).cloudinaryRecheck(c.actor)));
-  add("DELETE", "/api/integrations/cloudinary", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).cloudinaryDisconnect(c.actor)); });
 
   // Read-only view of the bot and both channels (needs BOT_TOKEN; uses only get* methods).
   add("GET", "/api/telegram", async (c) => {
@@ -335,7 +323,6 @@ function routes() {
     if (item.hashtags && !["poll", "quiz"].includes(item.kind)) text = text ? `${text}\n\n${item.hashtags}` : item.hashtags;
     try {
       const pcfg = { ...c.config, previewChatId: chat };
-      Object.defineProperty(pcfg, "cloudinary", { value: c.config.cloudinary, enumerable: false });
       Object.defineProperty(pcfg, "media", { value: c.config.media, enumerable: false });
       const r = await sendItem(tg, pcfg, item, text);
       await c.ops.audit(c.actor, "content_preview", `#${item.id} sent to the preview chat`);
@@ -376,8 +363,8 @@ function routes() {
   const media = (c) => new MediaStore(c.env.MEDIA, c.ops);
   const qp = (c, k) => c.url.searchParams.get(k) || "";
   add("GET", "/api/media/status", async (c) => {
-    if (!c.env.MEDIA) return json({ connected: false, migration: await migrationStatus(c.ops) });
-    return json({ connected: true, usage: await media(c).usage(), migration: await migrationStatus(c.ops) });
+    if (!c.env.MEDIA) return json({ connected: false });
+    return json({ connected: true, usage: await media(c).usage() });
   });
   add("GET", "/api/media/folders", async (c) => json(await media(c).folders()));
   add("POST", "/api/media/folders", async (c) => json(await media(c).createFolder((await body(c.request)).path, c.actor)));
@@ -487,25 +474,6 @@ function routes() {
   add("GET", "/api/settings/paid-media", async (c) => json(await c.ops.paidMediaConfig()));
   add("PUT", "/api/settings/paid-media", async (c) => json(await c.ops.setPaidMediaConfig(await body(c.request), c.actor)));
 
-  // Read-only view of the GitHub poster's Cloudinary folder (and the paid-media folder, if set).
-  add("GET", "/api/poster", async (c) => {
-    const cfg = cloudinaryConfig(c.env);
-    if (!cfg) return json({ configured: false });
-    try {
-      const assets = await listFolder(cfg, GITHUB_POSTER_FOLDER);
-      const paid = await c.ops.paidMediaConfig();
-      let paidFolder = null;
-      if (paid.folder) {
-        const pa = await listFolder(cfg, paid.folder);
-        const used = new Set((await c.ops.all("SELECT public_id FROM auto_paid_posted")).map((r) => r.public_id));
-        paidFolder = { folder: paid.folder, total: pa.length, unused: pa.filter((a) => !used.has(a.public_id)).length };
-      }
-      return json({ configured: true, folder: GITHUB_POSTER_FOLDER, inventory: posterInventory(assets, c.ops.now()),
-        recent_slots: [], library: libraryEntries(assets), paid_folder: paidFolder });
-    } catch (e) {
-      return json({ configured: true, error: String(e.message).slice(0, 200) });
-    }
-  });
   return r;
 }
 const ROUTES = routes();
@@ -561,8 +529,6 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
     else if (env.LIVE_DB && (await ops.featureEnabled("member_sync"))) out.member_sync = await syncLiveBot(env.LIVE_DB, ops, now).catch((e) => ({ error: e.message }));
     return out;
   }
-  const cfg = cloudinaryConfig(env);
-  const listAssets = cfg ? (folder) => listFolder(cfg, folder, fetchImpl) : null;
   const hhmm = new Date(now * 1000).toISOString().slice(11, 16);
   if (env.BACKUP_DB && hhmm === config.backupAt) {
     // The backup gets its own run (no posting in the same minute) to stay inside the per-run request limit.
@@ -576,11 +542,7 @@ export async function runScheduled(env, now = Math.floor(Date.now() / 1000), fet
     const token = await store.token(bot.id).catch(() => null);
     return token ? new SendOnlyTelegram({ token, previewChatId: config.previewChatId, requirePreview: config.requirePreview, fetchImpl }) : null;
   };
-  // Cloudinary → R2 copy (a couple of files per minute until done; never deletes anything).
-  let migration = null;
-  try { migration = await migrateStep(env, ops, now, fetchImpl); } catch (e) { migration = { error: String(e.message).slice(0, 200) }; }
-  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { listAssets, liveDb: env.LIVE_DB || null, bots, tgForBot, bucket: env.MEDIA || null });
-  if (migration) summary.r2_migration = migration;
+  const summary = await runCycle(tg, ops, config, now, makeAlert(tg, ops, config, now), { liveDb: env.LIVE_DB || null, bots, tgForBot, bucket: env.MEDIA || null });
   return { mode, summary, simulated: tg.simulated.length };
 }
 

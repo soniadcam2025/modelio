@@ -257,3 +257,25 @@ To restore from a downloaded file instead of D1, use `--file backup.json` in pla
 6. Remove the Cloudinary keys.
 
 **Rollback:** roll the Worker back to the previous version. The R2 copies remain, and Cloudinary is untouched.
+
+## Cloudinary retired from the dashboard (22 Nov 2026)
+
+**Removed from the dashboard:** the Cloudinary → R2 copy job and its cron step, its Media library section, the Cloudinary module, the integration routes, the poster-inventory view and the Cloudinary photo fallback.
+- Cloudinary had disabled downloads for the account ("action is disabled"), and the owner chose to re-upload instead.
+
+**Left untouched:**
+- The encrypted Cloudinary credentials stay in the database (`integration_secrets`) and in backups, but nothing reads them.
+- The old copy progress is in the `r2_migration` setting.
+- Nothing in the Cloudinary account was deleted.
+
+**Still on Cloudinary:** only the GitHub 5 AM / 10 PM poster (`poster/`, `post-to-channel.yml`, with its own GitHub secrets). Cloudinary currently refuses its downloads, so its runs are expected to fail until it is replaced.
+
+**Replacement steps (needs owner approval):**
+1. Upload photos to R2 `public/auto-post`.
+2. Disable the `post-to-channel.yml` schedule.
+3. In Automations → Media sources, tick "GitHub auto-poster switched off" and enable public automatic posts.
+4. Switch on `r2_autopost`.
+
+Same 5 AM / 10 PM IST slots, rotation and 30-day cooldown.
+
+**Create post:** the editor is now a full-screen centered workspace (Content, Media, Buttons & links, Publishing, live preview, and sticky action buttons). Media is chosen from the library or uploaded in place into the assigned R2 folder.
