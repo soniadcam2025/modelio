@@ -8,6 +8,8 @@ export const MODERATION_KINDS = ["word", "link"];
 export const MODERATION_ACTIONS = ["delete", "delete_warn", "delete_mute"];
 export const JOIN_POLICIES = ["manual", "approve_paid", "approve_all"];
 // Every feature is OFF until switched on in the dashboard.
+import { checkMediaRef, cleanKey } from "./r2media.js";
+
 export const FEATURES = {
   scheduled_posts: "Publish scheduled posts, polls, quizzes, promotions and paid media",
   poll_auto_close: "Close polls after their set time and save the results",
@@ -18,7 +20,8 @@ export const FEATURES = {
   moderation: "Moderate the channel's existing discussion group, if it has one (via the live bot; approval L8)",
   reaction_tracking: "Record reaction counts on channel posts (via the live bot; approval L8)",
   post_expiry: "Delete posts automatically when their set expiry time is reached",
-  auto_paid_media: "Post paid media automatically from its own Cloudinary folder on a schedule",
+  auto_paid_media: "Post paid media automatically from the paid-media folder (R2) on a schedule",
+  r2_autopost: "Automatic posts from the R2 auto-post folders (public / VIP), with rotation and a 30-day cooldown",
   member_sync: "Copy members and trials from the live VIP bot's database (read-only) into Subscribers",
 };
 // Telegram only lets bots delete their messages for 48 hours after sending.
@@ -54,8 +57,11 @@ export function validateContent(data) {
   let options = [], correct = null, explanation = "", closeAfter = data.close_after_minutes, stars = null;
 
   if (MEDIA_KINDS.includes(kind)) {
-    if (!startsWithAny(mediaUrl, URL_PREFIXES) || mediaUrl.length > 2000)
-      throw new OpsError("Media needs an https:// link (for example a Cloudinary URL)");
+    if (mediaUrl.startsWith("r2:")) {
+      mediaUrl = "r2:" + cleanKey(mediaUrl.slice(3));
+      checkMediaRef({ media_url: mediaUrl, target, kind });
+    } else if (!startsWithAny(mediaUrl, URL_PREFIXES) || mediaUrl.length > 2000)
+      throw new OpsError("Choose a file from the media library (or an https:// link)");
   } else mediaUrl = "";
   if (["text", "promo"].includes(kind) && !text) throw new OpsError("Write the message text");
   if (["poll", "quiz"].includes(kind)) {

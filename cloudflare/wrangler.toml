@@ -32,6 +32,11 @@ binding = "LIVE_DB"
 database_name = "shakhira-vip-sim"
 database_id = "925439c1-169c-4cae-bb81-3a81d0474496"
 
+# Private media library (no public access; served only through signed-in admin routes).
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "shakhira-media-staging"
+
 [vars]
 ENVIRONMENT = "staging"
 # Staging lock: never publish to the channels. Without BOT_TOKEN the automation is simulated

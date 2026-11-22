@@ -30,6 +30,11 @@ binding = "LIVE_DB"
 database_name = "shakhira-vip"
 database_id = "54eb917a-7ff9-4a3b-96b6-2608cebecd1b"
 
+# Private media library (no public access; served only through signed-in admin routes).
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "shakhira-media"
+
 [vars]
 ENVIRONMENT = "production"
 # Production posting approved on 22 Nov 2026 (posts, polls, promotions; not paid media or member actions).

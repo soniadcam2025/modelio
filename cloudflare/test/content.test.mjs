@@ -56,26 +56,12 @@ test("Cloudinary signatures match Cloudinary's documented example; the secret ne
   const u = await uploadSignature({ cloud: "shakhira", key: "123", secret: "cloud-secret-123" }, "shakhira_admin", 1000);
   assert.equal(u.upload_url, "https://api.cloudinary.com/v1_1/shakhira/auto/upload");
   assert.equal(JSON.stringify(u).includes("cloud-secret-123"), false);
-  assert.match(SECURITY_HEADERS["Content-Security-Policy"], /connect-src 'self' https:\/\/api\.cloudinary\.com;/);
+  // The browser talks only to the dashboard itself (media lives in private R2).
+  assert.match(SECURITY_HEADERS["Content-Security-Policy"], /connect-src 'self';/);
+  assert.doesNotMatch(SECURITY_HEADERS["Content-Security-Policy"], /cloudinary/);
 });
 
-test("media library: allowed folders only, the GitHub queue is never deleted from, in-use files are kept", async () => {
-  const e = env(), s = await login(e);
-  const folders = (await call(e, s, "/api/media/folders")).body.map((f) => f.folder);
-  assert.deepEqual(folders, ["shakhira_admin", "tgpub"]);
-  assert.equal((await call(e, s, "/api/media/upload-signature", "POST", { folder: "other" })).status, 400);
-  assert.equal((await call(e, s, "/api/media/upload-signature", "POST", { folder: "shakhira_admin" })).body.folder, "shakhira_admin");
-  const lib = (await call(e, s, "/api/media/library?folder=shakhira_admin")).body;
-  assert.equal(lib.items[0].public_id, "shakhira_admin/a1");
-  assert.equal((await call(e, s, "/api/media/delete", "POST", { public_id: "tgpub/x1" })).status, 400);
-  await call(e, s, "/api/content", "POST", { kind: "photo", target: "public", media_url: lib.items[0].url });
-  assert.match((await call(e, s, "/api/media/delete", "POST", { public_id: "shakhira_admin/a1" })).body.error, /still uses/);
-  await new Ops(e.DB).run("UPDATE content_items SET status='cancelled'");
-  assert.equal((await call(e, s, "/api/media/delete", "POST", { public_id: "shakhira_admin/a1", resource_type: "image" })).body.ok, true);
-  assert.ok(cloud.some((c) => c.method === "DELETE" && c.url.includes("shakhira_admin%2Fa1")));
-  const noCloud = env({ CLOUDINARY_CLOUD_NAME: "" }), s2 = await login(noCloud);
-  assert.match((await call(noCloud, s2, "/api/media/library")).body.error, /Connect Cloudinary/);
-});
+// The Cloudinary media-library test was replaced by test/r2media.test.mjs (private R2 library).
 
 test("protected content is passed to every kind of send", async () => {
   const e = env({ BOT_TOKEN: TOKEN, REQUIRE_PREVIEW: "false" }), s = await login(e);

@@ -207,3 +207,53 @@ To restore from a downloaded file instead of D1, use `--file backup.json` in pla
   3. It checks the real bytes (JPEG/PNG/WebP/GIF, ≤ 10 MB) and uploads the file. The same applies to paid-media photos and private previews.
 - **No duplicates:** a 400 means nothing was posted, so the fallback can't post twice.
 - **No automatic retries:** failed posts are never retried automatically; use **Retry**.
+
+## Private media library on Cloudflare R2 (built 22 Nov 2026; activation pending)
+
+**Storage:**
+- Two private R2 buckets: `shakhira-media` (production) and `shakhira-media-staging` (staging, so tests can never touch production files).
+- Both are bound to the Worker as `MEDIA`, with no public access and no r2.dev URL.
+- Files are served only by signed-in routes (`/api/media/file`, `Cache-Control: no-store`), and reach Telegram as multipart uploads.
+
+**Folders:** `public/{photos,videos,gifs,auto-post}`, `vip/{photos,videos,auto-post}`, `paid-media/{photos,videos}`, `drafts`, `archive`.
+- These are created automatically, and default folders can't be renamed or deleted.
+- Custom folders: only empty ones can be deleted, and renames move at most 200 exactly-prefixed objects.
+
+**Separation (enforced on the server):**
+- Public posts can't use `vip/` or `paid-media/` files.
+- VIP posts can't use `paid-media/` files.
+- Paid media must come from `paid-media/`.
+- The same rules apply to Automations → Media sources.
+
+**Uploads:**
+- The file type is checked from the bytes: JPEG, PNG, WebP, GIF, MP4, MOV and WebM; HEIC is refused.
+- Size limits: photos ≤ 10 MB, videos and GIFs ≤ 50 MB (Telegram's upload limits).
+
+**Deletion:**
+- One confirmation; the object is removed from R2 and re-checked.
+- Every deletion goes to the audit log.
+- Refused while a draft, scheduled or failed post still uses the file.
+
+**Automatic posts from R2:**
+- Feature `r2_autopost`. Rotation: new files first, then the file posted longest ago after a 30-day cooldown; one claim per slot.
+- Public automatic posts stay inactive until "GitHub auto-poster switched off" is confirmed, so a slot can never be posted twice.
+
+**Cloudinary → R2 copy:**
+- Runs automatically on the cron, 2 files a minute, once `MEDIA` and the Cloudinary keys are both present.
+- It only copies, and uses Cloudinary's signed download (public delivery returns 401 ACL deny). Copies are verified by size and type, and SHA-256 is stored.
+- Unpublished posts are repointed to the copies, and the GitHub poster's rotation history is carried over.
+- Files that can't be copied are listed in Media library for re-upload. Nothing in Cloudinary is deleted.
+
+**Still on Cloudinary until handover:**
+- The GitHub 5 AM / 10 PM poster (`poster/`, `post-to-channel.yml`).
+- The migration's read-only credentials.
+
+**Handover steps:**
+1. Copy finished.
+2. Private previews checked.
+3. Switch on `r2_autopost`.
+4. Tick "GitHub auto-poster switched off".
+5. Disable the `post-to-channel.yml` schedule.
+6. Remove the Cloudinary keys.
+
+**Rollback:** roll the Worker back to the previous version. The R2 copies remain, and Cloudinary is untouched.

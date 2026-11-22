@@ -7,6 +7,7 @@ import { syncLiveBot } from "./live.js";
 
 import { TelegramError } from "./telegram.js";
 import { classify, GITHUB_POSTER_FOLDER, privateDownloadUrl } from "./cloudinary.js";
+import { cleanKey, loadForTelegram, mediaKind, mediaSources, zoneAllowed } from "./r2media.js";
 
 const STALE_SENDING_SECONDS = 10 * 60;
 const MAX_RETRY_DELAY = 15 * 60;
@@ -82,6 +83,18 @@ export async function sendItem(tg, config, item, text) {
   // Telegram's "protected content": no forwarding or saving in official apps. Screenshots and other apps can still copy it.
   const protect_content = Number(item.protect_content) ? true : undefined;
   const parse_mode = item.parse_mode === "HTML" ? "HTML" : undefined;
+  // Files from the private R2 media library are uploaded to Telegram (no public link exists).
+  if (String(item.media_url || "").startsWith("r2:")) {
+    const f = await loadForTelegram(config.media, item.media_url, item.kind);
+    const base = { chat_id, caption, parse_mode, reply_markup, protect_content };
+    switch (item.kind) {
+      case "photo": return tg.upload("sendPhoto", base, "photo", f.blob, f.name);
+      case "video": return tg.upload("sendVideo", { ...base, supports_streaming: true }, "video", f.blob, f.name);
+      case "animation": return tg.upload("sendAnimation", base, "animation", f.blob, f.name);
+      case "paid_media": return tg.upload("sendPaidMedia", { ...base, star_count: item.star_count,
+        media: [{ type: f.mk === "image" ? "photo" : "video", media: "attach://file" }] }, "file", f.blob, f.name);
+    }
+  }
   switch (item.kind) {
     case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content, parse_mode });
     case "photo": {
@@ -157,7 +170,7 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}, b
         counts.uncertain++;
         await alert(`Scheduled post #${item.id} may or may not have been sent. It will NOT be sent again automatically.`);
       } else {
-        await setStatus(ops, item.id, "failed", `Telegram refused it: ${err.message}`, now);
+        await setStatus(ops, item.id, "failed", `${err instanceof TelegramError ? "Telegram refused it" : "Couldn't send"}: ${err.message}`, now);
         counts.failed++;
         await alert(`Scheduled post #${item.id} (${item.kind}) was refused: ${err.message}`);
       }
@@ -275,8 +288,15 @@ export function dueSlots(times, now, windowSeconds = 30 * 60) {
 // Automated paid media: at each configured time, queue the next unused asset from its own Cloudinary folder.
 // The slot is claimed in D1 first (INSERT … ON CONFLICT DO NOTHING), so one slot can never create two posts.
 // Used assets are remembered in D1, never as Cloudinary tags. The GitHub poster's folder is refused.
-export async function queueAutoPaidMedia(ops, now, listAssets) {
+// With R2 connected, the files come from the paid-media folder assigned in Automations → Media sources.
+export async function queueAutoPaidMedia(ops, now, listAssets, bucket = null) {
   const cfg = await ops.paidMediaConfig();
+  if (bucket) {
+    const folder = (await mediaSources(ops)).paid_media;
+    cfg.folder = folder;
+    listAssets = async (prefix) => (await listR2(bucket, prefix)).map((o) => ({ public_id: "r2:" + o.key, secure_url: "r2:" + o.key,
+      created_at: new Date(o.uploaded).toISOString(), r2kind: mediaKind(o.httpMetadata?.contentType) }));
+  }
   if (!cfg.folder || !cfg.times_utc.length || cfg.folder.toLowerCase() === GITHUB_POSTER_FOLDER || !listAssets) return [];
   const queued = [];
   for (const { slot } of dueSlots(cfg.times_utc, now)) {
@@ -290,7 +310,9 @@ export async function queueAutoPaidMedia(ops, now, listAssets) {
       continue;
     }
     const used = new Set((await ops.all("SELECT public_id FROM auto_paid_posted")).map((r) => r.public_id));
-    const next = assets.filter((a) => classify(a).kind && ["photo", "video"].includes(classify(a).kind) && !used.has(a.public_id))
+    const usable = (a) => (a.r2kind ? ["image", "video"].includes(a.r2kind) && zoneAllowed(a.public_id.slice(3), { kind: "paid_media" })
+      : classify(a).kind && ["photo", "video"].includes(classify(a).kind));
+    const next = assets.filter((a) => usable(a) && !used.has(a.public_id))
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.public_id.localeCompare(b.public_id))[0];
     if (!next) {
       await ops.run("UPDATE auto_paid_runs SET note='no unused media left in the folder' WHERE slot=?", slot);
@@ -304,6 +326,63 @@ export async function queueAutoPaidMedia(ops, now, listAssets) {
     await ops.run("INSERT INTO auto_paid_posted (public_id, content_id, posted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", next.public_id, item.id, now);
     await ops.run("UPDATE auto_paid_runs SET public_id=?, content_id=? WHERE slot=?", next.public_id, item.id, slot);
     queued.push(item.id);
+  }
+  return queued;
+}
+
+async function listR2(bucket, folder) {
+  const prefix = folder.replace(/\/+$/, "") + "/";
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 20; i++) {
+    const page = await bucket.list({ prefix, cursor, include: ["httpMetadata"] });
+    out.push(...page.objects.filter((o) => !o.key.endsWith("/.folder")));
+    if (!page.truncated) break;
+    cursor = page.cursor;
+  }
+  return out;
+}
+
+// Automatic posts from the R2 auto-post folders (Automations → Media sources), one per configured time.
+// Rotation like the GitHub poster: never-posted files first (oldest upload first), then the file posted
+// longest ago once its 30-day cooldown has passed; nothing qualifies → skip and alert. Each slot is claimed
+// first (auto_paid_runs, key "auto-<target>:<slot>"), so a slot can never create two posts.
+export const AUTOPOST_COOLDOWN = 30 * 86400;
+export async function queueR2AutoPosts(ops, now, bucket, slotTimes, alert = async () => {}) {
+  if (!bucket) return [];
+  const sources = await mediaSources(ops);
+  const queued = [];
+  for (const target of ["public", "vip"]) {
+    let cfg;
+    try { cfg = JSON.parse(await ops.getSetting(`autopost:${target}`, "{}")); } catch { cfg = {}; }
+    if (!cfg.enabled) continue;
+    // The public channel's 5 AM / 10 PM posts belong to the GitHub poster until it is retired, so they can't double up.
+    if (target === "public" && (await ops.getSetting("github_poster_retired")) !== "1") continue;
+    const times = cfg.times_utc?.length ? cfg.times_utc : slotTimes.map(([h, m]) => `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
+    for (const { slot } of dueSlots(times, now)) {
+      const claim = await ops.run("INSERT INTO auto_paid_runs (slot, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING", `auto-${target}:${slot}`, now);
+      if (claim.meta.changes !== 1) continue;
+      const folder = sources[`${target}_auto`];
+      let history = {};
+      try { history = JSON.parse(await ops.getSetting(`autopost_history:${target}`, "{}")); } catch { /* fresh */ }
+      const files = (await listR2(bucket, folder)).filter((o) => mediaKind(o.httpMetadata?.contentType) && zoneAllowed(o.key, { target, kind: "photo" }));
+      const fresh = files.filter((o) => !history[o.key]).sort((a, b) => new Date(a.uploaded) - new Date(b.uploaded));
+      const reuse = files.filter((o) => history[o.key] && now - history[o.key] >= AUTOPOST_COOLDOWN).sort((a, b) => history[a.key] - history[b.key]);
+      const next = fresh[0] || reuse[0];
+      if (!next) {
+        await ops.run("UPDATE auto_paid_runs SET note=? WHERE slot=?", `no file qualifies in ${folder}`, `auto-${target}:${slot}`);
+        await alert(`Automatic ${target} post skipped: no new file in ${folder} and every file was posted in the last 30 days.`, "autopost");
+        continue;
+      }
+      const mk = mediaKind(next.httpMetadata.contentType);
+      const item = await ops.createContent({ kind: mk === "image" ? "photo" : mk === "gif" ? "animation" : "video", target,
+        media_url: "r2:" + cleanKey(next.key), use_caption_library: true, source: `auto:r2:${next.key}` }, "automation");
+      await ops.scheduleContent(item.id, now, "automation");
+      history[next.key] = now;
+      await ops.setSetting(`autopost_history:${target}`, JSON.stringify(history));
+      await ops.run("UPDATE auto_paid_runs SET public_id=?, content_id=? WHERE slot=?", "r2:" + next.key, item.id, `auto-${target}:${slot}`);
+      queued.push(item.id);
+    }
   }
   return queued;
 }
@@ -338,7 +417,7 @@ export async function sendReminders(tg, ops, config, now, { trials = true, renew
   return out;
 }
 
-export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null, bots = [], tgForBot = async () => null } = {}) {
+export async function runCycle(tg, ops, config, now, alert, { listAssets = null, liveDb = null, bots = [], tgForBot = async () => null, bucket = null } = {}) {
   await ops.setSetting("heartbeat:worker", now);
   // Read-only mirror of the live bot's members and trials (needs the LIVE_DB binding and the feature switched on).
   const summary = {};
@@ -353,7 +432,8 @@ export async function runCycle(tg, ops, config, now, alert, { listAssets = null,
   await ops.run("DELETE FROM revoked_sessions WHERE expires_at < ?", now);
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
-  if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets)).length;
+  if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, listAssets, bucket)).length;
+  if (on("r2_autopost")) summary.auto_posts_queued = (await queueR2AutoPosts(ops, now, bucket, config.slotTimes, alert)).length;
   if (paused) { summary.paused = true; return summary; }
   // Primary bot (@ShakhiraVIPBot): runs unless it is registered with its automation switched off.
   const primary = bots.find((b) => Number(b.is_primary));
