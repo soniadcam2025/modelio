@@ -54,7 +54,7 @@ test("media library end to end (signed-in only)", async () => {
 
   // Delivery: inline, download, range; private caching
   const f = await call(e, s, "/api/media/file?key=" + encodeURIComponent(a.key));
-  assert.equal(f.status, 200); assert.equal(f.headers.get("cache-control").includes("no-store"), true); assert.equal(f.body.byteLength, 2000);
+  assert.equal(f.status, 200); assert.match(f.headers.get("cache-control"), /^private, max-age=/); assert.doesNotMatch(f.headers.get("cache-control"), /public/); assert.equal(f.body.byteLength, 2000);
   assert.match((await call(e, s, `/api/media/file?download=1&key=${encodeURIComponent(a.key)}`)).headers.get("content-disposition"), /^attachment/);
   const part = await worker.fetch(new Request(ORIGIN + "/api/media/file?key=" + encodeURIComponent(v.key), { headers: { cookie: s.cookie, range: "bytes=0-99", "cf-connecting-ip": "7.7.7.7" } }), e);
   assert.equal(part.status, 206); assert.equal((await part.arrayBuffer()).byteLength, 100);
@@ -160,4 +160,47 @@ test("automatic R2 posts: rotation, cooldown, one post per slot, public waits fo
   const alerts = [];
   assert.deepEqual(await queueR2AutoPosts(ops, now, e.MEDIA, slots, async (m) => alerts.push(m)), []); // both in cooldown
   assert.match(alerts[0], /skipped/);
+});
+
+test("parallel uploads of same-named files never overwrite each other; each is verified in R2", async () => {
+  const e = env(); const s = await login(e);
+  const files = Array.from({ length: 10 }, (_, i) => JPEG(1000 + i));
+  const res = await Promise.all(files.map((b) => up(e, s, "public/photos", "same.jpg", b)));
+  assert.ok(res.every((r) => r.status === 200), JSON.stringify(res.map((r) => r.status)));
+  const keys = res.map((r) => r.body.key);
+  assert.equal(new Set(keys).size, 10, "ten distinct keys");
+  for (let i = 0; i < 10; i++) assert.equal(e.MEDIA.store.get(keys[i]).data.byteLength, 1000 + i, "each key holds its own file");
+  assert.ok(res.every((r) => r.body.original_name === "same.jpg"));
+  assert.equal(await new Ops(e.DB).one("SELECT COUNT(*) AS n FROM settings WHERE key LIKE 'r2lock:%'").then((r) => Number(r.n)), 0, "no reservations left behind");
+  // a mixed batch: one bad file fails alone, the rest are kept
+  const mixed = await Promise.all([up(e, s, "public/videos", "a.mp4", MP4()), up(e, s, "public/videos", "b.heic", HEIC()), up(e, s, "public/videos", "c.mp4", MP4())]);
+  assert.deepEqual(mixed.map((r) => r.status), [200, 400, 200]);
+});
+
+test("paging, folder-only listing, cached summary refreshed after changes, private thumbnails", async () => {
+  const e = env(); const s = await login(e);
+  for (let i = 0; i < 25; i++) await up(e, s, "public/photos", `p${i}.jpg`, JPEG());
+  await up(e, s, "public/photos/sub", "deep.jpg", JPEG());
+  const p1 = (await call(e, s, "/api/media/files?folder=public/photos&limit=10")).body;
+  assert.equal(p1.items.length, 10); assert.equal(p1.total, 25); assert.equal(p1.next, 10);
+  const p3 = (await call(e, s, "/api/media/files?folder=public/photos&limit=10&offset=20")).body;
+  assert.equal(p3.items.length, 5); assert.equal(p3.next, null);
+  const st1 = (await call(e, s, "/api/media/status")).body.usage.files;
+  assert.equal(st1, 26);
+  await call(e, s, "/api/media/delete", "POST", { keys: ["public/photos/p0.jpg"] });
+  assert.equal((await call(e, s, "/api/media/status")).body.usage.files, 25, "summary refreshed after delete");
+  // thumbnails: stored under a hidden prefix, signed-in only, privately cacheable, follow moves, gone with the file
+  assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg")).status, 400);
+  assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg", "PUT", JPEG(500), true)).status, 200);
+  assert.equal((await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg", "PUT", MP4(), true)).status, 400);
+  assert.equal((await call(e, null, "/api/media/thumb?key=public/photos/p1.jpg")).status, 401);
+  const t = await call(e, s, "/api/media/thumb?key=public/photos/p1.jpg");
+  assert.equal(t.status, 200); assert.match(t.headers.get("cache-control"), /^private/);
+  assert.ok(!(await call(e, s, "/api/media/folders")).body.some((f) => f.path.startsWith("_thumbs")), "thumbnails never listed as a folder");
+  assert.equal((await call(e, s, "/api/media/files?recursive=1&q=p1")).body.filter((m) => m.key.includes("_thumbs")).length, 0);
+  assert.equal((await call(e, s, "/api/media/file?key=_thumbs/public/photos/p1.jpg")).status, 400, "hidden prefix can't be addressed");
+  await call(e, s, "/api/media/move", "POST", { from: "public/photos/p1.jpg", to: "archive/p1.jpg" });
+  assert.equal((await call(e, s, "/api/media/thumb?key=archive/p1.jpg")).status, 200);
+  await call(e, s, "/api/media/delete", "POST", { keys: ["archive/p1.jpg"] });
+  assert.ok(![...e.MEDIA.store.keys()].some((k) => k.includes("p1.jpg")), "file and thumbnail both deleted");
 });

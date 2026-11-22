@@ -62,9 +62,9 @@ export class Sessions {
     this.now = now;
   }
 
-  async issue() {
+  async issue(issuedAt = this.now()) {
     const nonce = b64(crypto.getRandomValues(new Uint8Array(16))).replace(/[^A-Za-z0-9]/g, "");
-    const message = `${this.now() + SESSION_SECONDS}.${nonce}`;
+    const message = `${issuedAt + SESSION_SECONDS}.${nonce}`;
     return `${message}.${await hmacHex(this.secret, message)}`;
   }
 
@@ -73,8 +73,12 @@ export class Sessions {
     const [expiry, nonce, signature] = token.split(".");
     if (!constantTimeEqual(signature, await hmacHex(this.secret, `${expiry}.${nonce}`))) return false;
     if (!(Number(expiry) > this.now())) return false;
-    const revoked = await this.db.prepare("SELECT 1 FROM revoked_sessions WHERE nonce = ?").bind(nonce).first();
-    return !revoked;
+    // Revoked (signed out) or issued before the last "sign out all sessions" (password change) → invalid.
+    const row = await this.db.prepare("SELECT (SELECT 1 FROM revoked_sessions WHERE nonce = ?) AS revoked, (SELECT value FROM settings WHERE key = 'auth:sessions_after') AS after")
+      .bind(nonce).first();
+    if (row?.revoked) return false;
+    const issuedAt = Number(expiry) - SESSION_SECONDS;
+    return !(row?.after && issuedAt <= Number(row.after));
   }
 
   async revoke(token) {

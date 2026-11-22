@@ -10,6 +10,9 @@ export const DEFAULT_FOLDERS = ["public", "public/photos", "public/videos", "pub
   "vip", "vip/photos", "vip/videos", "vip/auto-post", "paid-media", "paid-media/photos", "paid-media/videos", "drafts", "archive"];
 const PROTECTED_FOLDERS = new Set(DEFAULT_FOLDERS);
 const MARKER = ".folder";
+const THUMBS = "_thumbs";          // hidden: "_" can't start a folder name, so users can never address it
+const LOCK = "r2lock:";            // settings rows that reserve a key while it is being written
+const SUMMARY_KEY = "r2:summary", SUMMARY_TTL = 600;
 
 export const FREE_TIER_BYTES = 10 * 1024 ** 3; // R2 free tier: 10 GB-month of storage
 export const LIMITS = { image: 10 * 1024 * 1024, video: 50 * 1024 * 1024 }; // Telegram Bot API upload limits
@@ -129,12 +132,28 @@ export class MediaStore {
     return out;
   }
 
-  // All folders (from markers and file paths) with file counts and sizes.
-  async folders() {
-    await this.ensureDefaults();
+  // Folder counts and storage usage need a full listing, so they are cached (10 min) and cleared on every change.
+  async #summary() {
+    try {
+      const c = JSON.parse((await this.ops.getSetting(SUMMARY_KEY)) || "null");
+      if (c && this.ops.now() - c.at < SUMMARY_TTL) return c;
+    } catch { /* rebuild */ }
+    const folders = await this.#buildFolders();
+    let files = 0, bytes = 0;
+    for (const f of folders) { files += f.files; bytes += f.bytes; }
+    const out = { at: this.ops.now(), folders, files, bytes };
+    await this.ops.setSetting(SUMMARY_KEY, JSON.stringify(out));
+    return out;
+  }
+  async dirty() { await this.ops.setSetting(SUMMARY_KEY, ""); }
+
+  async folders() { await this.ensureDefaults(); return (await this.#summary()).folders; }
+
+  async #buildFolders() {
     const map = new Map();
     const touch = (f) => { if (!map.has(f)) map.set(f, { path: f, files: 0, bytes: 0, protected: PROTECTED_FOLDERS.has(f) }); return map.get(f); };
     for (const o of await this.#all()) {
+      if (o.key.startsWith(THUMBS + "/")) continue;
       const folder = o.key.slice(0, o.key.lastIndexOf("/"));
       if (!folder) continue;
       folder.split("/").forEach((_, i, parts) => touch(parts.slice(0, i + 1).join("/")));
@@ -143,22 +162,37 @@ export class MediaStore {
     return [...map.values()].sort((a, b) => a.path.localeCompare(b.path));
   }
 
-  async list({ folder = "", recursive = false, q = "", kind = "", from = null, to = null } = {}) {
+  // One folder (R2 delimiter listing: subfolders are not read) or, for search, everything. Newest first, paged.
+  async list({ folder = "", recursive = false, q = "", kind = "", from = null, to = null, offset = 0, limit = 0 } = {}) {
     const f = cleanFolder(folder);
     const prefix = f ? f + "/" : "";
     const needle = String(q || "").toLowerCase();
-    return (await this.#all(prefix)).filter((o) => !o.key.endsWith("/" + MARKER) && (recursive || o.key.slice(prefix.length).indexOf("/") < 0))
+    let objs;
+    if (recursive) objs = await this.#all(prefix);
+    else {
+      objs = [];
+      let cursor;
+      for (let i = 0; i < 50; i++) {
+        const page = await this.b.list({ prefix, delimiter: "/", cursor, include: ["httpMetadata", "customMetadata"] });
+        objs.push(...page.objects);
+        if (!page.truncated) break;
+        cursor = page.cursor;
+      }
+    }
+    const all = objs.filter((o) => !o.key.endsWith("/" + MARKER) && !o.key.startsWith(THUMBS + "/") && (recursive || o.key.slice(prefix.length).indexOf("/") < 0))
       .map(describe)
       .filter((m) => (!needle || m.name.toLowerCase().includes(needle) || (m.original_name || "").toLowerCase().includes(needle))
         && (!kind || m.kind === kind) && (!from || m.uploaded >= from) && (!to || m.uploaded < to))
-      .sort((a, b) => (b.uploaded || 0) - (a.uploaded || 0));
+      .sort((a, b) => (b.uploaded || 0) - (a.uploaded || 0) || a.key.localeCompare(b.key));
+    if (!limit) return all;
+    const start = Math.max(0, Number(offset) || 0), lim = Math.min(200, Math.max(1, Number(limit)));
+    return { items: all.slice(start, start + lim), total: all.length, next: start + lim < all.length ? start + lim : null };
   }
 
   async usage() {
-    let files = 0, bytes = 0;
-    for (const o of await this.#all()) { if (!o.key.endsWith("/" + MARKER)) { files++; bytes += o.size; } }
+    const { files, bytes, at } = await this.#summary();
     const pct = Math.round((bytes / FREE_TIER_BYTES) * 1000) / 10;
-    return { files, bytes, free_tier_bytes: FREE_TIER_BYTES, percent: pct,
+    return { files, bytes, free_tier_bytes: FREE_TIER_BYTES, percent: pct, measured_at: at,
       warning: pct >= 90 ? "Storage is above 90% of the R2 free tier (10 GB). Archive or delete files to avoid charges."
         : pct >= 75 ? "Storage is above 75% of the R2 free tier (10 GB)." : null };
   }
@@ -174,12 +208,45 @@ export class MediaStore {
     if (bytes.byteLength > limit) throw new OpsError(`${kind === "image" ? "Photos" : "Videos and GIFs"} can be at most ${limit / 1048576} MB (Telegram's upload limit)`);
     const base = cleanName(String(filename || "file").replace(/[^A-Za-z0-9 ._()+\-]/g, "_").replace(/^[^A-Za-z0-9]+/, "").slice(0, 80) || "file")
       .replace(/\.[A-Za-z0-9]{1,5}$/, "");
-    let key = `${f}/${base}.${TYPES[type][1]}`;
-    for (let n = 2; await this.b.head(key); n++) key = `${f}/${base}-${n}.${TYPES[type][1]}`;
-    await this.b.put(key, bytes, { httpMetadata: { contentType: type },
-      customMetadata: { original_name: String(filename || "").slice(0, 200), uploaded_by: actor, ...extra } });
+    // A free name is reserved in the database first (unique row), so parallel uploads can never pick the same key.
+    const key = await this.#reserve(f, base, TYPES[type][1]);
+    try {
+      await this.b.put(key, bytes, { httpMetadata: { contentType: type },
+        customMetadata: { original_name: String(filename || "").slice(0, 200), uploaded_by: actor, ...extra } });
+      const check = await this.b.head(key);
+      if (!check || check.size !== bytes.byteLength) throw new OpsError("The upload could not be verified in storage; please retry");
+    } finally { await this.#release(key); }
+    await this.dirty();
     await this.ops.audit(actor, "media_upload", `${key} (${bytes.byteLength} bytes)`);
     return describe({ key, size: bytes.byteLength, httpMetadata: { contentType: type }, uploaded: new Date(), customMetadata: { original_name: filename, ...extra } });
+  }
+
+  async #reserve(folder, base, ext) {
+    for (let n = 1; n < 1000; n++) {
+      const key = `${folder}/${base}${n === 1 ? "" : "-" + n}.${ext}`;
+      const r = await this.ops.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING", LOCK + key, String(this.ops.now()));
+      if (r.meta.changes !== 1) continue; // another upload is writing this name right now
+      if (await this.b.head(key)) { await this.#release(key); continue; }
+      return key;
+    }
+    throw new OpsError("Couldn't find a free file name");
+  }
+  async #release(key) { await this.ops.run("DELETE FROM settings WHERE key = ?", LOCK + key); }
+
+  // Small preview images, made by the browser (no paid image service). Stored under a hidden prefix and served
+  // only to signed-in admins; never listed, counted or selectable.
+  async putThumb(key, bytes) {
+    const k = cleanKey(key);
+    if (!(await this.b.head(k))) throw new OpsError("File not found");
+    const t = sniff(bytes);
+    if (!["image/jpeg", "image/webp"].includes(t) || bytes.byteLength > 300 * 1024) throw new OpsError("Thumbnails must be JPEG/WebP up to 300 KB");
+    await this.b.put(`${THUMBS}/${k}`, bytes, { httpMetadata: { contentType: t } });
+    return { ok: true };
+  }
+  async getThumb(key) {
+    const o = await this.b.get(`${THUMBS}/${cleanKey(key)}`);
+    if (!o) throw new OpsError("No thumbnail");
+    return o;
   }
 
   async get(key, range) {
@@ -199,6 +266,9 @@ export class MediaStore {
     if (!src) throw new OpsError(`File not found: ${from}`);
     if (await this.b.head(to)) throw new OpsError(`A file named ${to} already exists`);
     await this.b.put(to, await src.arrayBuffer(), { httpMetadata: src.httpMetadata, customMetadata: src.customMetadata });
+    const th = await this.b.get(`${THUMBS}/${from}`);
+    if (th) await this.b.put(`${THUMBS}/${to}`, await th.arrayBuffer(), { httpMetadata: th.httpMetadata });
+    await this.dirty();
   }
 
   // Rename / move: copy, repoint unpublished posts, then remove the old object.
@@ -208,6 +278,7 @@ export class MediaStore {
     await this.#copyObject(a, b);
     await this.ops.run("UPDATE content_items SET media_url = ? WHERE media_url = ? AND status IN ('draft','scheduled','failed','cancelled')", "r2:" + b, "r2:" + a);
     await this.b.delete(a);
+    await this.b.delete(`${THUMBS}/${a}`);
     await this.ops.audit(actor, "media_move", `${a} -> ${b}`);
     return { key: b };
   }
@@ -232,6 +303,8 @@ export class MediaStore {
       try {
         await this.b.delete(key);
         if (await this.b.head(key)) throw new Error("still present after delete");
+        await this.b.delete(`${THUMBS}/${key}`);
+        await this.dirty();
         await this.ops.audit(actor, "media_delete", `${key} (${head.size} bytes)`);
         results.push({ key, ok: true });
       } catch (e) {
@@ -246,6 +319,7 @@ export class MediaStore {
     const f = cleanFolder(path);
     if (!f) throw new OpsError("Enter a folder name");
     await this.b.put(`${f}/${MARKER}`, "", { customMetadata: { folder: "1" } });
+    await this.dirty();
     await this.ops.audit(actor, "media_folder_create", f);
     return { path: f };
   }
@@ -264,6 +338,7 @@ export class MediaStore {
       if (o.key.endsWith("/" + MARKER)) { await this.b.put(nk, "", { customMetadata: { folder: "1" } }); await this.b.delete(o.key); }
       else await this.move(o.key, nk, actor);
     }
+    await this.dirty();
     await this.ops.audit(actor, "media_folder_rename", `${a} -> ${b}`);
     return { path: b };
   }
@@ -275,6 +350,7 @@ export class MediaStore {
     const objs = await this.#all(f + "/");
     if (objs.some((o) => !o.key.endsWith("/" + MARKER))) throw new OpsError("The folder isn't empty. Move or delete its files first.");
     for (const o of objs) await this.b.delete(o.key);
+    await this.dirty();
     await this.ops.audit(actor, "media_folder_delete", f);
     return { ok: true };
   }
