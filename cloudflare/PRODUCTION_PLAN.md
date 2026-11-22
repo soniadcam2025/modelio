@@ -199,4 +199,11 @@ To restore from a downloaded file instead of D1, use `--file backup.json` in pla
 
 **Navigation:** Overview · Publishing (Create post, Scheduled posts, Calendar, Media library, Paid media) · VIP audience (Subscribers, Join requests, Moderation) · Automation (Automations, Features & settings, Bots & channels) · Analytics · System (Security & backups, Activity log). Old links still work.
 
-**Photo posts (`sendPhoto: failed to get HTTP URL content`):** Telegram fetches photo links itself and refuses files over 5 MB, HEIC and other formats it can't read, or very large images. Cloudinary photos are now sent as a JPEG of at most 2560 px (`f_jpg,q_auto:good,c_limit,w_2560,h_2560`, original untouched). If Telegram still refuses the link (400), the Worker downloads the image, checks HTTP 200, an image type and ≤ 10 MB, and uploads it as a file. A 400 means nothing was posted, so there is no duplicate. Failed posts are never retried automatically; use **Retry**.
+**Photo posts (`sendPhoto: failed to get HTTP URL content`):**
+- **Root cause (checked 22 Nov 2026):** the Cloudinary account `m4upuaai` now refuses public delivery. Every `res.cloudinary.com` image answers **HTTP 401, `x-cld-error: ACL deny`**, including photos that posted fine on 21 Nov. Telegram downloads photo links itself, so it gets the 401 and reports this error.
+- **Fix:**
+  1. Cloudinary photos are requested as a JPEG of at most 2560 px.
+  2. If Telegram refuses the link (400), the Worker downloads the image itself: first the public link, then Cloudinary's **signed Admin-API download** using the dashboard's own Cloudinary keys, which isn't affected by the delivery restriction.
+  3. It checks the real bytes (JPEG/PNG/WebP/GIF, ≤ 10 MB) and uploads the file. The same applies to paid-media photos and private previews.
+- **No duplicates:** a 400 means nothing was posted, so the fallback can't post twice.
+- **No automatic retries:** failed posts are never retried automatically; use **Retry**.

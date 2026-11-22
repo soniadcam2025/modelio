@@ -99,7 +99,7 @@ export const SECURITY_HEADERS = {
 export function loadConfig(env) {
   const slots = String(env.POST_SLOTS_UTC || "16:30,23:30").split(",").map((s) => s.trim()).filter(Boolean)
     .map((s) => s.split(":").map(Number));
-  return {
+  const cfg = {
     environment: env.ENVIRONMENT || "staging",
     requirePreview: String(env.REQUIRE_PREVIEW || "true").toLowerCase() === "true",
     previewChatId: String(env.PREVIEW_CHAT_ID || "").trim() || null,
@@ -115,6 +115,9 @@ export function loadConfig(env) {
     // Daily backup minute (UTC "HH:MM"); 21:40 UTC = 03:10 IST, away from the 5 AM / 10 PM IST posts.
     backupAt: String(env.BACKUP_AT_UTC || "21:40"),
   };
+  // Cloudinary keys for the photo-upload fallback. Not enumerable, so they never appear in JSON or logs.
+  Object.defineProperty(cfg, "cloudinary", { value: cloudinaryConfig(env), enumerable: false });
+  return cfg;
 }
 
 export function automationMode(env, config) {
@@ -328,7 +331,9 @@ function routes() {
     let text = item.text || (item.use_caption_library ? "[a caption from the library is added when published]" : "");
     if (item.hashtags && !["poll", "quiz"].includes(item.kind)) text = text ? `${text}\n\n${item.hashtags}` : item.hashtags;
     try {
-      const r = await sendItem(tg, { ...c.config, previewChatId: chat }, item, text);
+      const pcfg = { ...c.config, previewChatId: chat };
+      Object.defineProperty(pcfg, "cloudinary", { value: c.config.cloudinary, enumerable: false });
+      const r = await sendItem(tg, pcfg, item, text);
       await c.ops.audit(c.actor, "content_preview", `#${item.id} sent to the preview chat`);
       return json({ ok: true, message_id: r?.message_id ?? null });
     } catch (e) {

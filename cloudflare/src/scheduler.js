@@ -6,7 +6,7 @@ import { syncLiveBot } from "./live.js";
 // handles, so the two can never post the same thing.
 
 import { TelegramError } from "./telegram.js";
-import { classify, GITHUB_POSTER_FOLDER } from "./cloudinary.js";
+import { classify, GITHUB_POSTER_FOLDER, privateDownloadUrl } from "./cloudinary.js";
 
 const STALE_SENDING_SECONDS = 10 * 60;
 const MAX_RETRY_DELAY = 15 * 60;
@@ -50,20 +50,29 @@ const MAX_PHOTO_UPLOAD = 10 * 1024 * 1024;
 
 // Fallback: download the image here and upload it to Telegram as a file. Only used after Telegram answered
 // 400 to the link, which means nothing was posted, so this can't create a duplicate.
-async function uploadPhoto(tg, params, urls, fetchImpl = fetch) {
+async function uploadPhoto(tg, params, urls, { method = "sendPhoto", field = "photo" } = {}, fetchImpl = fetch) {
   const problems = [];
   for (const url of [...new Set(urls)]) {
     let res;
     try { res = await fetchImpl(url, { redirect: "follow" }); } catch { problems.push("network error"); continue; }
-    const type = (res.headers.get("content-type") || "").split(";")[0].trim();
-    if (!res.ok) { problems.push(`HTTP ${res.status}`); continue; }
-    if (!/^image\/(jpeg|png|webp|gif)$/.test(type)) { problems.push(`not a supported image (${type || "unknown type"})`); continue; }
+    if (!res.ok) { problems.push(`HTTP ${res.status}${res.headers.get("x-cld-error") ? ` (${res.headers.get("x-cld-error")})` : ""}`); continue; }
     const blob = await res.blob();
     if (blob.size > MAX_PHOTO_UPLOAD) { problems.push(`${Math.round(blob.size / 1048576)} MB is over Telegram's 10 MB photo limit`); continue; }
-    const ext = type === "image/png" ? "png" : type === "image/webp" ? "webp" : type === "image/gif" ? "gif" : "jpg";
-    return tg.upload("sendPhoto", params, "photo", blob, `photo.${ext}`);
+    // Check the actual bytes (Cloudinary's download API may label files application/octet-stream).
+    const b = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+    const ext = b[0] === 0xff && b[1] === 0xd8 ? "jpg" : b[0] === 0x89 && b[1] === 0x50 ? "png"
+      : b[0] === 0x47 && b[1] === 0x49 ? "gif" : b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50 ? "webp" : null;
+    if (!ext) { problems.push(`not a JPEG/PNG/WebP/GIF image (${(res.headers.get("content-type") || "unknown").split(";")[0]})`); continue; }
+    return tg.upload(method, params, field, blob, `photo.${ext}`);
   }
-  throw new TelegramError(`sendPhoto: Telegram could not fetch the image link and the upload fallback failed (${problems.join("; ")}). Check the file in the media library, then use Retry.`, { code: 400 });
+  throw new TelegramError(`${method}: Telegram could not fetch the image link and the upload fallback failed (${problems.join("; ")}). Check the file in the media library, then use Retry.`, { code: 400 });
+}
+
+// Public link first, then Cloudinary's signed download (as JPEG, then the original format).
+async function fallbackUrls(config, original, link) {
+  const urls = [link, original];
+  for (const fmt of ["jpg", null]) { const u = await privateDownloadUrl(config.cloudinary, original, fmt); if (u) urls.push(u); }
+  return urls;
 }
 
 export async function sendItem(tg, config, item, text) {
@@ -82,7 +91,7 @@ export async function sendItem(tg, config, item, text) {
         return await tg.call("sendPhoto", { ...params, photo: link });
       } catch (err) {
         if (!(err instanceof TelegramError) || err.code !== 400 || !URL_FETCH_REFUSED.test(err.message)) throw err;
-        return uploadPhoto(tg, params, [link, item.media_url]);
+        return uploadPhoto(tg, params, await fallbackUrls(config, item.media_url, link));
       }
     }
     case "video": return tg.call("sendVideo", { parse_mode, chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
@@ -97,7 +106,14 @@ export async function sendItem(tg, config, item, text) {
       const path = item.media_url.toLowerCase().split("?")[0];
       const type = VIDEO_EXT.some((e) => path.endsWith(e)) ? "video" : "photo";
       const media = type === "photo" ? telegramPhotoUrl(item.media_url) : item.media_url;
-      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media }], caption, parse_mode, protect_content, reply_markup });
+      const params = { chat_id, star_count: item.star_count, caption, parse_mode, protect_content, reply_markup };
+      try {
+        return await tg.call("sendPaidMedia", { ...params, media: [{ type, media }] });
+      } catch (err) {
+        if (type !== "photo" || !(err instanceof TelegramError) || err.code !== 400 || !URL_FETCH_REFUSED.test(err.message)) throw err;
+        return uploadPhoto(tg, { ...params, media: [{ type: "photo", media: "attach://file" }] }, await fallbackUrls(config, item.media_url, media),
+          { method: "sendPaidMedia", field: "file" });
+      }
     }
     default: throw new Error(`Unknown content kind ${item.kind}`);
   }

@@ -121,3 +121,21 @@ export async function deleteAsset(cfg, publicId, resourceType, fetchImpl = fetch
   const body = await r.json();
   return body.deleted?.[publicId] === "deleted";
 }
+
+// Signed Admin-API download of an image (works even when the account restricts public delivery,
+// which makes res.cloudinary.com answer 401 "ACL deny" to Telegram). Returns null for non-Cloudinary links.
+export async function privateDownloadUrl(cfg, deliveryUrl, format, now = Math.floor(Date.now() / 1000)) {
+  const m = /^https:\/\/res\.cloudinary\.com\/([^/]+)\/image\/upload\/(.+)$/.exec(String(deliveryUrl || ""));
+  if (!cfg || !m || m[1] !== cfg.cloud) return null;
+  const parts = m[2].split("?")[0].split("/");
+  while (parts.length > 1 && (parts[0].includes(",") || /^[a-z]{1,3}_[^/]+$/.test(parts[0]))) parts.shift(); // transformations
+  if (parts.length > 1 && /^v\d+$/.test(parts[0])) parts.shift(); // version
+  const path = decodeURIComponent(parts.join("/"));
+  const dot = path.lastIndexOf(".");
+  const publicId = dot > path.lastIndexOf("/") ? path.slice(0, dot) : path;
+  const fmt = format || (dot > path.lastIndexOf("/") ? path.slice(dot + 1) : "jpg");
+  const params = { format: fmt, public_id: publicId, timestamp: now, type: "upload" };
+  const signature = await signParams(params, cfg.secret);
+  const q = new URLSearchParams({ ...params, timestamp: String(now), api_key: cfg.key, signature });
+  return `https://api.cloudinary.com/v1_1/${encodeURIComponent(cfg.cloud)}/image/download?${q}`;
+}

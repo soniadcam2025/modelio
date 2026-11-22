@@ -15,13 +15,16 @@ function fakeTelegram({ refuseLink = true, cloud = { status: 200, type: "image/j
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     url = String(url);
-    if (url.startsWith("https://res.cloudinary.com/")) {
+    if (url.startsWith("https://res.cloudinary.com/") || url.startsWith("https://api.cloudinary.com/")) {
+      if (cloud.aclDeny && url.startsWith("https://res.")) { calls.push({ download: url, denied: true }); return new Response('{"error":{"message":"ACL deny"}}', { status: 401, headers: { "x-cld-error": "ACL deny" } }); }
       calls.push({ download: url });
-      return new Response(new Uint8Array(cloud.bytes), { status: cloud.status, headers: { "content-type": cloud.type } });
+      const body = new Uint8Array(cloud.bytes); if (cloud.jpeg !== false) body.set([0xff, 0xd8, 0xff], 0);
+      return new Response(body, { status: cloud.status, headers: { "content-type": cloud.type } });
     }
     const method = url.split("/").pop();
     if (init.body instanceof FormData) {
       const f = init.body;
+      if (method === "sendPaidMedia") { calls.push({ method, multipart: true, media: f.get("media"), stars: f.get("star_count"), size: f.get("file").size }); return new Response(JSON.stringify({ ok: true, result: { message_id: 78 } })); }
       calls.push({ method, multipart: true, chat_id: f.get("chat_id"), caption: f.get("caption"), parse_mode: f.get("parse_mode"),
         reply_markup: JSON.parse(f.get("reply_markup")), protect: f.get("protect_content"), size: f.get("photo").size });
       return new Response(JSON.stringify({ ok: true, result: { message_id: 77 } }));
@@ -62,7 +65,7 @@ test("link refused: uploads the file once, keeping caption, formatting, buttons 
 });
 
 test("fallback refuses broken files with a clear error and sends nothing", async () => {
-  for (const cloud of [{ status: 404, type: "text/html", bytes: 10 }, { status: 200, type: "text/html", bytes: 10 }, { status: 200, type: "image/jpeg", bytes: 11 * 1024 * 1024 }]) {
+  for (const cloud of [{ status: 404, type: "text/html", bytes: 10 }, { status: 200, type: "text/html", bytes: 10, jpeg: false }, { status: 200, type: "image/jpeg", bytes: 11 * 1024 * 1024 }]) {
     const { calls, tg, fetchImpl } = fakeTelegram({ cloud });
     globalThis.__realFetch = globalThis.fetch; globalThis.fetch = fetchImpl;
     try { await assert.rejects(sendItem(tg, config, item, "x"), (e) => e instanceof TelegramError && e.code === 400 && /upload fallback failed/.test(e.message)); }
@@ -80,4 +83,33 @@ test("other Telegram errors don't trigger the fallback", async () => {
 test("staging lock also applies to uploads", async () => {
   const tg = new SendOnlyTelegram({ token: "1:abc", previewChatId: "42", requirePreview: true, fetchImpl: async () => { throw new Error("must not send"); } });
   await assert.rejects(tg.upload("sendPhoto", { chat_id: "@yourshakhira" }, "photo", new Blob(["x"]), "a.jpg"), /Staging lock/);
+});
+
+const withFetch = async (fetchImpl, fn) => { const real = globalThis.fetch; globalThis.fetch = fetchImpl; try { return await fn(); } finally { globalThis.fetch = real; } };
+const cfgWithCloud = (() => { const c = { ...config }; Object.defineProperty(c, "cloudinary", { value: { cloud: "m4upuaai", key: "123", secret: "s" }, enumerable: false }); return c; })();
+
+test("Cloudinary delivery restricted (401 ACL deny): signed Admin-API download is uploaded instead", async () => {
+  const { calls, tg, fetchImpl } = fakeTelegram({ cloud: { status: 200, type: "application/octet-stream", bytes: 2000, aclDeny: true } });
+  const r = await withFetch(fetchImpl, () => sendItem(tg, cfgWithCloud, item, "cap"));
+  assert.equal(r.message_id, 77);
+  const dl = calls.filter((c) => c.download);
+  assert.ok(dl.at(-1).download.startsWith("https://api.cloudinary.com/v1_1/m4upuaai/image/download?"));
+  const q = new URL(dl.at(-1).download).searchParams;
+  assert.equal(q.get("public_id"), "shakhira_admin/abc"); assert.equal(q.get("format"), "jpg"); assert.ok(q.get("signature"));
+  assert.equal(calls.filter((c) => c.multipart).length, 1);
+});
+
+test("without the keys the error explains the 401", async () => {
+  const { tg, fetchImpl } = fakeTelegram({ cloud: { status: 200, type: "image/jpeg", bytes: 10, aclDeny: true } });
+  await assert.rejects(withFetch(fetchImpl, () => sendItem(tg, config, item, "x")), /HTTP 401 \(ACL deny\)/);
+});
+
+test("paid-media photo: same fallback, uploaded as attach://file with the Stars price", async () => {
+  const { calls, tg, fetchImpl } = fakeTelegram({ cloud: { status: 200, type: "image/jpeg", bytes: 500, aclDeny: true } });
+  const paid = { id: 9, kind: "paid_media", target: "vip", media_url: ORIG.replace(".heic", ".jpg"), star_count: 25 };
+  const r = await withFetch(fetchImpl, () => sendItem(tg, cfgWithCloud, paid, "unlock"));
+  assert.equal(r.message_id, 78);
+  const up = calls.find((c) => c.multipart);
+  assert.deepEqual(JSON.parse(up.media), [{ type: "photo", media: "attach://file" }]);
+  assert.equal(up.stars, "25");
 });
