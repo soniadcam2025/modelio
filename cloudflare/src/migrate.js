@@ -7,6 +7,7 @@ import { cleanName, LIMITS, mediaKind, sniff, zoneAllowed } from "./r2media.js";
 
 export const MIGRATION_KEY = "r2_migration";
 const PER_RUN = 2;
+const COPY_ATTEMPT = 2; // raise when the copy method changes, so earlier failures are retried
 
 export function publicIdFromUrl(url) {
   const m = /^https:\/\/res\.cloudinary\.com\/([^/]+)\/(image|video)\/upload\/(.+)$/.exec(String(url || ""));
@@ -51,6 +52,9 @@ export async function migrateStep(env, ops, now, fetchImpl = fetch) {
   const bucket = env.MEDIA, cfg = cloudinaryConfig(env);
   if (!bucket || !cfg) return null;
   let st = await load(ops);
+  // A newer copy method starts a fresh inventory, skipping files already copied (attempt counter).
+  let keep = {};
+  if (st && (st.attempt || 1) < COPY_ATTEMPT) { keep = st.done || {}; st = null; }
   if (st?.status === "done") return null;
   if (!st) {
     // Inventory: the dashboard library, the GitHub poster folder, the paid folder, and every Cloudinary link in posts.
@@ -62,24 +66,27 @@ export async function migrateStep(env, ops, now, fetchImpl = fetch) {
         posted_at: Math.max(0, ...(a.tags || []).filter((t) => t.startsWith("tgbot_at_")).map((t) => Number(t.slice(9)) || 0)) || null }, dest); }
       catch (e) { /* folder missing or listing refused: reported through the content references below */ }
     }
+    for (const id of Object.keys(keep)) queue.delete(id);
     for (const r of await ops.all("SELECT DISTINCT media_url, kind, target FROM content_items WHERE media_url LIKE 'https://res.cloudinary.com/%'")) {
       const p = publicIdFromUrl(r.media_url);
       if (p && p.cloud === cfg.cloud) add({ public_id: p.public_id, resource_type: p.resource_type, format: p.format, bytes: null },
         r.kind === "paid_media" ? "paid" : r.target === "vip" ? "vip" : "public");
     }
-    st = { status: "copying", started_at: now, total: queue.size, queue: [...queue.values()], done: {}, failed: {} };
+    for (const id of Object.keys(keep)) queue.delete(id);
+    st = { status: "copying", attempt: COPY_ATTEMPT, started_at: now, total: queue.size + Object.keys(keep).length, queue: [...queue.values()], done: keep, failed: {} };
     await save(ops, st);
     return { inventory: st.total };
   }
   const batch = st.queue.splice(0, PER_RUN);
+  let ok = 0; const errors = [];
   for (const a of batch) {
-    try { st.done[a.public_id] = await copyOne(bucket, cfg, ops, a, now, fetchImpl); }
-    catch (e) { st.failed[a.public_id] = String(e.message).slice(0, 200); }
+    try { st.done[a.public_id] = await copyOne(bucket, cfg, ops, a, now, fetchImpl); ok++; }
+    catch (e) { st.failed[a.public_id] = String(e.message).slice(0, 200); errors.push(`${a.public_id}: ${st.failed[a.public_id]}`); }
   }
   if (!st.queue.length) { st.status = "done"; st.finished_at = now; }
   await save(ops, st);
   if (st.status === "done") await ops.audit("automation", "r2_migration_done", `${Object.keys(st.done).length} copied, ${Object.keys(st.failed).length} failed`);
-  return { copied: batch.length, remaining: st.queue.length };
+  return { copied: ok, failed: errors.length, remaining: st.queue.length, ...(errors.length ? { errors } : {}) };
 }
 
 async function copyOne(bucket, cfg, ops, a, now, fetchImpl) {
@@ -87,8 +94,14 @@ async function copyOne(bucket, cfg, ops, a, now, fetchImpl) {
   const attempts = [[a.format || (a.resource_type === "video" ? "mp4" : "jpg"), true], ...(a.resource_type === "image" ? [["jpg", false]] : [])];
   let bytes = null, type = null, problems = [];
   for (const [fmt, exact] of attempts) {
-    const res = await fetchImpl(await downloadUrl(cfg, a, fmt, now));
-    if (!res.ok) { problems.push(`${fmt}: HTTP ${res.status}`); continue; }
+    let res = await fetchImpl(await downloadUrl(cfg, a, fmt, now), { redirect: "manual" });
+    let via = "api";
+    if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+      const loc = res.headers.get("location");
+      via = new URL(loc, "https://api.cloudinary.com").host;
+      res = await fetchImpl(loc);
+    }
+    if (!res.ok) { problems.push(`${fmt}: HTTP ${res.status} via ${via}${res.headers.get("x-cld-error") ? ` (${res.headers.get("x-cld-error")})` : ""}`); continue; }
     const buf = new Uint8Array(await res.arrayBuffer());
     if (exact && a.bytes && buf.byteLength !== a.bytes) { problems.push(`${fmt}: size ${buf.byteLength} ≠ ${a.bytes}`); continue; }
     const t = sniff(buf);
