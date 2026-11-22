@@ -188,13 +188,12 @@ const field = (label, input, hint) => h("label", { class: "field" }, label, inpu
 
 // ---------- shell ----------
 
-// Pages by route id. Old ids (content, media, bots…) are kept so existing links keep working.
+// Pages by route id. Old ids (content, media, bots, tg-*…) keep working as links.
 const PAGES = [
-  ["overview", "Overview", pageHome],
-  ["tg-overview", "Telegram overview", pageOverview],
-  ["bots", "Bots & channels", pageBots],
+  ["overview", "Overview", pageOverview],
   ["tg-create", "Create post", pageCreatePost],
   ["content", "Scheduled posts", pageContent],
+  ["calendar", "Calendar", pageCalendar],
   ["media", "Media library", pageMedia],
   ["tg-paid", "Paid media", pagePaidMedia],
   ["subscribers", "VIP subscribers", pageSubscribers],
@@ -202,33 +201,25 @@ const PAGES = [
   ["moderation", "Moderation", pageModeration],
   ["automation", "Automations", pageAutomation],
   ["settings", "Features & settings", pageSettings],
+  ["bots", "Bots & channels", pageBots],
   ["analytics", "Analytics", pageAnalytics],
-  ["mc-overview", "My.Club overview", (m) => pageMyClub(m, "overview")],
-  ["mc-connection", "Connection", (m) => pageMyClub(m, "connection")],
-  ["mc-create", "Create post", (m) => pageMyClub(m, "create")],
-  ["mc-scheduled", "Scheduled content", (m) => pageMyClub(m, "scheduled")],
-  ["mc-media", "Media library", (m) => pageMyClub(m, "media")],
-  ["mc-paid", "Paid content", (m) => pageMyClub(m, "paid")],
-  ["mc-subscribers", "Subscribers", (m) => pageMyClub(m, "subscribers")],
-  ["mc-analytics", "Analytics", (m) => pageMyClub(m, "analytics")],
-  ["calendar", "Unified calendar", pageCalendar],
-  ["library", "Shared media library", pageSharedMedia],
-  ["integrations", "Integrations", pageIntegrations],
   ["security", "Security & backups", pageSecurity],
   ["activity", "Activity log", pageActivity],
 ];
+// Former routes from the multi-platform layout, sent to their Telegram pages.
+const ROUTE_ALIAS = { "tg-overview": "overview", library: "media", integrations: "bots" };
 
 // Sidebar tree. Leaves are route ids; groups collapse (remembered per browser).
 const NAV = [
   { id: "overview" },
-  { group: "social", label: "Social media", children: [
-    { group: "telegram", label: "Telegram", icon: "✈", children: ["tg-overview", "bots", "tg-create", "content", "media", "tg-paid", "subscribers", "joins", "moderation", "automation", "settings", "analytics"] },
-    { group: "myclub", label: "My.Club", icon: "♣", cap: "myclub", children: ["mc-overview", "mc-connection", "mc-create", "mc-scheduled", "mc-media", "mc-paid", "mc-subscribers", "mc-analytics"] },
-  ] },
-  { id: "calendar" }, { id: "library" }, { id: "integrations" }, { id: "security" }, { id: "activity" },
+  { group: "publishing", label: "Publishing", children: ["tg-create", "content", "calendar", "media", "tg-paid"] },
+  { group: "audience", label: "VIP audience", children: ["subscribers", "joins", "moderation"] },
+  { group: "automation", label: "Automation", children: ["automation", "settings", "bots"] },
+  { id: "analytics" },
+  { group: "system", label: "System", children: ["security", "activity"] },
 ];
-const NAV_LABEL = { "tg-overview": "Overview", bots: "Bots & channels", content: "Scheduled posts", subscribers: "VIP subscribers", "mc-overview": "Overview" };
-const pageVisible = (id) => (id !== "bots" || can("bots")) && (id !== "automation" || can("content_v2")) && (!id.startsWith("mc-") || can("myclub"));
+const NAV_LABEL = {};
+const pageVisible = (id) => (id !== "bots" || can("bots")) && (id !== "automation" || can("content_v2"));
 
 function navOpenState() { try { return JSON.parse(localStorage.getItem("nav_open") || "{}"); } catch { return {}; } }
 function setNavOpen(group, open) { const o = navOpenState(); o[group] = open; try { localStorage.setItem("nav_open", JSON.stringify(o)); } catch { /* private mode */ } }
@@ -279,7 +270,7 @@ async function renderLogin(message) {
 function renderShell(active) {
   const close = () => document.body.classList.remove("nav-open");
   const nav = h("nav", { class: "nav", id: "sidenav", "aria-label": "Sections", onclick: (e) => { if (e.target.closest("a")) close(); } },
-    h("div", { class: "brand" }, h("span", {}, "💎"), "Shakhira", h("span", { class: "brand-sub" }, "Social admin")),
+    h("div", { class: "brand" }, h("span", {}, "💎"), "Shakhira", h("span", { class: "brand-sub" }, "Admin")),
     navTree(NAV, active),
     h("div", { class: "nav-foot" },
       h("button", { onclick: toggleTheme }, "Light / dark"),
@@ -310,7 +301,8 @@ async function route() {
     try { const me = await api("/api/me"); state.caps = me.capabilities || []; state.automation = me.automation; } catch { state.caps = []; }
     if ((state.caps || []).includes("bots") && !state.primaryBot) api("/api/bots").then((r) => { state.primaryBot = r.bots.find((b) => b.is_primary)?.username; }).catch(() => {});
   }
-  const id = (location.hash || "#overview").slice(1).split(/[?/]/)[0];
+  const raw = (location.hash || "#overview").slice(1).split(/[?/]/)[0];
+  const id = ROUTE_ALIAS[raw] || raw;
   const page = PAGES.find((p) => p[0] === id) || PAGES[0];
   const main = renderShell(page[0]);
   main.append(h("p", { class: "muted" }, "Loading…"));
@@ -328,7 +320,7 @@ async function pageOverview(main) {
   const offCount = Object.values(o.features).filter((f) => !f.enabled).length;
   const worker = o.worker_last_seen && Date.now() / 1000 - o.worker_last_seen < 600;
   put(main, 
-    head("Telegram overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
+    head("Overview", `Automatic Cloudinary posts: ${o.poster_slots_ist.join(" and ")} daily`),
     o.environment === "staging" || ["simulated", "preview", "locked"].includes(o.automation) ? h("div", { class: "banner warn" },
       `${String(o.environment || "").toUpperCase()}: ` + (o.automation === "preview"
         ? "automation sends only to the private preview chat. Nothing reaches the channels or members."
@@ -622,29 +614,20 @@ async function pageCalendar(main) {
     calendarStart = Math.round((monday - IST_OFFSET_MS) / 1000);
   }
   const start = calendarStart, end = start + 7 * 86400;
-  const platform = new URLSearchParams(location.hash.split("?")[1] || "").get("platform") || "all";
-  const [data, mcItems] = await Promise.all([api(`/api/calendar?start=${start}&end=${end}`),
-    can("myclub") && platform !== "telegram" ? api(`/api/myclub/calendar?start=${start}&end=${end}`).catch(() => []) : []]);
-  if (platform === "myclub") { data.items = []; data.poster_slots = []; }
+  const data = await api(`/api/calendar?start=${start}&end=${end}`);
   const days = [...Array(7)].map((_, d) => ({ start: start + d * 86400, items: [] }));
   const place = (ts, el) => { const d = Math.floor((ts - start) / 86400); if (d >= 0 && d < 7) days[d].items.push([ts, el]); };
   data.poster_slots.forEach((sl) => place(sl.at, h("div", { class: "cal-item auto", title: sl.label }, h("div", { class: "t" }, fmtTime.format(new Date(sl.at * 1000))), "Cloudinary auto-post")));
   data.items.forEach((i) => { const ts = i.posted_at || i.scheduled_at; if (ts) place(ts, h("div", { class: "cal-item", onclick: () => (["draft", "scheduled", "failed"].includes(i.status) ? editor(i) : null) },
     h("div", { class: "t" }, fmtTime.format(new Date(ts * 1000)), " ", chip(i.status)), h("div", { class: "clip" }, `${KIND_LABEL[i.kind]} · ${i.target === "vip" ? "VIP" : "Public"} · ${i.text || ""}`))); });
-  // My.Club entries are references to the My.Club plan (never copies of Telegram posts).
-  mcItems.forEach((i) => place(i.at, h("div", { class: "cal-item myclub", onclick: () => (location.hash = "#mc-scheduled") },
-    h("div", { class: "t" }, fmtTime.format(new Date(i.at * 1000)), " ", chip(MC_STATUS_CHIP[i.status] || "", MC_STATUS_LABEL[i.status])),
-    h("div", { class: "clip" }, `My.Club · ${MC_KIND_LABEL[i.kind]} · ${i.title}`))));
   const todayIdx = Math.floor((Date.now() / 1000 - start) / 86400);
-  const pf = can("myclub") ? h("div", { class: "tabs", role: "tablist" }, [["all", "All platforms"], ["telegram", "Telegram"], ["myclub", "My.Club"]].map(([k, l]) =>
-    h("button", { class: k === platform ? "active" : "", role: "tab", "aria-selected": String(k === platform), onclick: () => (location.hash = k === "all" ? "#calendar" : `#calendar?platform=${k}`) }, l))) : null;
   put(main, 
-    head("Unified calendar", "India time. Grey: automatic Cloudinary posts (GitHub). Blue: Telegram posts. Purple: My.Club plan.",
+    head("Calendar", "India time. Grey items are the automatic Cloudinary posts from GitHub.",
       h("button", { onclick: () => { calendarStart -= 7 * 86400; route(); } }, "← Previous week"),
       h("button", { onclick: () => { calendarStart = null; route(); } }, "This week"),
       h("button", { onclick: () => { calendarStart += 7 * 86400; route(); } }, "Next week →"),
       h("button", { class: "primary", onclick: () => editor() }, "New post")),
-    pf, h("div", { class: "cal" }, days.map((d, idx) => h("div", { class: "cal-day" + (idx === todayIdx ? " today" : "") },
+    h("div", { class: "cal" }, days.map((d, idx) => h("div", { class: "cal-day" + (idx === todayIdx ? " today" : "") },
       h("h4", {}, fmtDay.format(new Date(d.start * 1000 + 3600 * 1000))), d.items.sort((a, b) => a[0] - b[0]).map((x) => x[1])))));
 }
 
@@ -1104,57 +1087,7 @@ async function pageAutomation(main) {
 }
 
 
-// ---------- social media workspace (combined overview, shared pages, My.Club) ----------
-
-const MC_KIND_LABEL = { post: "Post", paid: "Paid content", story: "Story", message: "Mass message" };
-const MC_STATUS_LABEL = { draft: "Draft", ready: "Ready", exported: "Exported", scheduled_in_myclub: "Scheduled in My.Club", published: "Published", archived: "Archived" };
-const MC_STATUS_CHIP = { draft: "draft", ready: "queued", exported: "pending", scheduled_in_myclub: "scheduled", published: "posted", archived: "cancelled" };
-const mcChip = (st) => chip(MC_STATUS_CHIP[st] || "", MC_STATUS_LABEL[st] || st);
-const MC_LIMIT = "My.Club offers no public API for sign-in or publishing, so this dashboard never logs in to My.Club or posts there. Prepare content here, export it, and schedule it in My.Club's own planner; then mark it here.";
-
-async function pageHome(main) {
-  const now = Math.floor(Date.now() / 1000);
-  const [o, mc, cal, mcCal] = await Promise.all([
-    api("/api/overview"), can("myclub") ? api("/api/myclub").catch(() => null) : null,
-    api(`/api/calendar?start=${now}&end=${now + 7 * 86400}`).catch(() => ({ items: [], poster_slots: [] })),
-    can("myclub") ? api(`/api/myclub/calendar?start=${now}&end=${now + 7 * 86400}`).catch(() => []) : []]);
-  state.badges.joins = o.join_pending || 0;
-  const worker = o.worker_last_seen && now - o.worker_last_seen < 600;
-  const latest = mc?.metrics?.length ? mc.metrics[mc.metrics.length - 1] : null;
-  const tasks = [
-    ...o.attention.map((i) => ({ text: `Telegram post #${i.id} ${i.status}: ${i.last_error || "check it"}`, href: "#content" })),
-    ...(o.join_pending ? [{ text: `${o.join_pending} Telegram join request(s) to review`, href: "#joins" }] : []),
-    ...(mc ? mc.items.filter((i) => i.status === "ready").map((i) => ({ text: `My.Club: export “${i.title}” and add it to My.Club's planner`, href: "#mc-scheduled" })) : []),
-    ...(mc ? mc.items.filter((i) => i.status === "exported").map((i) => ({ text: `My.Club: confirm “${i.title}” is scheduled in My.Club`, href: "#mc-scheduled" })) : []),
-    ...(mc ? mc.items.filter((i) => ["ready", "exported"].includes(i.status) && i.planned_at && i.planned_at < now).map((i) => ({ text: `My.Club: “${i.title}” was planned for ${when(i.planned_at)} and isn't marked scheduled`, href: "#mc-scheduled" })) : []),
-  ];
-  const upcoming = [
-    ...cal.items.filter((i) => i.scheduled_at && i.status === "scheduled").map((i) => ({ at: i.scheduled_at, p: "Telegram", text: `${KIND_LABEL[i.kind]} → ${i.target === "vip" ? "VIP" : "Public"} · ${i.text || ""}` })),
-    ...cal.poster_slots.map((s) => ({ at: s.at, p: "Telegram", text: "Cloudinary auto-post (GitHub)" })),
-    ...mcCal.map((i) => ({ at: i.at, p: "My.Club", text: `${MC_KIND_LABEL[i.kind]} · ${i.title} (${MC_STATUS_LABEL[i.status]})` })),
-  ].sort((a, b) => a.at - b.at).slice(0, 10);
-  const platform = (name, href, status, rows) => h("section", { class: "card platform" },
-    h("div", { class: "row spread" }, h("h2", {}, name), status), h("ul", { class: "list" }, rows.map(([k, v]) => h("li", {}, h("span", { class: "muted" }, k), h("span", {}, v)))),
-    h("a", { href }, `Open ${name} →`));
-  put(main,
-    head("Overview", "All platforms at a glance: status, next 7 days, tasks and analytics"),
-    h("div", { class: "grid two" },
-      platform("Telegram", "#tg-overview", chip(o.automation === "live" ? "posted" : "pending", o.automation === "live" ? "Posting live" : `Automation ${o.automation}`), [
-        ["Scheduled posts", num(o.scheduled_count)], ["Monthly VIP members", num(o.members.monthly)], ["Active trials", num(o.trials.active)],
-        ["Stars, 30 days", num(o.stars_30d) + " ⭐"], ["Worker", worker ? `running (${ago(o.worker_last_seen)})` : "not seen"], ["Auto-posts", o.poster_slots_ist.join(", ")]]),
-      can("myclub") ? platform("My.Club", "#mc-overview", chip(mc?.connection?.handle ? "posted" : "pending", mc?.connection?.handle ? `@${mc.connection.handle}` : "Not linked"), [
-        ["Drafts / ready", `${num(mc?.counts?.draft)} / ${num(mc?.counts?.ready)}`], ["Exported, awaiting My.Club", num(mc?.counts?.exported)],
-        ["Scheduled in My.Club", num(mc?.counts?.scheduled_in_myclub)], ["Published", num(mc?.counts?.published)],
-        ["Subscribers (last entered)", latest?.subscribers != null ? num(latest.subscribers) : "—"], ["Publishing", "manual via My.Club planner"]]) : null),
-    h("div", { class: "grid two" },
-      h("section", { class: "card" }, h("div", { class: "row spread" }, h("h2", {}, "Next 7 days"), h("a", { href: "#calendar" }, "Unified calendar →")),
-        upcoming.length ? h("ul", { class: "list" }, upcoming.map((u) => h("li", {}, h("div", {}, h("div", { class: "clip" }, u.text), h("div", { class: "small muted" }, u.p)), h("span", { class: "small" }, when(u.at)))))
-          : h("p", { class: "empty" }, "Nothing planned")),
-      h("section", { class: "card" }, h("h2", {}, "Tasks"),
-        tasks.length ? h("ul", { class: "list" }, tasks.slice(0, 12).map((t) => h("li", {}, h("a", { href: t.href }, t.text)))) : h("p", { class: "empty" }, "Nothing needs your attention"))),
-    h("section", { class: "card" }, h("h2", {}, "Telegram Stars per day"),
-      barChart(o.revenue_by_day.map((r) => ({ label: r.day, short: r.day.slice(5), value: r.stars })), { unit: " ⭐", empty: "No payments recorded by this system yet" })));
-}
+// ---------- Telegram pages added with the sidebar restructure ----------
 
 async function pageCreatePost(main) {
   await pageContent(main);
@@ -1178,162 +1111,13 @@ async function pagePaidMedia(main) {
     can("paid_media_automation") ? await paidMediaSettings() : null);
 }
 
-async function pageSharedMedia(main) {
-  await pageMedia(main);
-  main.querySelector("h1").textContent = "Shared media library";
-  main.querySelector(".page-head")?.after(h("div", { class: "banner" }, "One library for every platform. Telegram posts and My.Club drafts link to the same files, so nothing is uploaded twice. Files in the GitHub auto-poster folder are posted to Telegram automatically."));
-}
-
-async function pageIntegrations(main) {
-  const [cloud, bots, mc] = await Promise.all([
-    can("bots") ? api("/api/integrations/cloudinary").catch((e) => ({ error: e.message })) : null,
-    can("bots") ? api("/api/bots").catch(() => null) : null, can("myclub") ? api("/api/myclub").catch(() => null) : null]);
-  const row = (name, status, detail, href) => h("div", { class: "toggle-row" }, h("div", {}, h("div", {}, name), h("div", { class: "small muted" }, detail)), h("div", { class: "row" }, status, href ? h("a", { href }, "Manage") : null));
-  put(main, head("Integrations", "Each platform keeps its own accounts, credentials and permissions"),
-    h("section", { class: "card" },
-      row("Telegram bots", chip(bots?.bots?.length ? "posted" : "pending", bots?.bots?.length ? `${bots.bots.length} connected` : "none"), "Tokens encrypted (AES-256-GCM), per-bot permissions and channels", "#bots"),
-      row("Cloudinary (shared media)", chip(cloud?.connected ? "posted" : "pending", cloud?.connected ? "connected" : cloud?.error || "not connected"), "Used by the shared media library for every platform", "#bots"),
-      row("GitHub auto-poster", chip("posted", "unchanged"), "Posts Cloudinary media to the Telegram channel at 5 AM / 10 PM IST", "#automation"),
-      row("My.Club", chip(mc?.connection?.handle ? "posted" : "pending", mc?.connection?.handle ? `@${mc.connection.handle} (manual)` : "not linked"), "No public API: profile link only, no credentials stored. Publishing through My.Club's own planner.", "#mc-connection")));
-}
-
 async function pageSecurity(main) {
   put(main, head("Security & backups", "Sign-in, credential protection, backups and restore"),
     h("section", { class: "card" }, h("h2", {}, "Protection in place"), h("ul", { class: "list" }, [
       "Supabase Auth sign-in, CSRF tokens, login rate limit (15-minute lockout)",
       "Every credential change needs your password again",
       "Telegram tokens and Cloudinary secrets encrypted per record; never shown in full",
-      "No My.Club password or token is ever stored",
       "Every change is written to the activity log",
     ].map((t) => h("li", {}, t))), h("a", { href: "#activity" }, "Open activity log →")),
     can("backup") ? await backupCard() : null);
-}
-
-// ----- My.Club -----
-
-function mcEditor(item, preset = {}) {
-  const v = { kind: "post", status: "draft", title: "", caption: "", media: [], tags: [], price: "", planned_at: null, myclub_url: "", ...preset, ...(item || {}) };
-  const title = h("input", { value: v.title, maxlength: 140 });
-  const kind = h("select", {}, Object.entries(MC_KIND_LABEL).map(([k, l]) => h("option", { value: k, selected: k === v.kind }, l)));
-  const caption = h("textarea", { rows: 6, maxlength: 5000 }); caption.value = v.caption;
-  const tags = h("input", { value: (v.tags || []).join(" "), placeholder: "tag1 tag2" });
-  const price = h("input", { type: "number", min: "0.01", step: "0.01", value: v.price ?? "" });
-  const priceField = field("Price", price, "Set the same price in My.Club when you add the post.");
-  const media = h("textarea", { rows: 3, placeholder: "https://… (one link per line)" }); media.value = (v.media || []).join("\n");
-  const planned = h("input", { type: "datetime-local", value: tsToIstInput(v.planned_at) });
-  const status = h("select", {}, Object.entries(MC_STATUS_LABEL).map(([k, l]) => h("option", { value: k, selected: k === v.status }, l)));
-  const link = h("input", { value: v.myclub_url || "", placeholder: "https://… link to the post on My.Club (optional)" });
-  const syncPrice = () => { priceField.hidden = kind.value !== "paid"; };
-  kind.addEventListener("change", syncPrice); syncPrice();
-  const form = h("form", { onsubmit: async (e) => {
-    e.preventDefault();
-    const b = { title: title.value, kind: kind.value, caption: caption.value, tags: tags.value.split(/[\s,]+/).filter(Boolean),
-      price: kind.value === "paid" ? price.value : null, media: media.value.split(/\s+/).filter(Boolean),
-      planned_at: istInputToTs(planned.value), status: status.value, myclub_url: link.value };
-    const r = await act(() => api(item ? `/api/myclub/items/${item.id}` : "/api/myclub/items", { method: item ? "PUT" : "POST", body: b }), item ? "Saved" : "Draft saved");
-    if (r) { closeDrawer(); if (location.hash.startsWith("#mc-create")) location.hash = "#mc-scheduled"; else route(); }
-  } },
-    h("div", { class: "banner" }, "My.Club workspace — separate from Telegram. Nothing here is sent anywhere automatically."),
-    field("Title (for your plan)", title), field("Type", kind), field("Caption", caption), field("Hashtags", tags), priceField,
-    field("Media links", media, "From the shared media library. Download and upload them in My.Club's editor."),
-    h("button", { type: "button", onclick: () => pickMedia((url) => { media.value = (media.value.trim() + "\n" + url).trim(); }) }, "Choose from shared library"),
-    field("Planned time (IST)", planned, "Schedule it at this time in My.Club's own planner."), field("Status", status), field("My.Club link", link),
-    h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, item ? "Save" : "Save draft")));
-  drawer(item ? `Edit My.Club item #${item.id}` : "New My.Club post", form);
-}
-
-async function mcExport(item) {
-  const pkg = await act(() => api(`/api/myclub/items/${item.id}/export`, { method: "POST" }));
-  if (!pkg) return;
-  const cap = h("textarea", { rows: 8, readonly: true }); cap.value = pkg.caption;
-  const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
-  drawer(`Export for My.Club: ${pkg.title}`, h("div", {},
-    field("Caption", cap), h("div", { class: "row" },
-      h("button", { onclick: async () => { try { await navigator.clipboard.writeText(pkg.caption); toast("Caption copied"); } catch { cap.select(); } } }, "Copy caption"),
-      h("a", { class: "btn", href: URL.createObjectURL(blob), download: `myclub-${item.id}.json` }, "Download package")),
-    pkg.media.length ? h("div", {}, h("h3", {}, "Media"), h("ul", { class: "list" }, pkg.media.map((u) => h("li", {}, h("a", { href: u, target: "_blank", rel: "noopener" }, u.split("/").pop()))))) : null,
-    pkg.price ? h("p", {}, `Price: ${pkg.price}`) : null, pkg.planned_at_iso ? h("p", {}, `Planned: ${when(Date.parse(pkg.planned_at_iso) / 1000)}`) : null,
-    h("h3", {}, "Steps in My.Club"), h("ol", {}, pkg.steps.map((t) => h("li", {}, t))),
-    h("div", { class: "row" },
-      h("button", { class: "primary", onclick: async () => { if (await act(() => api(`/api/myclub/items/${item.id}`, { method: "PUT", body: { status: "scheduled_in_myclub" } }), "Marked as scheduled in My.Club")) { closeDrawer(); route(); } } }, "Mark scheduled in My.Club"),
-      h("button", { onclick: async () => { if (await act(() => api(`/api/myclub/items/${item.id}`, { method: "PUT", body: { status: "published" } }), "Marked as published")) { closeDrawer(); route(); } } }, "Mark published"))));
-  route();
-}
-
-function mcTable(items, empty) {
-  return table([
-    { label: "Planned", render: (i) => when(i.planned_at) },
-    { label: "Type", render: (i) => MC_KIND_LABEL[i.kind] + (i.price ? ` · ${i.price}` : "") },
-    { label: "Title", render: (i) => h("div", { class: "clip" }, i.title) },
-    { label: "Status", render: mcChip },
-    { label: "", render: (i) => h("div", { class: "row" },
-      h("button", { class: "link", onclick: (e) => { e.stopPropagation(); mcEditor(i); } }, "Edit"),
-      h("button", { class: "link", onclick: (e) => { e.stopPropagation(); mcExport(i); } }, "Export"),
-      h("button", { class: "link danger", onclick: async (e) => { e.stopPropagation(); if (confirm("Delete this My.Club item?") && await act(() => api(`/api/myclub/items/${i.id}`, { method: "DELETE" }), "Deleted")) route(); } }, "Delete")) },
-  ], items, { empty });
-}
-
-async function pageMyClub(main, tab) {
-  const ws = await api("/api/myclub");
-  const limits = h("div", { class: "banner warn" }, MC_LIMIT);
-  const newBtn = (preset) => h("button", { class: "primary", onclick: () => mcEditor(null, preset) }, preset?.kind === "paid" ? "New paid content" : "New My.Club post");
-  const sorted = [...ws.items].sort((a, b) => (a.planned_at || 9e12) - (b.planned_at || 9e12));
-  const metrics = ws.metrics || [];
-  const latest = metrics[metrics.length - 1];
-  if (tab === "overview") {
-    return put(main, head("My.Club", ws.connection.handle ? `@${ws.connection.handle}` : "Not linked yet", newBtn()), limits,
-      h("div", { class: "grid kpis" }, kpi("Drafts", num(ws.counts.draft), "being prepared"), kpi("Ready / exported", `${num(ws.counts.ready)} / ${num(ws.counts.exported)}`, "to add in My.Club"),
-        kpi("Scheduled in My.Club", num(ws.counts.scheduled_in_myclub), "confirmed by you"), kpi("Published", num(ws.counts.published), "all time"),
-        kpi("Subscribers", latest?.subscribers != null ? num(latest.subscribers) : "—", latest ? `entered ${ago(latest.at)}` : "enter in Subscribers")),
-      h("section", { class: "card" }, h("h2", {}, "Coming up"), mcTable(sorted.filter((i) => !["published", "archived"].includes(i.status)).slice(0, 8), "Nothing planned. Create a post.")));
-  }
-  if (tab === "connection") {
-    const handle = h("input", { value: ws.connection.handle, placeholder: "yourhandle" });
-    const url = h("input", { value: ws.connection.profile_url, placeholder: "https://…" });
-    const notes = h("textarea", { rows: 3 }); notes.value = ws.connection.notes;
-    return put(main, head("My.Club connection", "Kept separate from every Telegram account and credential"), limits,
-      h("section", { class: "card" }, h("h2", {}, "Integration status"), h("ul", { class: "list" }, [
-        ["Official sign-in (OAuth / API key)", "Not offered by My.Club"], ["Direct publishing API", "Not offered — use My.Club's planner"],
-        ["Statistics API", "Not offered — enter figures manually"], ["Credentials stored here", "None"]].map(([k, v2]) => h("li", {}, h("span", {}, k), chip("pending", v2))))),
-      h("section", { class: "card" }, h("h2", {}, "Profile"), h("form", { onsubmit: async (e) => { e.preventDefault();
-        if (await act(() => api("/api/myclub/connection", { method: "PUT", body: { handle: handle.value, profile_url: url.value, notes: notes.value } }), "Saved")) route(); } },
-        field("My.Club username", handle), field("Profile link", url), field("Notes", notes, "Do not paste passwords here."), h("button", { class: "primary", type: "submit" }, "Save"))));
-  }
-  if (tab === "create") { put(main, head("Create My.Club post", "Draft here, then export to My.Club"), limits, h("section", { class: "card" }, mcTable(sorted.filter((i) => i.status === "draft"), "No drafts yet"))); return mcEditor(); }
-  if (tab === "scheduled") {
-    return put(main, head("Scheduled content", "Your My.Club plan. Export each item, add it in My.Club's planner, then mark it scheduled.", newBtn()), limits,
-      h("section", { class: "card" }, mcTable(sorted.filter((i) => i.status !== "archived"), "No My.Club content yet")));
-  }
-  if (tab === "paid") {
-    return put(main, head("Paid content", "Locked/paid posts for My.Club. Prices are set in My.Club when you add the post.", newBtn({ kind: "paid" })), limits,
-      h("section", { class: "card" }, mcTable(sorted.filter((i) => i.kind === "paid"), "No paid content yet")));
-  }
-  if (tab === "media") {
-    await pageMedia(main);
-    main.querySelector("h1").textContent = "My.Club media";
-    const used = [...new Set(ws.items.flatMap((i) => i.media))];
-    main.querySelector(".page-head")?.after(h("div", { class: "banner" }, "This is the shared library. Upload here, then attach the links to My.Club drafts. " + `${used.length} file(s) are used by My.Club drafts.`));
-    return;
-  }
-  const metricForm = () => {
-    const f = { subscribers: h("input", { type: "number", min: 0 }), paid_subscribers: h("input", { type: "number", min: 0 }), revenue: h("input", { type: "number", min: 0, step: "0.01" }), views: h("input", { type: "number", min: 0 }), note: h("input", {}) };
-    return h("form", { class: "grid kpis", onsubmit: async (e) => { e.preventDefault();
-      if (await act(() => api("/api/myclub/metrics", { method: "POST", body: Object.fromEntries(Object.entries(f).map(([k, el]) => [k, el.value])) }), "Snapshot saved")) route(); } },
-      field("Subscribers", f.subscribers), field("Paid subscribers", f.paid_subscribers), field("Revenue", f.revenue), field("Views", f.views), field("Note", f.note),
-      h("div", {}, h("button", { class: "primary", type: "submit" }, "Save snapshot")));
-  };
-  const series = (key) => metrics.filter((m) => m[key] != null).slice(-30).map((m) => ({ label: when(m.at), short: fmtDay.format(new Date(m.at * 1000)), value: m[key] }));
-  if (tab === "subscribers") {
-    return put(main, head("My.Club subscribers", "Copied by you from My.Club's statistics (no API provides them)"), limits,
-      h("section", { class: "card" }, h("h2", {}, "Add today's figures"), metricForm()),
-      h("section", { class: "card" }, h("h2", {}, "Subscribers over time"), barChart(series("subscribers"), { empty: "No snapshots yet" })));
-  }
-  // analytics
-  const published = ws.items.filter((i) => i.status === "published");
-  return put(main, head("My.Club analytics", "From your snapshots and this workspace"), limits,
-    h("div", { class: "grid kpis" }, kpi("Subscribers", latest?.subscribers != null ? num(latest.subscribers) : "—", "latest snapshot"),
-      kpi("Paid subscribers", latest?.paid_subscribers != null ? num(latest.paid_subscribers) : "—", "latest snapshot"),
-      kpi("Revenue", latest?.revenue != null ? num(latest.revenue) : "—", "latest snapshot"), kpi("Published", num(published.length), `${num(published.filter((i) => i.kind === "paid").length)} paid`)),
-    h("section", { class: "card" }, h("h2", {}, "Revenue per snapshot"), barChart(series("revenue"), { empty: "No snapshots yet" })),
-    h("section", { class: "card" }, h("h2", {}, "Add figures"), metricForm()));
 }

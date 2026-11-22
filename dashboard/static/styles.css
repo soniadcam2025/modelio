@@ -202,8 +202,6 @@ tr.clickable:hover td { background: var(--surface-2); }
 .nav a.depth-1 { padding-left: 20px; }
 .nav-kids { display: grid; gap: 1px; }
 .row.spread { justify-content: space-between; align-items: center; }
-.platform .list li { display: flex; justify-content: space-between; gap: 12px; }
-.cal-item.myclub { border-left: 3px solid #8b5cf6; }
 .banner:not(.warn):not(.bad) { border: 1px solid var(--glass-edge, var(--border)); }
 
 /* Consistent vertical rhythm between page sections */

@@ -34,6 +34,38 @@ function markup(item, config) {
   return undefined;
 }
 
+// Telegram downloads photos sent by link itself, and refuses them ("failed to get HTTP URL content") when the
+// file is over 5 MB, in a format it can't read (HEIC, some PNG/WebP), or too large in pixels. Uploads from
+// phones are often like that. Cloudinary images are therefore requested as a JPEG of at most 2560 px,
+// which is always within Telegram's photo limits. The original file in Cloudinary is unchanged.
+const PHOTO_TRANSFORM = "f_jpg,q_auto:good,c_limit,w_2560,h_2560";
+export function telegramPhotoUrl(url) {
+  const m = /^(https:\/\/res\.cloudinary\.com\/[^/]+\/image\/upload\/)(.+)$/.exec(String(url || ""));
+  if (!m || m[2].startsWith(PHOTO_TRANSFORM)) return url;
+  return m[1] + PHOTO_TRANSFORM + "/" + m[2];
+}
+
+const URL_FETCH_REFUSED = /failed to get HTTP URL content|wrong file identifier\/HTTP URL|wrong type of the web page content|IMAGE_PROCESS_FAILED|PHOTO_INVALID_DIMENSIONS|failed to get file/i;
+const MAX_PHOTO_UPLOAD = 10 * 1024 * 1024;
+
+// Fallback: download the image here and upload it to Telegram as a file. Only used after Telegram answered
+// 400 to the link, which means nothing was posted, so this can't create a duplicate.
+async function uploadPhoto(tg, params, urls, fetchImpl = fetch) {
+  const problems = [];
+  for (const url of [...new Set(urls)]) {
+    let res;
+    try { res = await fetchImpl(url, { redirect: "follow" }); } catch { problems.push("network error"); continue; }
+    const type = (res.headers.get("content-type") || "").split(";")[0].trim();
+    if (!res.ok) { problems.push(`HTTP ${res.status}`); continue; }
+    if (!/^image\/(jpeg|png|webp|gif)$/.test(type)) { problems.push(`not a supported image (${type || "unknown type"})`); continue; }
+    const blob = await res.blob();
+    if (blob.size > MAX_PHOTO_UPLOAD) { problems.push(`${Math.round(blob.size / 1048576)} MB is over Telegram's 10 MB photo limit`); continue; }
+    const ext = type === "image/png" ? "png" : type === "image/webp" ? "webp" : type === "image/gif" ? "gif" : "jpg";
+    return tg.upload("sendPhoto", params, "photo", blob, `photo.${ext}`);
+  }
+  throw new TelegramError(`sendPhoto: Telegram could not fetch the image link and the upload fallback failed (${problems.join("; ")}). Check the file in the media library, then use Retry.`, { code: 400 });
+}
+
 export async function sendItem(tg, config, item, text) {
   const chat_id = targetChat(config, item.target);
   const reply_markup = markup(item, config);
@@ -43,7 +75,16 @@ export async function sendItem(tg, config, item, text) {
   const parse_mode = item.parse_mode === "HTML" ? "HTML" : undefined;
   switch (item.kind) {
     case "text": case "promo": return tg.call("sendMessage", { chat_id, text, reply_markup, protect_content, parse_mode });
-    case "photo": return tg.call("sendPhoto", { parse_mode, chat_id, photo: item.media_url, caption, reply_markup, protect_content });
+    case "photo": {
+      const params = { parse_mode, chat_id, caption, reply_markup, protect_content };
+      const link = telegramPhotoUrl(item.media_url);
+      try {
+        return await tg.call("sendPhoto", { ...params, photo: link });
+      } catch (err) {
+        if (!(err instanceof TelegramError) || err.code !== 400 || !URL_FETCH_REFUSED.test(err.message)) throw err;
+        return uploadPhoto(tg, params, [link, item.media_url]);
+      }
+    }
     case "video": return tg.call("sendVideo", { parse_mode, chat_id, video: item.media_url, caption, reply_markup, supports_streaming: true, protect_content });
     case "animation": return tg.call("sendAnimation", { parse_mode, chat_id, animation: item.media_url, caption, reply_markup, protect_content });
     case "poll": case "quiz": {
@@ -55,7 +96,8 @@ export async function sendItem(tg, config, item, text) {
     case "paid_media": {
       const path = item.media_url.toLowerCase().split("?")[0];
       const type = VIDEO_EXT.some((e) => path.endsWith(e)) ? "video" : "photo";
-      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media: item.media_url }], caption, parse_mode, protect_content, reply_markup });
+      const media = type === "photo" ? telegramPhotoUrl(item.media_url) : item.media_url;
+      return tg.call("sendPaidMedia", { chat_id, star_count: item.star_count, media: [{ type, media }], caption, parse_mode, protect_content, reply_markup });
     }
     default: throw new Error(`Unknown content kind ${item.kind}`);
   }

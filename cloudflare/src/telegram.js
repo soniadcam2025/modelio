@@ -39,6 +39,16 @@ export class SendOnlyTelegram {
   }
 
   async call(method, params) {
+    return this.#request(method, params, null);
+  }
+
+  // Multipart upload of one file (used when Telegram can't download a media link itself).
+  // Same method allow-list and staging lock as call(); params are sent as form fields.
+  async upload(method, params, field, blob, filename) {
+    return this.#request(method, params, { field, blob, filename });
+  }
+
+  async #request(method, params, file) {
     if (!ALLOWED_METHODS.has(method)) throw new Error(`Telegram method ${method} is not allowed for this Worker`);
     if (this.requirePreview && !READ_ONLY_METHODS.has(method)) {
       if (!this.previewChatId && !this.simulating) throw new Error("Staging lock: PREVIEW_CHAT_ID is required to send anything");
@@ -52,13 +62,24 @@ export class SendOnlyTelegram {
       this.simulated.push({ method, params });
       if (method === "stopPoll") return { total_voter_count: 0, options: [], correct_option_id: null };
       if (method === "deleteMessage") return true;
+      if (file) this.simulated[this.simulated.length - 1].upload = { field: file.field, bytes: file.blob.size };
       return { message_id: null, simulated: true };
     }
     let response;
     try {
-      response = await this.fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params),
-      });
+      let init;
+      if (file) {
+        const form = new FormData();
+        for (const [k, v] of Object.entries(params)) {
+          if (v === undefined || v === null) continue;
+          form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+        }
+        form.append(file.field, file.blob, file.filename);
+        init = { method: "POST", body: form };
+      } else {
+        init = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) };
+      }
+      response = await this.fetch(`https://api.telegram.org/bot${this.token}/${method}`, init);
     } catch (err) {
       throw new TelegramError(`${method}: network error`, { uncertain: true });
     }

@@ -1,4 +1,7 @@
-// My.Club workspace. My.Club has no public, documented API for authentication or publishing (checked
+// My.Club workspace — RETIRED from the dashboard on 22 Nov 2026 (owner request). Not imported anywhere.
+// Kept only so the saved data in the "myclub:workspace" setting (still in every backup) can be restored later.
+//
+// Original notes: My.Club has no public, documented API for authentication or publishing (checked
 // 22 Nov 2026), so nothing here calls My.Club. The dashboard keeps My.Club drafts, a content plan,
 // manual subscriber/analytics snapshots and export packages for use in My.Club's own planner.
 //
