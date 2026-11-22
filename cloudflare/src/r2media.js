@@ -224,7 +224,7 @@ export class MediaStore {
   async #reserve(folder, base, ext) {
     for (let n = 1; n < 1000; n++) {
       const key = `${folder}/${base}${n === 1 ? "" : "-" + n}.${ext}`;
-      const r = await this.ops.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING", LOCK + key, String(this.ops.now()));
+      const r = await this.ops.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO NOTHING", LOCK + key, String(this.ops.now()));
       if (r.meta.changes !== 1) continue; // another upload is writing this name right now
       if (await this.b.head(key)) { await this.#release(key); continue; }
       return key;
