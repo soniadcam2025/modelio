@@ -1,10 +1,9 @@
 // Content management: one-click publish now / schedule, recurring series without duplicates,
-// protected content, private previews, automation pause switches and the Cloudinary media library.
+// protected content, private previews and automation pause switches.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { hashPassword } from "../src/auth.js";
-import { signParams, uploadSignature } from "../src/cloudinary.js";
 import worker, { runScheduled, SECURITY_HEADERS } from "../src/index.js";
 import { Ops } from "../src/ops.js";
 import { makeD1 } from "./d1shim.mjs";
@@ -49,13 +48,7 @@ const call = async (e, s, path, method = "GET", body) => {
 };
 const on = async (e, ...names) => { for (const n of names) await new Ops(e.DB).setSetting("feature:" + n, "1"); };
 
-test("Cloudinary signatures match Cloudinary's documented example; the secret never leaves the server", async () => {
-  // https://cloudinary.com/documentation/authentication_signatures example.
-  assert.equal(await signParams({ eager: "w_400,h_300,c_pad|w_260,h_200,c_crop", public_id: "sample_image", timestamp: 1315060510 }, "abcd"),
-    "bfd09f95f331f558cbd1320e67aa8d488770583e");
-  const u = await uploadSignature({ cloud: "shakhira", key: "123", secret: "cloud-secret-123" }, "shakhira_admin", 1000);
-  assert.equal(u.upload_url, "https://api.cloudinary.com/v1_1/shakhira/auto/upload");
-  assert.equal(JSON.stringify(u).includes("cloud-secret-123"), false);
+test("security policy: the browser only talks to the dashboard itself (media lives in private R2)", async () => {
   // The browser talks only to the dashboard itself (media lives in private R2).
   assert.match(SECURITY_HEADERS["Content-Security-Policy"], /connect-src 'self';/);
   assert.doesNotMatch(SECURITY_HEADERS["Content-Security-Policy"], /cloudinary/);

@@ -5,7 +5,7 @@ import { hashPassword } from "../src/auth.js";
 import worker, { runScheduled } from "../src/index.js";
 import { Ops, validateContent } from "../src/ops.js";
 import { dueSlots, queueAutoPaidMedia } from "../src/scheduler.js";
-import { posterInventory } from "../src/cloudinary.js";
+import { JPEG, makeR2, MP4 } from "./r2shim.mjs";
 import { SendOnlyTelegram } from "../src/telegram.js";
 import { makeD1 } from "./d1shim.mjs";
 
@@ -98,87 +98,42 @@ test("due slots are found only within 30 minutes after their time", () => {
   assert.deepEqual(dueSlots(["23:50"], at("2026-11-22T00:05:00Z")).map((x) => x.slot), ["20261121T2350Z"]);
 });
 
-test("automation queues one paid post per slot, oldest unused asset first, with per-asset price override", async () => {
+test("automation queues one paid post per slot from the R2 paid-media folder, oldest unused file first", async () => {
   const e = env();
+  const bucket = makeR2();
   const ops = new Ops(e.DB, () => at("2026-11-21T08:05:00Z"));
-  await ops.setPaidMediaConfig({ default_stars: 50, folder: "vip_drops", times_utc: ["08:00"], target: "vip", expire_after_minutes: 120, caption: "VIP drop" }, "admin");
-  const assets = [
-    asset("newest", { created: "2026-11-10T00:00:00Z" }),
-    asset("oldest", { created: "2026-11-01T00:00:00Z", stars: 120, caption: "Exclusive set" }),
-    asset("huge", { created: "2026-10-01T00:00:00Z", bytes: 9 * 1024 * 1024 }),     // photo over 5 MB: skipped
-    asset("doc", { created: "2026-09-01T00:00:00Z", fmt: "pdf" }),                    // unsupported: skipped
-  ];
-  let listed = 0;
-  const lister = async (folder) => { listed++; assert.equal(folder, "vip_drops"); return assets; };
-  const first = await queueAutoPaidMedia(ops, at("2026-11-21T08:05:00Z"), lister);
+  await ops.setPaidMediaConfig({ default_stars: 50, times_utc: ["08:00"], target: "vip", expire_after_minutes: 120, caption: "VIP drop" }, "admin");
+  const put = async (key, bytes, type, when) => { await bucket.put(key, bytes, { httpMetadata: { contentType: type } }); bucket.store.get(key).uploaded = new Date(when); };
+  await put("paid-media/photos/newest.jpg", JPEG(), "image/jpeg", "2026-11-10T00:00:00Z");
+  await put("paid-media/videos/oldest.mp4", MP4(), "video/mp4", "2026-11-01T00:00:00Z");
+  await put("vip/photos/not-paid.jpg", JPEG(), "image/jpeg", "2026-10-01T00:00:00Z"); // outside paid-media: never used
+  const first = await queueAutoPaidMedia(ops, at("2026-11-21T08:05:00Z"), bucket);
   assert.equal(first.length, 1);
   const item = await ops.content(first[0]);
-  assert.deepEqual([item.kind, item.target, item.star_count, item.text, item.expire_after_minutes, item.status, item.source],
-    ["paid_media", "vip", 120, "Exclusive set", 120, "scheduled", "auto:vip_drops/oldest"]);
-  // Same slot again (next cron minute): nothing new, the listing is not even fetched.
-  assert.deepEqual(await queueAutoPaidMedia(ops, at("2026-11-21T08:06:00Z"), lister), []);
-  assert.equal(listed, 1);
-  // Next day's slot: the next unused asset, at the default price and caption.
-  const next = await queueAutoPaidMedia(ops, at("2026-11-22T08:01:00Z"), lister);
-  const item2 = await ops.content(next[0]);
-  assert.deepEqual([item2.star_count, item2.text, item2.source], [50, "VIP drop", "auto:vip_drops/newest"]);
-  // Nothing left: the slot is recorded with a note, no post is created.
-  assert.deepEqual(await queueAutoPaidMedia(ops, at("2026-11-23T08:01:00Z"), lister), []);
-  const run = await ops.one("SELECT note FROM auto_paid_runs WHERE slot = '20261123T0800Z'");
-  assert.match(run.note, /no unused media/);
+  assert.deepEqual([item.kind, item.target, item.star_count, item.text, item.expire_after_minutes, item.status, item.media_url],
+    ["paid_media", "vip", 50, "VIP drop", 120, "scheduled", "r2:paid-media/videos/oldest.mp4"]);
+  assert.deepEqual(await queueAutoPaidMedia(ops, at("2026-11-21T08:06:00Z"), bucket), []); // same slot: nothing new
+  const next = await queueAutoPaidMedia(ops, at("2026-11-22T08:01:00Z"), bucket);
+  assert.equal((await ops.content(next[0])).media_url, "r2:paid-media/photos/newest.jpg");
+  assert.deepEqual(await queueAutoPaidMedia(ops, at("2026-11-23T08:01:00Z"), bucket), []); // nothing left
+  assert.match((await ops.one("SELECT note FROM auto_paid_runs WHERE slot = '20261123T0800Z'")).note, /no unused media/);
 });
 
-test("end to end in simulation: automation off by default, then queued and simulated, never touching Cloudinary tags", async () => {
-  const e = env({ CLOUDINARY_CLOUD_NAME: "demo", CLOUDINARY_API_KEY: "k", CLOUDINARY_API_SECRET: "s" });
+test("end to end in simulation: automation off by default, then queued from R2 and simulated", async () => {
+  const e = env({ MEDIA: makeR2() });
+  await e.MEDIA.put("paid-media/photos/a1.jpg", JPEG(), { httpMetadata: { contentType: "image/jpeg" } });
   const s = await login(e);
-  await call(e, s, "/api/settings/paid-media", { method: "PUT", body: { default_stars: 30, folder: "vip_drops", times_utc: ["08:00"], target: "vip" } });
-  const calls = [];
-  const fake = async (url, init = {}) => {
-    calls.push({ url: String(url), method: init.method || "GET" });
-    if (String(url).includes("api.cloudinary.com")) return new Response(JSON.stringify({ resources: [asset("a1")] }));
-    throw new Error("Telegram must not be called in simulation");
-  };
+  await call(e, s, "/api/settings/paid-media", { method: "PUT", body: { default_stars: 30, times_utc: ["08:00"], target: "vip" } });
+  const fake = async () => { throw new Error("nothing outside the Worker may be called in simulation"); };
   const t = at("2026-11-21T08:02:00Z");
-  await runScheduled(e, t, fake);
-  assert.equal(calls.length, 0, "nothing happens while auto_paid_media is off");
+  const off = await runScheduled(e, t, fake);
+  assert.equal(off.summary.auto_paid_queued, undefined, "nothing happens while auto_paid_media is off");
   for (const f of ["auto_paid_media", "scheduled_posts"]) await call(e, s, `/api/settings/features/${f}`, { method: "PUT", body: { enabled: true } });
   const r = await runScheduled(e, t + 60, fake);
   assert.equal(r.summary.auto_paid_queued, 1);
   assert.equal(r.summary.posts.simulated, 1);
-  assert.ok(calls.every((c) => c.method === "GET" && c.url.includes("api.cloudinary.com/v1_1/demo/resources")), "Cloudinary is only read");
   const item = (await (await call(e, s, "/api/content")).json())[0];
-  assert.deepEqual([item.kind, item.status, item.star_count], ["paid_media", "simulated", 30]);
-});
-
-// --- media library ---
-
-test("media library reads the GitHub poster folder read-only and reports smart-rotation state", async () => {
-  const now = at("2026-11-21T12:00:00Z");
-  const inv = posterInventory([
-    { resource_type: "image", type: "upload", format: "jpg", bytes: 1000, tags: [] },
-    { resource_type: "image", type: "upload", format: "jpg", bytes: 1000, tags: ["tgbot_posted", `tgbot_at_${now - 40 * 86400}`] },
-    { resource_type: "image", type: "upload", format: "jpg", bytes: 1000, tags: ["tgbot_posted", `tgbot_at_${now - 5 * 86400}`] },
-    { resource_type: "image", type: "upload", format: "jpg", bytes: 1000, tags: ["tgbot_posted"] },
-    { resource_type: "image", type: "upload", format: "jpg", bytes: 1000, tags: ["tgbot_uncertain"] },
-    { resource_type: "image", type: "upload", format: "pdf", bytes: 1000, tags: [] },
-  ], now);
-  assert.deepEqual([inv.remaining, inv.posted, inv.reusable_now, inv.unknown_time, inv.uncertain, inv.unsupported], [1, 3, 1, 1, 1, 1]);
-  assert.equal(inv.next_reuse_at, now - 5 * 86400 + 30 * 86400);
-
-  const e = env({ CLOUDINARY_CLOUD_NAME: "demo", CLOUDINARY_API_KEY: "k", CLOUDINARY_API_SECRET: "s" });
-  const s = await login(e);
-  const realFetch = globalThis.fetch;
-  const seen = [];
-  globalThis.fetch = async (url, init = {}) => { seen.push([init.method || "GET", String(url)]);
-    return new Response(JSON.stringify({ resources: [{ public_id: "a", resource_type: "image", type: "upload", format: "jpg", bytes: 10, asset_folder: "tgpub", tags: ["tgbot_posted"], secure_url: "https://x/a.jpg" }] })); };
-  try {
-    const lib = await (await call(e, s, "/api/poster")).json();
-    assert.equal(lib.configured, true);
-    assert.equal(lib.inventory.posted, 1);
-    assert.equal(lib.library[0].state, "posted");
-    assert.ok(seen.every(([m, u]) => m === "GET" && u.includes("asset_folder=tgpub")));
-  } finally { globalThis.fetch = realFetch; }
-  assert.deepEqual(await (await call(env(), await login(env()), "/api/poster")).json(), { configured: false });
+  assert.deepEqual([item.kind, item.status, item.star_count, item.media_url], ["paid_media", "simulated", 30, "r2:paid-media/photos/a1.jpg"]);
 });
 
 test("/api/me advertises the new capabilities to the shared frontend", async () => {

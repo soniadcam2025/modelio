@@ -1,6 +1,6 @@
 // Credential encryption: AES-256-GCM with a key that lives only in the Worker secret CREDENTIALS_KEY
 // (32 random bytes, base64). Supabase stores ciphertext; without the Worker key it is useless.
-// Each ciphertext is bound to its record ("bot:<telegram bot id>", "integration:cloudinary") as additional data,
+// Each ciphertext is bound to its record ("bot:<telegram bot id>") as additional data,
 // so a ciphertext copied onto another record fails to decrypt.
 
 const enc = new TextEncoder(), dec = new TextDecoder();

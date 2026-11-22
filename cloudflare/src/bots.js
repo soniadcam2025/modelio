@@ -1,5 +1,5 @@
 // Bot registry and integrations (Settings → Bots & integrations).
-// - Tokens and Cloudinary secrets are stored encrypted (src/crypto.js); responses only ever carry masks.
+// - Tokens are stored encrypted (src/crypto.js); responses only ever carry masks.
 // - Bots are identified with getMe; health uses getMe + getWebhookInfo (read-only). Webhooks are never set,
 //   changed or deleted, and this Worker never receives updates, so no second receiver can exist.
 // - Each channel belongs to one bot (unique chat_id). A bot's posts can only go to its own channels, and only
@@ -192,49 +192,5 @@ export class BotStore {
     return p ? this.token(p.id).catch(() => null) : null;
   }
 
-  // ---- Cloudinary ----
-  async cloudinaryView() {
-    const r = await this.ops.one("SELECT * FROM integration_secrets WHERE name = 'cloudinary'");
-    if (!r) return { connected: false };
-    return { connected: true, ...JSON.parse(r.hint_json), last_check_at: r.last_check_at, last_check_ok: r.last_check_ok === null ? null : !!Number(r.last_check_ok), last_error: r.last_error };
-  }
-  async cloudinaryTest(creds) {
-    const auth = btoa(`${creds.key}:${creds.secret}`);
-    let res;
-    try { res = await this.fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(creds.cloud)}/resources/image?max_results=1`, { headers: { authorization: `Basic ${auth}` } }); }
-    catch (e) { throw new OpsError(`Cloudinary: could not connect (${String(e?.message || e).slice(0, 80)})`); }
-    if (!res.ok) throw new OpsError(`Cloudinary refused these credentials (HTTP ${res.status})`);
-    return true;
-  }
-  async cloudinarySave(input, actor) {
-    const creds = { cloud: String(input.cloud_name || "").trim(), key: String(input.api_key || "").trim(), secret: String(input.api_secret || "").trim() };
-    if (!/^[A-Za-z0-9_-]{2,64}$/.test(creds.cloud) || !/^\d{6,20}$/.test(creds.key) || creds.secret.length < 10) throw new OpsError("Enter the cloud name, API key and API secret");
-    await this.cloudinaryTest(creds);
-    const now = this.ops.now();
-    const cipher = await encryptSecret(this.key, JSON.stringify(creds), "integration:cloudinary");
-    const hint = JSON.stringify({ cloud_name: creds.cloud, api_key: maskValue(creds.key), api_secret: maskValue(creds.secret) });
-    await this.ops.run("INSERT INTO integration_secrets (name, cipher, hint_json, last_check_at, last_check_ok, last_error, updated_at) VALUES ('cloudinary', ?, ?, ?, 1, '', ?) " +
-      "ON CONFLICT(name) DO UPDATE SET cipher = excluded.cipher, hint_json = excluded.hint_json, last_check_at = excluded.last_check_at, last_check_ok = 1, last_error = '', updated_at = excluded.updated_at",
-      cipher, hint, now, now);
-    await this.ops.audit(actor, "cloudinary_save", `cloud ${creds.cloud}, key ${maskValue(creds.key)}`);
-    return this.cloudinaryView();
-  }
-  async cloudinaryCreds() {
-    const r = await this.ops.one("SELECT cipher FROM integration_secrets WHERE name = 'cloudinary'");
-    return r ? JSON.parse(await decryptSecret(this.key, r.cipher, "integration:cloudinary")) : null;
-  }
-  async cloudinaryRecheck(actor) {
-    const creds = await this.cloudinaryCreds();
-    if (!creds) throw new OpsError("Cloudinary is not connected");
-    let ok = 1, error = "";
-    try { await this.cloudinaryTest(creds); } catch (e) { ok = 0; error = String(e.message).slice(0, 200); }
-    await this.ops.run("UPDATE integration_secrets SET last_check_at = ?, last_check_ok = ?, last_error = ? WHERE name = 'cloudinary'", this.ops.now(), ok, error);
-    await this.ops.audit(actor, "cloudinary_test", ok ? "ok" : error);
-    return this.cloudinaryView();
-  }
-  async cloudinaryDisconnect(actor) {
-    await this.ops.run("DELETE FROM integration_secrets WHERE name = 'cloudinary'");
-    await this.ops.audit(actor, "cloudinary_disconnect", "");
-    return { connected: false };
-  }
+
 }
