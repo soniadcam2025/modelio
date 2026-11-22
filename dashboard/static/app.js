@@ -220,6 +220,7 @@ const PAGES = [
   ["bots", "Bots & channels", pageBots],
   ["analytics", "Analytics", pageAnalytics],
   ["security", "Security & backups", pageSecurity],
+  ["account", "Admin account", pageAccount],
   ["activity", "Activity log", pageActivity],
 ];
 // Former routes from the multi-platform layout, sent to their Telegram pages.
@@ -232,7 +233,7 @@ const NAV = [
   { group: "audience", label: "VIP audience", children: ["subscribers", "joins", "moderation"] },
   { group: "automation", label: "Automation", children: ["automation", "settings", "bots"] },
   { id: "analytics" },
-  { group: "system", label: "System", children: ["security", "activity"] },
+  { group: "system", label: "System", children: ["account", "security", "activity"] },
 ];
 const NAV_LABEL = {};
 const pageVisible = (id) => (id !== "bots" || can("bots")) && (id !== "automation" || can("content_v2"));
@@ -1017,7 +1018,8 @@ async function uploadFolderFor(kind, target, file) {
   return src[`${t}_${video ? "videos" : "photos"}`] || `${t}/${video ? "videos" : "photos"}`;
 }
 
-const fileUrl = (key, download = false) => `/api/media/file?key=${encodeURIComponent(key)}${download ? "&download=1" : ""}`;
+// v = the file's upload time: a name reused after a delete gets a new URL, so the browser never shows the old file.
+const fileUrl = (key, download = false, v = 0) => `/api/media/file?key=${encodeURIComponent(key)}${download ? "&download=1" : ""}${v ? `&v=${v}` : ""}`;
 const isVideoRef = (ref) => /\.(mp4|mov|webm)(\?|$)/i.test(ref);
 const mb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 const KIND_NAME = { image: "Photo", gif: "GIF", video: "Video" };
@@ -1033,23 +1035,93 @@ function checkUpload(file) {
   return null;
 }
 
-// Upload one file to an R2 folder (body = the file; checked again on the server). Resolves to the stored file.
-function uploadToLibrary(file, folder, onProgress = null) {
-  return new Promise((resolve, reject) => {
-    if (file.size > 50 * 1024 * 1024) return reject(new Error("Files can be at most 50 MB (Telegram's upload limit)"));
-    if (file.type.startsWith("image/") && !file.type.includes("gif") && file.size > 10 * 1024 * 1024) return reject(new Error("Photos can be at most 10 MB"));
-    const xhr = new XMLHttpRequest();
+// Upload one file to an R2 folder (body = the file; checked again on the server, which also picks a unique name).
+// Returns { promise, abort }. After a successful upload a small thumbnail is made in the browser and stored.
+function startUpload(file, folder, onProgress = null) {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise((resolve, reject) => {
+    const problem = checkUpload(file);
+    if (problem) return reject(new Error(problem));
     xhr.open("POST", `/api/media/upload?folder=${encodeURIComponent(folder)}&name=${encodeURIComponent(file.name)}`);
     if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100)); };
     xhr.onload = () => { let b = {}; try { b = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
-      if (xhr.status >= 200 && xhr.status < 300 && b.key) resolve(b); else reject(new Error(b.error || b.detail || `Upload failed (${xhr.status})`)); };
-    xhr.onerror = () => reject(new Error("Upload failed: network error"));
+      if (xhr.status >= 200 && xhr.status < 300 && b.key) { saveThumbFromFile(file, b.key).catch(() => {}); resolve(b); }
+      else reject(new Error(b.error || b.detail || `Upload failed (${xhr.status})`)); };
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.onabort = () => reject(new Error("Cancelled"));
     xhr.send(file);
   });
+  return { promise, abort: () => xhr.abort() };
+}
+const uploadToLibrary = (file, folder, onProgress) => startUpload(file, folder, onProgress).promise;
+
+// ---- Thumbnails: made in the browser (no paid image service), 360 px JPEG, stored privately next to the file ----
+const THUMB_PX = 360;
+async function frameToJpeg(source, w, h) {
+  const scale = Math.min(1, THUMB_PX / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w * scale)); c.height = Math.max(1, Math.round(h * scale));
+  c.getContext("2d").drawImage(source, 0, 0, c.width, c.height);
+  return new Promise((r) => c.toBlob(r, "image/jpeg", 0.78));
+}
+async function thumbFromBlob(blob, type) {
+  if (type.startsWith("image/")) {
+    const bmp = await createImageBitmap(blob);
+    try { return await frameToJpeg(bmp, bmp.width, bmp.height); } finally { bmp.close?.(); }
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const v = document.createElement("video");
+    v.muted = true; v.preload = "auto"; v.src = url;
+    await new Promise((ok, bad) => { v.onloadeddata = ok; v.onerror = bad; setTimeout(bad, 8000); });
+    v.currentTime = Math.min(0.5, (v.duration || 1) / 2);
+    await new Promise((ok) => { v.onseeked = ok; setTimeout(ok, 3000); });
+    return await frameToJpeg(v, v.videoWidth || 320, v.videoHeight || 180);
+  } finally { URL.revokeObjectURL(url); }
+}
+async function putThumb(key, jpeg) {
+  if (!jpeg || jpeg.size > 290 * 1024) return;
+  await fetch(`/api/media/thumb?key=${encodeURIComponent(key)}`, { method: "PUT", body: jpeg, credentials: "same-origin", headers: { "X-CSRF-Token": state.csrf || "" } });
+}
+async function saveThumbFromFile(file, key) { await putThumb(key, await thumbFromBlob(file, file.type)); }
+const thumbUrl = (key, v = 0) => `/api/media/thumb?key=${encodeURIComponent(key)}${v ? `&v=${v}` : ""}`;
+
+// Older files without a thumbnail: made once, only when the card is on screen, two at a time.
+const backfill = { queue: [], running: 0 };
+function queueBackfill(m, img) {
+  backfill.queue.push([m, img]);
+  pumpBackfill();
+}
+function pumpBackfill() {
+  while (backfill.running < 2 && backfill.queue.length) {
+    const [m, img] = backfill.queue.shift();
+    backfill.running++;
+    (async () => {
+      const res = await fetch(fileUrl(m.key, false, m.uploaded), { credentials: "same-origin" });
+      const jpeg = await thumbFromBlob(await res.blob(), m.type);
+      await putThumb(m.key, jpeg);
+      img.src = URL.createObjectURL(jpeg); img.classList.remove("ph-img");
+    })().catch(() => { img.replaceWith(h("div", { class: "ph" }, m.kind === "video" ? "▶ Video" : "Photo")); })
+      .finally(() => { backfill.running--; pumpBackfill(); });
+  }
+}
+const seen = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+  for (const en of entries) if (en.isIntersecting) { seen.unobserve(en.target); en.target._onVisible?.(); }
+}, { rootMargin: "200px" }) : null;
+
+// A thumbnail element: the stored thumbnail (cached privately by the browser); if none, one is made when visible.
+function thumbEl(m) {
+  const img = h("img", { alt: m.name, class: "ph-img", decoding: "async" });
+  const load = () => {
+    img.src = thumbUrl(m.key, m.uploaded);
+    img.onload = () => img.classList.remove("ph-img");
+    img.onerror = () => { img.onerror = null; if (m.size <= 50 * 1024 * 1024) queueBackfill(m, img); };
+  };
+  if (seen) { img._onVisible = load; seen.observe(img); } else load();
+  return img;
 }
 
-// Which folders a post may use: public posts never see VIP or paid files; paid media only paid-media/.
 function allowedFor(key, { kind, target }) {
   const top = String(key).split("/")[0];
   if (kind === "paid_media") return top === "paid-media";
@@ -1063,10 +1135,11 @@ async function pickMedia(onPick, ctx = { kind: "photo", target: "public" }) {
   try { files = await api("/api/media/files?recursive=1"); } catch (e) { toast(e.message, true); return; }
   const want = ctx.kind === "video" ? ["video"] : ctx.kind === "animation" ? ["gif", "video"] : ctx.kind === "photo" ? ["image"] : ["image", "video"];
   const usable = files.filter((m) => allowedFor(m.key, ctx) && want.includes(m.kind));
+  const box = h("div", { class: "picker" });
   const grid = h("div", { class: "media-grid" }, usable.map((m) => h("button", { type: "button", class: "media-tile pick", onclick: () => { onPick("r2:" + m.key); box.remove(); } },
-    m.kind === "video" ? h("video", { src: fileUrl(m.key), preload: "metadata", muted: true }) : h("img", { src: fileUrl(m.key), alt: m.name, loading: "lazy" }),
-    h("div", { class: "meta" }, h("span", { class: "clip mono" }, m.name), h("span", { class: "muted" }, m.folder)))));
-  const box = h("div", { class: "picker" }, h("div", { class: "row" }, h("h3", {}, "Choose from the media library"), h("button", { type: "button", onclick: () => box.remove() }, "Close")),
+    h("div", { class: "thumb" }, thumbEl(m), m.kind === "video" ? h("span", { class: "badge" }, "▶") : null),
+    h("div", { class: "meta" }, h("span", { class: "clip" }, m.original_name || m.name), h("span", { class: "muted small" }, m.folder)))));
+  put(box, h("div", { class: "row spread" }, h("h3", {}, "Choose from the media library"), h("button", { type: "button", onclick: () => box.remove() }, "Close")),
     h("p", { class: "small muted" }, ctx.kind === "paid_media" ? "Only the paid-media folders are shown." : ctx.target === "public" ? "VIP and paid-media files are hidden for the public channel." : "Paid-media files are hidden here."),
     usable.length ? grid : h("p", { class: "muted" }, "No matching files yet. Upload one first."));
   box.classList.add("picker-modal");
@@ -1075,132 +1148,221 @@ async function pickMedia(onPick, ctx = { kind: "photo", target: "public" }) {
 }
 
 function storageBar(st) {
-  if (!st?.connected) return h("div", { class: "banner warn" }, "Media storage (Cloudflare R2) is not connected to this deployment yet.");
+  if (!st?.connected) return h("div", { class: "banner warn" }, "Media storage (Cloudflare R2) is not connected to this deployment.");
   const u = st.usage;
-  return h("div", { class: "card storage" },
+  return h("div", { class: "storage" },
     h("div", { class: "row spread" }, h("strong", {}, "Storage"), h("span", { class: "small muted" }, `${num(u.files)} files · ${mb(u.bytes)} of 10 GB free tier (${u.percent}%)`)),
     h("progress", { max: 100, value: Math.min(100, u.percent), class: "upload-progress" }),
-    u.warning ? h("p", { class: "small", style: null }, chip("failed", "Warning"), " ", u.warning) : null);
+    u.warning ? h("p", { class: "small" }, chip("failed", "Warning"), " ", u.warning) : null);
 }
+
+// Full-screen preview (the original, loaded only when opened).
+function lightbox(m) {
+  const close = () => wrap.remove();
+  const wrap = h("div", { class: "lightbox", role: "dialog", "aria-label": m.name, onclick: (e) => { if (e.target === wrap) close(); } },
+    h("div", { class: "lightbox-bar" }, h("span", { class: "clip" }, `${m.original_name || m.name} · ${mb(m.size)}`),
+      h("a", { class: "btn", href: fileUrl(m.key, true) }, "Download"), h("button", { onclick: close }, "✕ Close")),
+    m.kind === "video" ? h("video", { src: fileUrl(m.key, false, m.uploaded), controls: true, autoplay: true }) : h("img", { src: fileUrl(m.key, false, m.uploaded), alt: m.name }));
+  const onKey = (e) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", onKey); } };
+  document.addEventListener("keydown", onKey);
+  document.body.append(wrap);
+}
+
+// Three-dot menu (one open at a time; closes on outside click or Escape).
+function menu(items) {
+  const list = h("div", { class: "menu-list", role: "menu", hidden: true }, items.filter(Boolean).map(([label, fn, cls]) =>
+    h("button", { type: "button", role: "menuitem", class: cls || "", onclick: (e) => { e.stopPropagation(); list.hidden = true; fn(); } }, label)));
+  const btn = h("button", { type: "button", class: "menu-btn-dots", "aria-label": "Actions", "aria-haspopup": "menu", onclick: (e) => {
+    e.stopPropagation();
+    document.querySelectorAll(".menu-list").forEach((l) => { if (l !== list) l.hidden = true; });
+    document.querySelectorAll(".menu-open").forEach((t) => t.classList.remove("menu-open"));
+    list.hidden = !list.hidden;
+    if (!list.hidden) btn.closest(".media-tile")?.classList.add("menu-open"); // above the neighbouring cards
+  } }, "⋯");
+  return h("div", { class: "menu" }, btn, list);
+}
+document.addEventListener("click", () => { document.querySelectorAll(".menu-list").forEach((l) => { l.hidden = true; }); document.querySelectorAll(".menu-open").forEach((t) => t.classList.remove("menu-open")); });
+
+const PAGE = 60;
+function treeOpen() { try { return JSON.parse(localStorage.getItem("media_tree") || "{}"); } catch { return {}; } }
+function setTreeOpen(path, open) { const o = treeOpen(); o[path] = open; try { localStorage.setItem("media_tree", JSON.stringify(o)); } catch { /* private mode */ } }
+function viewMode() { try { return localStorage.getItem("media_view") || "grid"; } catch { return "grid"; } }
 
 async function pageMedia(main) {
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const folder = params.get("folder") || "public/photos", q = params.get("q") || "", kind = params.get("kind") || "", days = params.get("days") || "";
+  const searching = !!(q || kind || days);
   const go = (o) => { const p = new URLSearchParams({ folder, ...(q ? { q } : {}), ...(kind ? { kind } : {}), ...(days ? { days } : {}), ...o });
     for (const [k, v] of [...p]) if (!v) p.delete(k); location.hash = "#media?" + p; };
-  const [st, folders] = await Promise.all([api("/api/media/status"), api("/api/media/folders").catch(() => [])]);
-  if (!st.connected) return put(main, head("Media library", "Private storage for your photos and videos"), storageBar(st));
-  const since = days ? Math.floor(Date.now() / 1000) - Number(days) * 86400 : 0;
-  const files = await api(`/api/media/files?folder=${encodeURIComponent(q || kind || days ? "" : folder)}${q || kind || days ? "&recursive=1" : ""}&q=${encodeURIComponent(q)}&kind=${kind}${since ? `&from=${since}` : ""}`);
-  const cur = folders.find((f) => f.path === folder);
-  const selected = new Set();
-  const selCount = h("span", { class: "small muted" }, "");
-  const syncSel = () => { selCount.textContent = selected.size ? `${selected.size} selected` : ""; bulk.hidden = !selected.size; };
-  const folderOptions = (sel) => folders.map((f) => h("option", { value: f.path, selected: f.path === sel }, f.path));
 
-  // Upload: button or drag-and-drop, several files, a progress bar each, then refresh.
+  // The page appears at once with placeholders; storage, folders and files load in parallel.
+  const storageBox = h("div", { class: "card" }, h("div", { class: "skeleton line" }));
+  const treeBox = h("nav", { class: "folder-tree", "aria-label": "Folders" }, [1, 2, 3, 4, 5, 6].map(() => h("div", { class: "skeleton line" })));
+  const gridBox = h("div", { class: "media-grid " + viewMode() }, Array.from({ length: 8 }, () => h("div", { class: "media-tile skeleton-tile" })));
+  const countBox = h("span", { class: "muted small" }, "Loading…");
+  const moreBox = h("div", {});
+  const selected = new Set();
+  const selCount = h("span", { class: "small muted" });
+  const bulk = h("div", { class: "row", hidden: true },
+    h("button", { onclick: () => moveDrawer([...selected]) }, "Move"),
+    h("button", { onclick: () => downloadMany([...selected]) }, "Download"),
+    h("button", { class: "danger", onclick: () => removeKeys([...selected]) }, "Delete"));
+  const syncSel = () => { selCount.textContent = selected.size ? `${selected.size} selected` : ""; bulk.hidden = !selected.size; };
+
+  const search = h("input", { type: "search", value: q, placeholder: "Search all folders", "aria-label": "Search" });
+  const kindSel = h("select", { "aria-label": "Type", onchange: (e) => go({ kind: e.target.value }) }, [["", "All types"], ["image", "Photos"], ["video", "Videos"], ["gif", "GIFs"]].map(([v, l]) => h("option", { value: v, selected: v === kind }, l)));
+  const daySel = h("select", { "aria-label": "Date", onchange: (e) => go({ days: e.target.value }) }, [["", "Any date"], ["1", "Last 24 hours"], ["7", "Last 7 days"], ["30", "Last 30 days"]].map(([v, l]) => h("option", { value: v, selected: v === days }, l)));
+  const viewBtn = h("button", { type: "button", "aria-label": "Switch grid or list view", onclick: () => {
+    const next = viewMode() === "grid" ? "list" : "grid"; try { localStorage.setItem("media_view", next); } catch { /* ignore */ }
+    gridBox.classList.toggle("grid", next === "grid"); gridBox.classList.toggle("list", next === "list"); viewBtn.textContent = next === "grid" ? "List view" : "Grid view"; } },
+    viewMode() === "grid" ? "List view" : "Grid view");
+
+  // ---- upload queue: every file listed first, 3 at a time, cancel / retry each, successes kept when others fail ----
   const queue = h("div", { class: "upload-queue" });
-  // Several files at once, each with its own progress bar and a Retry button if it fails. Checked before uploading.
-  let pending = 0, uploaded = 0;
-  const finish = () => { if (pending === 0 && uploaded) { toast(`${uploaded} file${uploaded > 1 ? "s" : ""} uploaded to ${folder}`); setTimeout(route, 500); } };
-  const uploadOne = async (f, row) => {
-    const problem = checkUpload(f);
-    if (problem) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${problem}`)); return; }
-    const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
-    row.replaceChildren(h("span", {}, `${f.name} (${mb(f.size)}) `), bar);
-    pending++;
-    try { const r = await uploadToLibrary(f, folder, (pct) => { bar.value = pct; }); uploaded++; row.replaceChildren(`✓ ${r.name}`); }
-    catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message} `), h("button", { type: "button", onclick: () => { chain = chain.then(() => uploadOne(f, row)); } }, "Retry")); }
-    finally { pending--; finish(); }
-  };
-  // One at a time (rows for every file appear at once): the server picks a free name per upload, and parallel
-  // uploads of two same-named files could otherwise both claim the same name.
-  let chain = Promise.resolve();
-  const uploadFiles = (list) => {
-    for (const f of [...list]) {
-      const row = h("div", { class: "small upload-row" }, `${f.name}: waiting…`);
-      queue.append(row);
-      chain = chain.then(() => uploadOne(f, row));
+  const queueHead = h("div", { class: "row spread", hidden: true }, h("strong", { class: "small" }, "Uploads"),
+    h("button", { type: "button", class: "link", onclick: () => { for (const j of jobs.filter((x) => ["done", "failed", "cancelled"].includes(x.status))) j.row.remove(); jobs = jobs.filter((x) => !["done", "failed", "cancelled"].includes(x.status)); queueHead.hidden = !jobs.length; } }, "Clear finished"));
+  let jobs = [], active = 0, uploadedAny = false;
+  const pump = () => {
+    while (active < 3) {
+      const j = jobs.find((x) => x.status === "queued");
+      if (!j) break;
+      run(j);
     }
+    if (!active && !jobs.some((x) => x.status === "queued") && uploadedAny) { uploadedAny = false; refreshAfterUpload(); }
   };
-  const input = h("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true, onchange: (e) => { uploadFiles(e.target.files); e.target.value = ""; } });
+  const draw = (j, ...parts) => j.row.replaceChildren(h("span", { class: "clip up-name" }, j.file.name), h("span", { class: "muted small" }, mb(j.file.size)), ...parts);
+  const run = (j) => {
+    j.status = "uploading"; active++;
+    const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
+    const up = startUpload(j.file, folder, (pct) => { bar.value = pct; });
+    j.abort = up.abort;
+    draw(j, bar, h("button", { type: "button", class: "link danger", onclick: () => up.abort() }, "Cancel"));
+    up.promise.then((r) => { j.status = "done"; uploadedAny = true; draw(j, h("span", { class: "ok-text" }, `✓ saved as ${r.name}`)); })
+      .catch((e) => { j.status = e.message === "Cancelled" ? "cancelled" : "failed";
+        draw(j, h("span", { class: "bad-text" }, e.message), h("button", { type: "button", onclick: () => { j.status = "queued"; draw(j, h("span", { class: "muted small" }, "Waiting…")); pump(); } }, "Retry")); })
+      .finally(() => { active--; pump(); });
+  };
+  const addFiles = (list) => {
+    for (const file of [...list]) {
+      const j = { file, status: "queued", row: h("div", { class: "upload-row" }) };
+      const problem = checkUpload(file);
+      if (problem) { j.status = "failed"; draw(j, h("span", { class: "bad-text" }, problem)); }
+      else draw(j, h("span", { class: "muted small" }, "Waiting…"), h("button", { type: "button", class: "link danger", onclick: () => { if (j.status === "queued") { j.status = "cancelled"; draw(j, h("span", { class: "muted small" }, "Cancelled")); } } }, "Remove"));
+      jobs.push(j); queue.append(j.row);
+    }
+    queueHead.hidden = !jobs.length;
+    pump();
+  };
+  const input = h("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true, onchange: (e) => { addFiles(e.target.files); e.target.value = ""; } });
   const drop = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
-    ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); } },
+    ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); addFiles(e.dataTransfer.files); } },
     h("label", { class: "btn primary" }, "Upload photos or videos", input),
     h("span", {}, "or drop files here — they go into ", h("strong", { class: "mono" }, folder)),
     h("span", { class: "small muted" }, "JPEG, PNG, WebP, GIF, MP4, MOV, WebM · photos ≤ 10 MB, videos ≤ 50 MB · same names get “-2”, “-3”"));
 
+  // ---- actions ----
   const removeKeys = async (keys) => {
-    if (!confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : keys.length + " files"}? This cannot be undone.`)) return;
+    if (!keys.length || !confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : keys.length + " files"} from storage? This cannot be undone.`)) return;
     const r = await act(() => api("/api/media/delete", { method: "POST", body: { keys } }));
     if (!r) return;
-    const bad = r.results.filter((x) => !x.ok);
-    if (bad.length) toast(bad.map((x) => `${x.key.split("/").pop()}: ${x.error}`).join(" · "), true);
-    else toast(keys.length === 1 ? "Deleted" : `${keys.length} files deleted`);
+    const bad = r.results.filter((x) => !x.ok), ok = r.results.length - bad.length;
+    if (bad.length) toast(`${ok} deleted. Not deleted: ${bad.map((x) => `${x.key.split("/").pop()} (${x.error})`).join(" · ")}`, true);
+    else toast(ok === 1 ? "Deleted" : `${ok} files deleted`);
     route();
   };
-  const moveDrawer = (keys, copy = false) => {
-    const target = h("select", {}, folderOptions(folder));
+  const downloadMany = (keys) => keys.forEach((k, i) => setTimeout(() => { const a = h("a", { href: fileUrl(k, true), download: "" }); document.body.append(a); a.click(); a.remove(); }, i * 400));
+  const moveDrawer = async (keys, copy = false) => {
+    const folders = await api("/api/media/folders").catch(() => []);
+    const target = h("select", {}, folders.map((f) => h("option", { value: f.path, selected: f.path === folder }, f.path)));
     const name = keys.length === 1 ? h("input", { value: keys[0].split("/").pop() }) : null;
     drawer(copy ? "Copy to folder" : keys.length === 1 ? "Rename or move" : `Move ${keys.length} files`, h("form", { onsubmit: async (e) => {
       e.preventDefault();
       let ok = 0;
-      for (const k of keys) {
-        const to = `${target.value}/${name ? name.value.trim() : k.split("/").pop()}`;
-        if (await act(() => api(copy ? "/api/media/copy" : "/api/media/move", { method: "POST", body: { from: k, to } }))) ok++;
-      }
+      for (const k of keys) if (await act(() => api(copy ? "/api/media/copy" : "/api/media/move", { method: "POST", body: { from: k, to: `${target.value}/${name ? name.value.trim() : k.split("/").pop()}` } }))) ok++;
       if (ok) { toast(`${ok} file${ok > 1 ? "s" : ""} ${copy ? "copied" : "moved"}`); closeDrawer(); route(); }
     } }, field("Folder", target), name ? field("File name", name, "Letters, numbers, spaces and . _ - ( ) +") : null,
-      h("p", { class: "small muted" }, "Scheduled and draft posts using a moved file are updated automatically."),
+      h("p", { class: "small muted" }, "Scheduled and draft posts using a moved file are updated automatically. Public posts can't use VIP or paid-media files."),
       h("button", { class: "primary", type: "submit" }, copy ? "Copy" : "Save")));
   };
-  const bulk = h("div", { class: "row", hidden: true },
-    h("button", { onclick: () => moveDrawer([...selected]) }, "Move selected"),
-    h("button", { class: "danger", onclick: () => removeKeys([...selected]) }, "Delete selected"));
 
   const tile = (m) => {
     const cb = h("input", { type: "checkbox", "aria-label": `Select ${m.name}`, onchange: (e) => { e.target.checked ? selected.add(m.key) : selected.delete(m.key); syncSel(); } });
     const ctx = { kind: m.kind === "video" ? "video" : m.kind === "gif" ? "animation" : "photo", target: m.key.startsWith("vip/") ? "vip" : "public" };
+    const paid = m.key.startsWith("paid-media/");
     return h("div", { class: "media-tile" },
       h("label", { class: "tile-check" }, cb),
-      m.kind === "video" ? h("video", { src: fileUrl(m.key), preload: "metadata", muted: true, controls: true }) : h("img", { src: fileUrl(m.key), alt: m.name, loading: "lazy" }),
-      h("div", { class: "meta" }, h("span", { class: "clip mono", title: m.key }, m.name),
-        h("span", { class: "muted" }, `${KIND_NAME[m.kind] || m.type} · ${mb(m.size)} · ${m.uploaded ? fmtDay.format(new Date(m.uploaded * 1000)) : ""}`),
-        q || kind || days ? h("span", { class: "muted small" }, m.folder) : null),
-      h("div", { class: "row" },
-        m.key.startsWith("paid-media/") ? h("button", { class: "link", onclick: () => editor(null, { kind: "paid_media", target: "vip", media_url: "r2:" + m.key, star_count: 50 }) }, "Paid post")
-          : h("button", { class: "link", onclick: () => editor(null, { ...ctx, media_url: "r2:" + m.key }) }, "New post"),
-        h("a", { class: "link", href: fileUrl(m.key, true) }, "Download"),
-        h("button", { class: "link", onclick: () => moveDrawer([m.key]) }, "Rename / move"),
-        h("button", { class: "link", onclick: () => moveDrawer([m.key], true) }, "Copy"),
-        h("button", { class: "link danger", onclick: () => removeKeys([m.key]) }, "Delete")));
+      h("button", { type: "button", class: "thumb", "aria-label": `Preview ${m.name}`, onclick: () => lightbox(m) }, thumbEl(m), m.kind === "video" ? h("span", { class: "badge" }, "▶") : null),
+      h("div", { class: "meta" },
+        h("span", { class: "clip", title: m.original_name || m.name }, m.name),
+        h("span", { class: "muted small" }, `${KIND_NAME[m.kind] || m.type} · ${mb(m.size)} · ${m.uploaded ? fmtDay.format(new Date(m.uploaded * 1000)) : ""}`),
+        searching ? h("span", { class: "muted small" }, m.folder) : null),
+      menu([
+        ["Preview", () => lightbox(m)],
+        ["Download original", () => downloadMany([m.key])],
+        paid ? ["Create paid post", () => editor(null, { kind: "paid_media", target: "vip", media_url: "r2:" + m.key, star_count: 50 })] : ["Create post", () => editor(null, { ...ctx, media_url: "r2:" + m.key })],
+        ["Rename", () => moveDrawer([m.key])],
+        ["Move", () => moveDrawer([m.key])],
+        ["Copy", () => moveDrawer([m.key], true)],
+        ["Delete permanently", () => removeKeys([m.key]), "danger"],
+      ]));
   };
 
-  const search = h("input", { type: "search", value: q, placeholder: "Search all folders" });
-  const kindSel = h("select", { onchange: (e) => go({ kind: e.target.value }) }, [["", "All types"], ["image", "Photos"], ["video", "Videos"], ["gif", "GIFs"]].map(([v, l]) => h("option", { value: v, selected: v === kind }, l)));
-  const daySel = h("select", { onchange: (e) => go({ days: e.target.value }) }, [["", "Any date"], ["1", "Last 24 hours"], ["7", "Last 7 days"], ["30", "Last 30 days"]].map(([v, l]) => h("option", { value: v, selected: v === days }, l)));
-  const tree = h("nav", { class: "folder-tree", "aria-label": "Folders" }, folders.map((f) => h("a", { href: `#media?folder=${encodeURIComponent(f.path)}`,
-    class: (f.path === folder && !q && !kind && !days ? "active " : "") + `lvl-${f.path.split("/").length}`, title: f.path },
-    h("span", {}, f.path.split("/").pop()), f.files ? h("span", { class: "count-muted" }, num(f.files)) : null)));
-  const folderTools = h("div", { class: "row" },
-    h("button", { onclick: () => { const n = prompt(`New folder inside ${folder}/ (or a full path like campaigns/december):`); if (n) act(() => api("/api/media/folders", { method: "POST", body: { path: n.includes("/") ? n : `${folder}/${n}` } }), "Folder created").then((r) => r && go({ folder: r.path })); } }, "New folder"),
-    cur && !cur.protected ? h("button", { onclick: () => { const n = prompt("New folder path:", folder); if (n && n !== folder) act(() => api("/api/media/folders/rename", { method: "POST", body: { from: folder, to: n } }), "Folder renamed").then((r) => r && go({ folder: r.path })); } }, "Rename folder") : null,
-    cur && !cur.protected ? h("button", { class: "danger", onclick: () => { if (confirm(`Delete the empty folder ${folder}?`)) act(() => api("/api/media/folders/delete", { method: "POST", body: { path: folder } }), "Folder deleted").then((r) => r && go({ folder: "public/photos" })); } }, "Delete folder") : null);
+  let offset = 0, shown = new Set();
+  const since = days ? Math.floor(Date.now() / 1000) - Number(days) * 86400 : 0;
+  const listUrl = (off) => searching
+    ? `/api/media/files?recursive=1&q=${encodeURIComponent(q)}&kind=${kind}${since ? `&from=${since}` : ""}&limit=${PAGE}&offset=${off}`
+    : `/api/media/files?folder=${encodeURIComponent(folder)}&limit=${PAGE}&offset=${off}`;
+  const loadPage = async (first) => {
+    const r = await api(listUrl(offset));
+    if (first) gridBox.replaceChildren();
+    for (const m of r.items) if (!shown.has(m.key)) { shown.add(m.key); gridBox.append(tile(m)); }
+    offset = r.next ?? offset;
+    countBox.textContent = `${num(r.total)} file${r.total === 1 ? "" : "s"}`;
+    if (!r.total) gridBox.replaceChildren(h("p", { class: "empty" }, searching ? "No files match." : "No files here yet. Upload or drop some above."));
+    put(moreBox, r.next != null ? h("button", { onclick: async (e) => { e.target.disabled = true; await loadPage(false).catch((x) => toast(x.message, true)); } }, `Load more (${num(r.total - r.next)} left)`) : null);
+  };
+  const refreshAfterUpload = () => { offset = 0; shown = new Set(); loadPage(true).catch(() => {}); api("/api/media/status").then((s) => put(storageBox, storageBar(s))).catch(() => {}); refreshTree(); };
 
-  put(main, head("Media library", "Private storage (Cloudflare R2). Files are only visible to signed-in admins and sent to Telegram as uploads."),
-    storageBar(st),
+  const drawTree = (folders) => {
+    const open = treeOpen();
+    const kids = (p) => folders.filter((f) => f.path.startsWith(p + "/") && f.path.split("/").length === p.split("/").length + 1);
+    const node = (f) => {
+      const children = kids(f.path);
+      const isOpen = open[f.path] ?? (folder === f.path || folder.startsWith(f.path + "/"));
+      const sub = children.length ? h("div", { class: "tree-kids", hidden: !isOpen }, children.map(node)) : null;
+      const caret = children.length ? h("button", { type: "button", class: "caret-btn", "aria-expanded": String(isOpen), "aria-label": `Show ${f.path}`, onclick: (e) => {
+        e.preventDefault(); const now = e.currentTarget.getAttribute("aria-expanded") !== "true"; e.currentTarget.setAttribute("aria-expanded", String(now)); sub.hidden = !now; setTreeOpen(f.path, now); } }, "▸") : h("span", { class: "caret-sp" });
+      const total = folders.filter((x) => x.path === f.path || x.path.startsWith(f.path + "/")).reduce((n, x) => n + x.files, 0);
+      return h("div", {}, h("div", { class: "tree-row" + (f.path === folder && !searching ? " active" : "") }, caret,
+        h("a", { href: `#media?folder=${encodeURIComponent(f.path)}`, title: f.path }, h("span", {}, f.path.split("/").pop()), total ? h("span", { class: "count-muted" }, num(total)) : null)), sub);
+    };
+    put(treeBox, folders.filter((f) => !f.path.includes("/")).map(node));
+    put(folderTools, h("button", { onclick: () => { const n = prompt(`New folder inside ${folder}/ (or a full path like campaigns/december):`); if (n) act(() => api("/api/media/folders", { method: "POST", body: { path: n.includes("/") ? n : `${folder}/${n}` } }), "Folder created").then((r) => r && go({ folder: r.path })); } }, "New folder"),
+      folders.find((f) => f.path === folder && !f.protected) ? [
+        h("button", { onclick: () => { const n = prompt("New folder path:", folder); if (n && n !== folder) act(() => api("/api/media/folders/rename", { method: "POST", body: { from: folder, to: n } }), "Folder renamed").then((r) => r && go({ folder: r.path })); } }, "Rename folder"),
+        h("button", { class: "danger", onclick: () => { if (confirm(`Delete the empty folder ${folder}? Folders with files can't be deleted.`)) act(() => api("/api/media/folders/delete", { method: "POST", body: { path: folder } }), "Folder deleted").then((r) => r && go({ folder: "public/photos" })); } }, "Delete folder")] : null);
+  };
+  const folderTools = h("div", { class: "row" });
+  const refreshTree = () => api("/api/media/folders").then(drawTree).catch((e) => put(treeBox, h("p", { class: "small bad-text" }, e.message)));
+
+  put(main, head("Media library", "Private storage (Cloudflare R2): only signed-in admins can see these files; Telegram receives them as uploads."),
+    storageBox,
     h("div", { class: "media-layout" },
-      h("section", { class: "card" }, h("h3", {}, "Folders"), tree),
+      h("section", { class: "card" }, h("h3", {}, "Folders"), treeBox),
       h("section", { class: "card" },
         h("form", { class: "row search-row", onsubmit: (e) => { e.preventDefault(); go({ q: search.value.trim() }); } }, search, kindSel, daySel, h("button", { type: "submit" }, "Search"),
-          q || kind || days ? h("button", { type: "button", onclick: () => (location.hash = `#media?folder=${encodeURIComponent(folder)}`) }, "Clear") : null),
-        h("div", { class: "row spread" }, h("h2", {}, q || kind || days ? `Results (${files.length})` : `${folder} (${files.length})`), folderTools),
-        !q && !kind && !days ? drop : null, queue,
-        h("div", { class: "row" }, files.length ? h("label", { class: "inline" }, h("input", { type: "checkbox", onchange: (e) => {
-          main.querySelectorAll(".tile-check input").forEach((c) => { c.checked = e.target.checked; c.dispatchEvent(new Event("change")); }); } }), "Select all") : null, selCount, bulk),
-        files.length ? h("div", { class: "media-grid" }, files.map(tile)) : h("p", { class: "empty" }, "No files here yet."))));
+          searching ? h("button", { type: "button", onclick: () => (location.hash = `#media?folder=${encodeURIComponent(folder)}`) }, "Clear") : null),
+        h("div", { class: "row spread" }, h("div", {}, h("h2", {}, searching ? "Search results" : folder), countBox), h("div", { class: "row" }, folderTools, viewBtn)),
+        !searching ? drop : null, queueHead, queue,
+        h("div", { class: "row" }, h("label", { class: "inline" }, h("input", { type: "checkbox", onchange: (e) => {
+          main.querySelectorAll(".tile-check input").forEach((c) => { c.checked = e.target.checked; c.dispatchEvent(new Event("change")); }); } }), "Select all shown"), selCount, bulk),
+        gridBox, moreBox)));
+  await Promise.all([
+    api("/api/media/status").then((s) => put(storageBox, storageBar(s))).catch((e) => put(storageBox, h("p", { class: "bad-text" }, e.message))),
+    refreshTree(),
+    loadPage(true).catch((e) => put(gridBox, h("div", { class: "banner bad" }, e.message))),
+  ]);
 }
-
 
 async function pageAutomation(main) {
   const a = await api("/api/automation");
@@ -1262,6 +1424,73 @@ async function mediaSourcesCard() {
       if (await act(() => api("/api/media/sources", { method: "PUT", body: { sources: Object.fromEntries(Object.entries(sel).map(([k, el]) => [k, el.value])) } }), "Saved")) route(); } },
       h("div", { class: "grid two" }, rows), h("button", { class: "primary", type: "submit" }, "Save folders")),
     h("div", { class: "grid two" }, auto("public", "Public channel automatic posts"), auto("vip", "VIP channel automatic posts")));
+}
+
+// ---------- Admin account (single admin, the deployment's own sign-in) ----------
+
+function passwordInput(label, autocomplete) {
+  const input = h("input", { type: "password", autocomplete, required: true, maxlength: 200 });
+  const toggle = h("button", { type: "button", class: "link", "aria-label": `Show ${label}`, onclick: () => {
+    const show = input.type === "password"; input.type = show ? "text" : "password"; toggle.textContent = show ? "Hide" : "Show"; } }, "Show");
+  return { input, node: h("label", { class: "field" }, label, h("div", { class: "pw-row" }, input, toggle)) };
+}
+const strengthHint = (pw) => !pw ? "" : pw.length < 12 ? "Too short: at least 12 characters"
+  : (pw.length < 16 && [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(pw)).length < 3) ? "Mix at least three of: lowercase, uppercase, numbers, symbols (or 16+ characters)" : "Strong enough";
+
+async function pageAccount(main) {
+  const a = await api("/api/account");
+  const msg = (box, text, bad = false) => put(box, h("div", { class: `banner ${bad ? "bad" : ""}` }, text));
+  // Password
+  const cur = passwordInput("Current password", "current-password"), np = passwordInput("New password", "new-password"), cp = passwordInput("Confirm new password", "new-password");
+  const hint = h("span", { class: "hint" });
+  np.input.addEventListener("input", () => { hint.textContent = strengthHint(np.input.value); });
+  const pwMsg = h("div", {});
+  const pwForm = h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    if (np.input.value !== cp.input.value) return msg(pwMsg, "The new passwords don't match.", true);
+    const btn = e.submitter; btn.disabled = true;
+    try {
+      const r = await api("/api/account/password", { method: "PUT", body: { current_password: cur.input.value, new_password: np.input.value, confirm_password: cp.input.value } });
+      state.csrf = r.csrf;
+      pwForm.reset(); hint.textContent = "";
+      msg(pwMsg, "Password changed. Every other signed-in browser has been signed out; this one stays signed in.");
+    } catch (ex) { msg(pwMsg, ex.message, true); } finally { btn.disabled = false; }
+  } }, cur.node, np.node, hint, cp.node, pwMsg, h("button", { class: "primary", type: "submit" }, "Change password"));
+  // Email
+  const emMsg = h("div", {});
+  const newEmail = h("input", { type: "email", autocomplete: "email", required: true, maxlength: 200 });
+  const emPw = passwordInput("Current password", "current-password");
+  const emailForm = a.email_supported ? h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    const btn = e.submitter; btn.disabled = true;
+    try {
+      const r = await api("/api/account/email", { method: "PUT", body: { new_email: newEmail.value, current_password: emPw.input.value } });
+      emailForm.reset();
+      msg(emMsg, `Check ${r.pending_email} (and possibly your current inbox) for a confirmation link from Supabase. Until you confirm, keep signing in with your current email.`);
+    } catch (ex) { msg(emMsg, ex.message, true); } finally { btn.disabled = false; }
+  } }, field("New email", newEmail), emPw.node, emMsg, h("button", { class: "primary", type: "submit" }, "Change email")) : null;
+  // Sign out other sessions
+  const soPw = passwordInput("Current password", "current-password"), soMsg = h("div", {});
+  const soForm = h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    try { const r = await api("/api/account/signout-others", { method: "POST", body: { current_password: soPw.input.value } }); state.csrf = r.csrf; soForm.reset(); msg(soMsg, "All other sessions are signed out."); }
+    catch (ex) { msg(soMsg, ex.message, true); }
+  } }, soPw.node, soMsg, h("button", { type: "submit" }, "Sign out everywhere else"));
+  const row = (k, v) => h("div", { class: "toggle-row" }, h("div", {}, k), h("div", { class: "small" }, v));
+  put(main, head("Admin account", "Your single administrator login. Every change needs your current password."),
+    h("section", { class: "card" }, h("h2", {}, "Account"),
+      row("Sign-in method", a.mode === "supabase" ? "Email and password (Supabase Auth)" : "Password only"),
+      a.mode === "supabase" ? row("Email", h("span", {}, a.email, " ", a.email_confirmed ? chip("posted", "confirmed") : chip("pending", "unconfirmed"))) : null,
+      a.pending_email ? row("Pending email change", h("span", {}, a.pending_email, " ", chip("pending", "awaiting confirmation"))) : null,
+      a.last_sign_in_at ? row("Last sign-in", fmt.format(new Date(a.last_sign_in_at)) + " IST") : null,
+      row("Password last changed here", a.password_changed_at ? when(a.password_changed_at) : "not yet"),
+      row("Other sessions last signed out", a.sessions_reset_at ? when(a.sessions_reset_at) : "never"),
+      a.note ? h("p", { class: "small muted" }, a.note) : null),
+    h("div", { class: "grid two" },
+      h("section", { class: "card" }, h("h2", {}, "Change password"), h("p", { class: "small muted" }, "At least 12 characters mixing letters, numbers and symbols, or 16+ characters. Other sessions are signed out afterwards."), pwForm),
+      emailForm ? h("section", { class: "card" }, h("h2", {}, "Change email"), h("p", { class: "small muted" }, "Supabase emails a confirmation link to the new address. Nothing changes until you click it, so you can't be locked out by a typo."), emailForm) : null),
+    h("section", { class: "card" }, h("h2", {}, "Sessions"), h("p", { class: "small muted" }, "Sign out every other browser or device that is signed in to this dashboard."), soForm),
+    h("p", { class: "small muted" }, "Forgot your password? Reset it in Supabase (Authentication → Users → your user → Send password recovery) or ask your developer; nothing here sends passwords by email."));
 }
 
 // ---------- Telegram pages added with the sidebar restructure ----------

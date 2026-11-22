@@ -10,6 +10,7 @@ import { handleUpdate, verifyUpdate } from "./updates.js";
 import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle, sendItem } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
+import { AdminAccount, AuthCheckError, PASSWORD_HASH_KEY, SESSIONS_AFTER_KEY } from "./account.js";
 import { MediaStore, mediaSources, setMediaSources, SOURCE_LABELS } from "./r2media.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
@@ -127,7 +128,8 @@ const err = (message, status) => json(status === 400 ? { error: message } : { de
 function withHeaders(response, isApi) {
   const r = new Response(response.body, response);
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) if (!r.headers.has(k)) r.headers.set(k, v);
-  if (isApi) r.headers.set("Cache-Control", "no-store");
+  // API responses are never cached, except private media responses that set their own (browser-only) caching.
+  if (isApi && !(r.headers.get("Cache-Control") || "").startsWith("private")) r.headers.set("Cache-Control", "no-store");
   return r;
 }
 
@@ -171,7 +173,7 @@ function routes() {
       const user = email ? await supabaseSignIn(c.env, email, String(b.password ?? "").slice(0, 200)) : null;
       if (!user) { await c.limiter.failed(client); return err("Wrong email or password", 401); }
       who = email;
-    } else if (!(await verifyPassword(String(b.password ?? ""), c.env.DASHBOARD_PASSWORD_HASH || ""))) {
+    } else if (!(await verifyPassword(String(b.password ?? ""), (await c.ops.getSetting(PASSWORD_HASH_KEY)) || c.env.DASHBOARD_PASSWORD_HASH || ""))) {
       await c.limiter.failed(client);
       return err("Wrong password", 401);
     }
@@ -193,13 +195,47 @@ function routes() {
     if (await c.limiter.blocked(client)) throw new OpsError("Too many attempts. Wait 15 minutes.");
     let ok;
     if (authMode(c.env) === "supabase") ok = !!(await supabaseSignIn(c.env, String(b.email || "").trim().toLowerCase(), String(b.password || "")));
-    else ok = await verifyPassword(String(b.password || ""), c.env.DASHBOARD_PASSWORD_HASH || "");
+    else ok = await verifyPassword(String(b.password || ""), (await c.ops.getSetting(PASSWORD_HASH_KEY)) || c.env.DASHBOARD_PASSWORD_HASH || "");
     if (!ok) { await c.limiter.failed(client); throw new OpsError("Password check failed: enter your sign-in email and password again"); }
   };
   const store = (c) => {
     if (!c.env.CREDENTIALS_KEY) throw new OpsError("Credential storage is not set up on this Worker (CREDENTIALS_KEY secret missing)");
     return new BotStore(c.ops, c.env, { botUsername: c.config.botUsername });
   };
+  // ---- Admin Account (single admin; the deployment's own sign-in provider). Current password always required. ----
+  const account = (c) => new AdminAccount(c.env, c.ops, authMode(c.env));
+  const sensitive = async (c, fn) => {
+    const client = clientAddress(c.request);
+    if (await c.limiter.blocked(client)) throw new OpsError("Too many attempts. Wait 15 minutes.");
+    try { return await fn(); }
+    catch (e) { if (e instanceof AuthCheckError) await c.limiter.failed(client); throw e; }
+  };
+  // Signs out every other session: sessions issued before now stop working; this browser gets a fresh one.
+  const resetSessions = async (c, payload) => {
+    const now = c.ops.now();
+    await c.ops.setSetting(SESSIONS_AFTER_KEY, String(now));
+    await c.sessions.revoke(c.token);
+    const token = await c.sessions.issue(now + 1); // issued after the cut-off, so only this browser stays signed in
+    const res = json({ ...payload, csrf: await c.sessions.csrfFor(token) });
+    res.headers.set("Set-Cookie", `${SESSION_COOKIE}=${token}; Max-Age=43200; Path=/; HttpOnly; Secure; SameSite=Strict`);
+    return res;
+  };
+  add("GET", "/api/account", async (c) => json(await account(c).view()));
+  add("PUT", "/api/account/password", async (c) => {
+    const b = await body(c.request);
+    await sensitive(c, () => account(c).changePassword(b, c.actor));
+    return resetSessions(c, { ok: true });
+  });
+  add("PUT", "/api/account/email", async (c) => {
+    const b = await body(c.request);
+    return json(await sensitive(c, () => account(c).changeEmail(b, c.actor)));
+  });
+  add("POST", "/api/account/signout-others", async (c) => {
+    const b = await body(c.request);
+    await sensitive(c, () => account(c).verifyOnly(b.current_password));
+    await c.ops.audit(c.actor, "account_signout_others", "all other sessions signed out");
+    return resetSessions(c, { ok: true });
+  });
   add("GET", "/api/bots", async (c) => json({ bots: await store(c).list(), permissions: PERMISSIONS }));
   add("POST", "/api/bots", async (c) => { const b = await body(c.request); await fresh(c, b); return json(await store(c).add(b.token, c.actor)); });
   add("POST", "/api/bots/(\\d+)/test", async (c, m) => json(await store(c).test(m[1], c.actor)));
@@ -371,7 +407,7 @@ function routes() {
   add("POST", "/api/media/folders/rename", async (c) => { const b = await body(c.request); return json(await media(c).renameFolder(b.from, b.to, c.actor)); });
   add("POST", "/api/media/folders/delete", async (c) => json(await media(c).deleteFolder((await body(c.request)).path, c.actor)));
   add("GET", "/api/media/files", async (c) => json(await media(c).list({ folder: qp(c, "folder"), recursive: qp(c, "recursive") === "1", q: qp(c, "q"),
-    kind: qp(c, "kind"), from: Number(qp(c, "from")) || null, to: Number(qp(c, "to")) || null })));
+    kind: qp(c, "kind"), from: Number(qp(c, "from")) || null, to: Number(qp(c, "to")) || null, offset: Number(qp(c, "offset")) || 0, limit: Number(qp(c, "limit")) || 0 })));
   // Raw upload: the request body is the file. Checked by content (type) and Telegram's size limits before storing.
   add("POST", "/api/media/upload", async (c) => {
     const len = Number(c.request.headers.get("content-length") || 0);
@@ -388,13 +424,21 @@ function routes() {
     if (m) r = m[2] ? { offset: Number(m[1]), length: Number(m[2]) - Number(m[1]) + 1 } : { offset: Number(m[1]) };
     const o = await media(c).get(qp(c, "key"), r);
     const name = o.key.slice(o.key.lastIndexOf("/") + 1);
-    const h = { "content-type": o.httpMetadata?.contentType || "application/octet-stream", "cache-control": "private, no-store",
+    const h = { "content-type": o.httpMetadata?.contentType || "application/octet-stream", "cache-control": qp(c, "v") ? "private, max-age=3600" : "private, no-cache",
       "accept-ranges": "bytes", "content-disposition": `${qp(c, "download") === "1" ? "attachment" : "inline"}; filename="${name.replace(/"/g, "")}"` };
     if (r && o.range) {
       const start = o.range.offset ?? 0, end = start + (o.range.length ?? o.size - start) - 1;
       return new Response(o.body, { status: 206, headers: { ...h, "content-range": `bytes ${start}-${end}/${o.size}`, "content-length": String(end - start + 1) } });
     }
     return new Response(o.body, { headers: { ...h, "content-length": String(o.size) } });
+  });
+  add("GET", "/api/media/thumb", async (c) => {
+    const o = await media(c).getThumb(qp(c, "key"));
+    return new Response(o.body, { headers: { "content-type": o.httpMetadata?.contentType || "image/jpeg", "cache-control": qp(c, "v") ? "private, max-age=604800" : "private, no-cache", "content-length": String(o.size) } });
+  });
+  add("PUT", "/api/media/thumb", async (c) => {
+    if (Number(c.request.headers.get("content-length") || 0) > 300 * 1024) throw new OpsError("Thumbnail too large");
+    return json(await media(c).putThumb(qp(c, "key"), new Uint8Array(await c.request.arrayBuffer())));
   });
   add("POST", "/api/media/move", async (c) => { const b = await body(c.request); return json(await media(c).move(b.from, b.to, c.actor)); });
   add("POST", "/api/media/copy", async (c) => { const b = await body(c.request); return json(await media(c).copy(b.from, b.to, c.actor)); });
