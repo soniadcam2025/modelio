@@ -1110,10 +1110,19 @@ async function pageMedia(main) {
     row.replaceChildren(h("span", {}, `${f.name} (${mb(f.size)}) `), bar);
     pending++;
     try { const r = await uploadToLibrary(f, folder, (pct) => { bar.value = pct; }); uploaded++; row.replaceChildren(`✓ ${r.name}`); }
-    catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message} `), h("button", { type: "button", onclick: () => uploadOne(f, row) }, "Retry")); }
+    catch (e) { row.replaceChildren(h("span", { class: "bad-text" }, `✕ ${f.name}: ${e.message} `), h("button", { type: "button", onclick: () => { chain = chain.then(() => uploadOne(f, row)); } }, "Retry")); }
     finally { pending--; finish(); }
   };
-  const uploadFiles = (list) => { for (const f of [...list]) { const row = h("div", { class: "small upload-row" }); queue.append(row); uploadOne(f, row); } };
+  // One at a time (rows for every file appear at once): the server picks a free name per upload, and parallel
+  // uploads of two same-named files could otherwise both claim the same name.
+  let chain = Promise.resolve();
+  const uploadFiles = (list) => {
+    for (const f of [...list]) {
+      const row = h("div", { class: "small upload-row" }, `${f.name}: waiting…`);
+      queue.append(row);
+      chain = chain.then(() => uploadOne(f, row));
+    }
+  };
   const input = h("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true, onchange: (e) => { uploadFiles(e.target.files); e.target.value = ""; } });
   const drop = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
     ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); } },
