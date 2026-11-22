@@ -192,3 +192,13 @@ To restore from a downloaded file instead of D1, use `--file backup.json` in pla
 - **Channels and money:** channel settings, prices (499 ⭐ / 30 days, 49 ⭐ / 3 days), subscriptions and payments.
 - **GitHub poster:** its 5 AM / 10 PM IST schedule and smart rotation.
 - **Paid services:** none are activated.
+
+## Social media dashboard (22 Nov 2026)
+
+**Navigation:** Overview (all platforms) · Social media → Telegram (Overview, Bots & channels, Create post, Scheduled posts, Media library, Paid media, VIP subscribers, Join requests, Moderation, Automations, Features & settings, Analytics) · Social media → My.Club (Overview, Connection, Create post, Scheduled content, Media library, Paid content, Subscribers, Analytics) · Unified calendar · Shared media library · Integrations · Security & backups · Activity log. Old links (`#content`, `#media`, `#bots`…) still work. Groups collapse and remember their state; on phones the sidebar is a slide-in menu.
+
+**My.Club limits (checked 22 Nov 2026):** My.Club publishes no public API for sign-in, publishing or statistics, so the dashboard never logs in to or posts on My.Club and stores no My.Club credentials. Workflow: draft here → Export (caption, media links, price, steps) → schedule in My.Club's own planner → mark *Scheduled in My.Club* / *Published*. Subscriber and revenue figures are entered manually as snapshots.
+
+**Separation:** My.Club data lives in the single settings key `myclub:workspace` (already in every backup). The Telegram scheduler never reads it; no schema change; Telegram posting is unaffected. The unified calendar and shared media library reference items, never copy them.
+
+**Deploy (UI + API only, no migration):** `npm run deploy:staging`, check, then `npm run deploy:production`. Rollback: `wrangler rollback -c wrangler.production.toml`.

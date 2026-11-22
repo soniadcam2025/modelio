@@ -11,6 +11,7 @@ import { FEATURES, JOIN_POLICIES, Ops, OpsError, TARGETS } from "./ops.js";
 import { runCycle, sendItem } from "./scheduler.js";
 import { SendOnlyTelegram } from "./telegram.js";
 import { ADMIN_MEDIA_FOLDER, cloudinaryConfig, deleteAsset, GITHUB_POSTER_FOLDER, libraryEntries, listFolder, posterInventory, uploadSignature } from "./cloudinary.js";
+import { MyClubStore } from "./myclub.js";
 import BUNDLED_ASSETS from "./assets.generated.js";
 
 const SESSION_COOKIE = "sb_session";
@@ -263,7 +264,7 @@ function routes() {
     return res;
   });
   add("GET", "/api/me", async (c) => json({ user: c.config.adminName, csrf: await c.sessions.csrfFor(c.token),
-    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots", "content_v2"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
+    capabilities: ["post_expiry", "paid_media_automation", "hashtags", "backup", "member_sync", "telegram_status", "bots", "content_v2", "myclub"], environment: c.config.environment, automation: automationMode(c.env, c.config) }));
 
   add("GET", "/api/overview", async (c) => {
     const now = c.ops.now();
@@ -413,6 +414,21 @@ function routes() {
     for (let day = Math.floor(start / 86400) * 86400; day < end; day += 86400)
       for (const [h, mi] of c.config.slotTimes) { const at = day + h * 3600 + mi * 60; if (at >= start && at < end) slots.push({ at, label: "Cloudinary auto-post (GitHub)" }); }
     return json({ items, poster_slots: slots });
+  });
+
+  // ---- My.Club workspace (separate from Telegram; no My.Club API calls, see myclub.js) ----
+  const mc = (c) => new MyClubStore(c.ops);
+  add("GET", "/api/myclub", async (c) => json(await mc(c).view()));
+  add("PUT", "/api/myclub/connection", async (c) => json(await mc(c).setConnection(await body(c.request), c.actor)));
+  add("POST", "/api/myclub/items", async (c) => json(await mc(c).create(await body(c.request), c.actor)));
+  add("PUT", "/api/myclub/items/(\\d+)", async (c, m) => json(await mc(c).update(m[1], await body(c.request), c.actor)));
+  add("DELETE", "/api/myclub/items/(\\d+)", async (c, m) => { await mc(c).remove(m[1], c.actor); return json({ ok: true }); });
+  add("POST", "/api/myclub/items/(\\d+)/export", async (c, m) => json(await mc(c).exportItem(m[1], c.actor)));
+  add("POST", "/api/myclub/metrics", async (c) => json(await mc(c).addMetric(await body(c.request), c.actor)));
+  add("GET", "/api/myclub/calendar", async (c) => {
+    const start = Number(c.url.searchParams.get("start")), end = Number(c.url.searchParams.get("end"));
+    if (!(end > start) || end - start > 62 * 86400) throw new OpsError("Choose a range of up to 62 days");
+    return json(await mc(c).calendar(start, end));
   });
 
   add("GET", "/api/captions", async (c) => json(await c.ops.captions()));
