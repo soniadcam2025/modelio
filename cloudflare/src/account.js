@@ -59,7 +59,7 @@ export class AdminAccount {
         note: "This deployment signs in with a password only (no email). Changing that would need a move to Supabase Auth." };
     }
     const u = await this.#adminUser();
-    return { mode: "supabase", email: u.email, email_supported: true, pending_email: u.new_email || null, email_confirmed: !!u.email_confirmed_at,
+    return { mode: "supabase", email: u.email, email_is_placeholder: PLACEHOLDER.test(String(u.email)), email_supported: true, pending_email: u.new_email || null, email_confirmed: !!u.email_confirmed_at,
       last_sign_in_at: u.last_sign_in_at || null, password_changed_at: last?.created_at ?? null, sessions_reset_at: sessionsAfter };
   }
 
@@ -72,7 +72,7 @@ export class AdminAccount {
       if (problem) throw new OpsError(problem);
       if (!(await this.#verify(u.email, cur))) throw new AuthCheckError();
       const r = await sb(this.env, `/auth/v1/admin/users/${encodeURIComponent(u.id)}`, { method: "PUT", body: { password: next } }, this.fetch);
-      if (!r.ok) throw new OpsError(`Supabase refused the new password${r.data?.msg ? `: ${String(r.data.msg).slice(0, 120)}` : ""}`);
+      if (!r.ok) { const why = supabaseReason(r); console.warn("account_password_error", JSON.stringify({ status: r.status, code: why.code })); throw new OpsError(why.message); }
     } else {
       const stored = (await this.ops.getSetting(PASSWORD_HASH_KEY)) || this.env.DASHBOARD_PASSWORD_HASH || "";
       if (!(await verifyPassword(cur, stored))) throw new AuthCheckError();
@@ -83,19 +83,26 @@ export class AdminAccount {
     await this.ops.audit(actor, "account_password", "password changed; other sessions signed out");
   }
 
-  async changeEmail({ current_password, new_email }, actor) {
+  async changeEmail({ current_password, new_email, redirect_to }, actor) {
     if (this.mode !== "supabase") throw new OpsError("This deployment has no email sign-in");
     const email = String(new_email || "").trim().toLowerCase();
-    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/i.test(email)) throw new OpsError("Enter a valid email address");
+    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/i.test(email) || PLACEHOLDER.test(email)) throw new OpsError("Enter a real email address you can open");
     const u = await this.#adminUser();
     if (email === String(u.email).toLowerCase()) throw new OpsError("That is already your email");
     const session = await this.#verify(u.email, String(current_password || ""));
     if (!session) throw new AuthCheckError();
-    // Supabase's own email-change flow: confirmation links are emailed; the old email works until confirmed.
-    const r = await sb(this.env, "/auth/v1/user", { method: "PUT", body: { email }, token: session.access_token }, this.fetch);
-    if (!r.ok) throw new OpsError(r.status === 422 ? "That email can't be used" : "Supabase couldn't start the email change");
+    // Supabase's own email-change flow. The address stays unchanged until the emailed link is clicked, and the
+    // Supabase user (same id, same admin flag) is only updated by Supabase itself, so there is no lock-out.
+    const back = /^https:\/\/[^/\s]+$/.test(String(redirect_to || "")) ? `?redirect_to=${encodeURIComponent(redirect_to + "/#account")}` : "";
+    const r = await sb(this.env, "/auth/v1/user" + back, { method: "PUT", body: { email }, token: session.access_token }, this.fetch);
+    if (!r.ok) {
+      const why = supabaseReason(r);
+      console.warn("account_email_error", JSON.stringify({ status: r.status, code: why.code })); // no addresses or tokens
+      await this.ops.audit(actor, "account_email_failed", `${why.code}`);
+      throw new OpsError(why.message);
+    }
     await this.ops.audit(actor, "account_email_request", `change requested to ${email.replace(/^(.).*(@.*)$/, "$1***$2")}; awaiting confirmation`);
-    return { pending_email: email };
+    return { pending_email: email, current_is_placeholder: PLACEHOLDER.test(String(u.email)) };
   }
 
   async verifyOnly(current_password) {
@@ -105,6 +112,26 @@ export class AdminAccount {
       if (!(await verifyPassword(String(current_password || ""), stored))) throw new AuthCheckError();
     }
   }
+}
+
+// Reserved test domains that can never receive email (RFC 2606/6761).
+export const PLACEHOLDER = /@[^@]*\.(invalid|test|example|localhost)$|@example\.(com|net|org)$/i;
+
+// Supabase Auth error → a safe, useful message (codes are Supabase's documented error_code values).
+export function supabaseReason(r) {
+  const code = String(r.data?.error_code || r.data?.code || r.data?.error || `http_${r.status}`).slice(0, 60);
+  const text = String(r.data?.msg || r.data?.message || r.data?.error_description || "").toLowerCase();
+  if (code === "email_exists" || /already (been )?registered|already exists/.test(text)) return { code, message: "That email is already used by another Supabase account" };
+  if (code === "over_email_send_rate_limit" || r.status === 429) return { code, message: "Supabase's email limit was reached. Wait an hour and try again" };
+  if (code === "email_address_invalid" || code === "email_address_not_authorized" || /not authori[sz]ed/.test(text))
+    return { code, message: "Supabase won't send email to that address. Its built-in mailer only delivers to members of your Supabase project: add your own SMTP (Authentication → Emails → SMTP settings) or invite that address to the project, then try again" };
+  if (/sending|smtp|mail/.test(text) || code === "unexpected_failure")
+    return { code, message: "Supabase couldn't send the confirmation email. Check Authentication → Emails → SMTP settings in Supabase (the built-in mailer only delivers to project members), then try again" };
+  if (code === "weak_password") return { code, message: "Supabase rejected the password as too weak" };
+  if (code === "same_password") return { code, message: "Choose a password different from the current one" };
+  if (r.status === 401 || r.status === 403) return { code, message: "Your Supabase session expired. Sign in again and retry" };
+  if (r.status >= 500) return { code, message: "Supabase Auth is unavailable right now. Try again in a few minutes" };
+  return { code, message: `Supabase refused the change (${code})` };
 }
 
 export class AuthCheckError extends OpsError { constructor() { super("Current password is incorrect"); } }
