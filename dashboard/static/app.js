@@ -318,6 +318,7 @@ async function route() {
     try { const me = await api("/api/me"); state.caps = me.capabilities || []; state.automation = me.automation; } catch { state.caps = []; }
     if ((state.caps || []).includes("bots") && !state.primaryBot) api("/api/bots").then((r) => { state.primaryBot = r.bots.find((b) => b.is_primary)?.username; }).catch(() => {});
   }
+  if (typeof cancelThumbs === "function") cancelThumbs();
   const raw = (location.hash || "#overview").slice(1).split(/[?/]/)[0];
   const id = ROUTE_ALIAS[raw] || raw;
   const page = PAGES.find((p) => p[0] === id) || PAGES[0];
@@ -1037,18 +1038,22 @@ function checkUpload(file) {
 
 // Upload one file to an R2 folder (body = the file; checked again on the server, which also picks a unique name).
 // Returns { promise, abort }. After a successful upload a small thumbnail is made in the browser and stored.
-function startUpload(file, folder, onProgress = null) {
+// opts.uploadId: the same id on a retry, so the server never stores a second copy of a file it already saved.
+// opts.onSaving: the bytes are all sent; the server is now writing and checking the file in R2 (not saved yet).
+function startUpload(file, folder, onProgress = null, opts = {}) {
   const xhr = new XMLHttpRequest();
   const promise = new Promise((resolve, reject) => {
     const problem = checkUpload(file);
     if (problem) return reject(new Error(problem));
     xhr.open("POST", `/api/media/upload?folder=${encodeURIComponent(folder)}&name=${encodeURIComponent(file.name)}`);
     if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
+    if (opts.uploadId) xhr.setRequestHeader("X-Upload-Id", opts.uploadId);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100)); };
+    xhr.upload.onload = () => opts.onSaving?.();
     xhr.onload = () => { let b = {}; try { b = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
-      if (xhr.status >= 200 && xhr.status < 300 && b.key) { saveThumbFromFile(file, b.key).catch(() => {}); resolve(b); }
+      if (xhr.status >= 200 && xhr.status < 300 && b.key) { if (!b.duplicate_retry) saveThumbFromFile(file, b.key).catch(() => {}); resolve(b); }
       else reject(new Error(b.error || b.detail || `Upload failed (${xhr.status})`)); };
-    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.onerror = () => reject(new Error("Network error — Retry is safe (no duplicate is created)"));
     xhr.onabort = () => reject(new Error("Cancelled"));
     xhr.send(file);
   });
@@ -1088,36 +1093,57 @@ async function saveThumbFromFile(file, key) { await putThumb(key, await thumbFro
 const thumbUrl = (key, v = 0) => `/api/media/thumb?key=${encodeURIComponent(key)}${v ? `&v=${v}` : ""}`;
 
 // Older files without a thumbnail: made once, only when the card is on screen, two at a time.
-const backfill = { queue: [], running: 0 };
-function queueBackfill(m, img) {
-  backfill.queue.push([m, img]);
-  pumpBackfill();
+// Thumbnail loading: at most 6 at a time, only when on screen; switching folder/page cancels what is still queued.
+const thumbs = { queue: [], running: 0, gen: 0 };
+function cancelThumbs() {
+  thumbs.gen++;
+  for (const t of thumbs.queue) t.img.removeAttribute("src");
+  thumbs.queue = [];
 }
+function pumpThumbs() {
+  while (thumbs.running < 6 && thumbs.queue.length) {
+    const t = thumbs.queue.shift();
+    if (t.gen !== thumbs.gen || !t.img.isConnected) continue;
+    thumbs.running++;
+    t.run().finally(() => { thumbs.running--; pumpThumbs(); });
+  }
+}
+const enqueueThumb = (img, run) => { thumbs.queue.push({ img, run, gen: thumbs.gen }); pumpThumbs(); };
+const loadImg = (img, src) => new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; img.src = src; });
+
+// Files without a stored thumbnail (older uploads): one is made once from the original, two at a time.
+const backfill = { queue: [], running: 0 };
+function queueBackfill(m, img) { backfill.queue.push([m, img, thumbs.gen]); pumpBackfill(); }
 function pumpBackfill() {
   while (backfill.running < 2 && backfill.queue.length) {
-    const [m, img] = backfill.queue.shift();
+    const [m, img, gen] = backfill.queue.shift();
+    if (gen !== thumbs.gen || !img.isConnected) continue;
     backfill.running++;
     (async () => {
       const res = await fetch(fileUrl(m.key, false, m.uploaded), { credentials: "same-origin" });
+      if (!res.ok) throw new Error(String(res.status));
       const jpeg = await thumbFromBlob(await res.blob(), m.type);
       await putThumb(m.key, jpeg);
       img.src = URL.createObjectURL(jpeg); img.classList.remove("ph-img");
-    })().catch(() => { img.replaceWith(h("div", { class: "ph" }, m.kind === "video" ? "▶ Video" : "Photo")); })
-      .finally(() => { backfill.running--; pumpBackfill(); });
+    })().catch(() => thumbFailed(m, img)).finally(() => { backfill.running--; pumpBackfill(); });
   }
+}
+function thumbFailed(m, img) {
+  if (!img.isConnected) return;
+  const ph = h("div", { class: "ph" }, h("span", {}, m.kind === "video" ? "▶ Video" : "Photo"),
+    h("button", { type: "button", class: "link", onclick: (e) => { e.stopPropagation(); const fresh = thumbEl(m); ph.replaceWith(fresh); } }, "Retry"));
+  img.replaceWith(ph);
 }
 const seen = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
   for (const en of entries) if (en.isIntersecting) { seen.unobserve(en.target); en.target._onVisible?.(); }
-}, { rootMargin: "200px" }) : null;
+}, { rootMargin: "300px" }) : null;
 
-// A thumbnail element: the stored thumbnail (cached privately by the browser); if none, one is made when visible.
+// A thumbnail: the stored small JPEG (privately cached by the browser), never the original; made once if missing.
 function thumbEl(m) {
   const img = h("img", { alt: m.name, class: "ph-img", decoding: "async" });
-  const load = () => {
-    img.src = thumbUrl(m.key, m.uploaded);
-    img.onload = () => img.classList.remove("ph-img");
-    img.onerror = () => { img.onerror = null; if (m.size <= 50 * 1024 * 1024) queueBackfill(m, img); };
-  };
+  const load = () => enqueueThumb(img, () => loadImg(img, thumbUrl(m.key, m.uploaded))
+    .then(() => img.classList.remove("ph-img"))
+    .catch(() => { if (m.size <= 50 * 1024 * 1024) queueBackfill(m, img); else thumbFailed(m, img); }));
   if (seen) { img._onVisible = load; seen.observe(img); } else load();
   return img;
 }
@@ -1183,110 +1209,148 @@ function menu(items) {
 }
 document.addEventListener("click", () => { document.querySelectorAll(".menu-list").forEach((l) => { l.hidden = true; }); document.querySelectorAll(".menu-open").forEach((t) => t.classList.remove("menu-open")); });
 
-const PAGE = 60;
+const PAGE_SIZES = [24, 48, 96];
 function treeOpen() { try { return JSON.parse(localStorage.getItem("media_tree") || "{}"); } catch { return {}; } }
 function setTreeOpen(path, open) { const o = treeOpen(); o[path] = open; try { localStorage.setItem("media_tree", JSON.stringify(o)); } catch { /* private mode */ } }
 function viewMode() { try { return localStorage.getItem("media_view") || "grid"; } catch { return "grid"; } }
+function pageSize() { try { const n = Number(localStorage.getItem("media_page_size")); return PAGE_SIZES.includes(n) ? n : 24; } catch { return 24; } }
+let uploadSeq = 0;
+const newUploadId = () => `${Date.now().toString(36)}-${(++uploadSeq).toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 async function pageMedia(main) {
+  cancelThumbs();
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const folder = params.get("folder") || "public/photos", q = params.get("q") || "", kind = params.get("kind") || "", days = params.get("days") || "";
   const searching = !!(q || kind || days);
+  // Changing folder, search or filters starts again at page 1 (page lives only in this view, not in the link).
   const go = (o) => { const p = new URLSearchParams({ folder, ...(q ? { q } : {}), ...(kind ? { kind } : {}), ...(days ? { days } : {}), ...o });
     for (const [k, v] of [...p]) if (!v) p.delete(k); location.hash = "#media?" + p; };
+  let page = 1, size = pageSize(), total = 0, pages = 1, current = [];
 
-  // The page appears at once with placeholders; storage, folders and files load in parallel.
-  const storageBox = h("div", { class: "card" }, h("div", { class: "skeleton line" }));
+  const storageBox = h("div", { class: "card storage-card" }, h("div", { class: "skeleton line" }));
   const treeBox = h("nav", { class: "folder-tree", "aria-label": "Folders" }, [1, 2, 3, 4, 5, 6].map(() => h("div", { class: "skeleton line" })));
-  const gridBox = h("div", { class: "media-grid " + viewMode() }, Array.from({ length: 8 }, () => h("div", { class: "media-tile skeleton-tile" })));
-  const countBox = h("span", { class: "muted small" }, "Loading…");
-  const moreBox = h("div", {});
+  const skeletons = (n) => Array.from({ length: Math.min(n, 12) }, () => h("div", { class: "media-tile skeleton-tile" }));
+  const gridBox = h("div", { class: "media-grid " + viewMode() }, skeletons(size));
+  const scroller = h("div", { class: "media-scroll" }, gridBox);
+  const rangeBox = h("span", { class: "muted small" }, "Loading…");
+  const pager = h("div", { class: "pager" });
+
+  // ---- selection: current page vs all matching files ----
   const selected = new Set();
   const selCount = h("span", { class: "small muted" });
+  const pageCheck = h("input", { type: "checkbox", "aria-label": "Select current page", onchange: (e) => {
+    gridBox.querySelectorAll(".tile-check input").forEach((c) => { c.checked = e.target.checked; c.dispatchEvent(new Event("change")); }); } });
+  const selectAllBtn = h("button", { type: "button", class: "link", onclick: async () => {
+    const r = await act(() => api(`${listBase()}&keys=1`)); if (!r) return;
+    r.keys.forEach((k) => selected.add(k)); gridBox.querySelectorAll(".tile-check input").forEach((c) => { c.checked = true; }); syncSel();
+    if (r.total > r.keys.length) toast(`Selected the first ${num(r.keys.length)} of ${num(r.total)}`, true); } }, "Select all matching");
+  const clearSel = h("button", { type: "button", class: "link", onclick: () => { selected.clear(); gridBox.querySelectorAll(".tile-check input").forEach((c) => { c.checked = false; }); pageCheck.checked = false; syncSel(); } }, "Clear selection");
   const bulk = h("div", { class: "row", hidden: true },
     h("button", { onclick: () => moveDrawer([...selected]) }, "Move"),
     h("button", { onclick: () => downloadMany([...selected]) }, "Download"),
     h("button", { class: "danger", onclick: () => removeKeys([...selected]) }, "Delete"));
-  const syncSel = () => { selCount.textContent = selected.size ? `${selected.size} selected` : ""; bulk.hidden = !selected.size; };
+  const syncSel = () => { selCount.textContent = selected.size ? `${num(selected.size)} selected` : ""; bulk.hidden = !selected.size; clearSel.hidden = !selected.size; };
+  syncSel();
 
   const search = h("input", { type: "search", value: q, placeholder: "Search all folders", "aria-label": "Search" });
   const kindSel = h("select", { "aria-label": "Type", onchange: (e) => go({ kind: e.target.value }) }, [["", "All types"], ["image", "Photos"], ["video", "Videos"], ["gif", "GIFs"]].map(([v, l]) => h("option", { value: v, selected: v === kind }, l)));
   const daySel = h("select", { "aria-label": "Date", onchange: (e) => go({ days: e.target.value }) }, [["", "Any date"], ["1", "Last 24 hours"], ["7", "Last 7 days"], ["30", "Last 30 days"]].map(([v, l]) => h("option", { value: v, selected: v === days }, l)));
+  const sizeSel = h("select", { "aria-label": "Files per page", onchange: (e) => { size = Number(e.target.value); try { localStorage.setItem("media_page_size", String(size)); } catch { /* ignore */ } loadPage(1); } },
+    PAGE_SIZES.map((n) => h("option", { value: n, selected: n === size }, `${n} per page`)));
   const viewBtn = h("button", { type: "button", "aria-label": "Switch grid or list view", onclick: () => {
     const next = viewMode() === "grid" ? "list" : "grid"; try { localStorage.setItem("media_view", next); } catch { /* ignore */ }
     gridBox.classList.toggle("grid", next === "grid"); gridBox.classList.toggle("list", next === "list"); viewBtn.textContent = next === "grid" ? "List view" : "Grid view"; } },
     viewMode() === "grid" ? "List view" : "Grid view");
 
-  // ---- upload queue: every file listed first, 3 at a time, cancel / retry each, successes kept when others fail ----
-  const queue = h("div", { class: "upload-queue" });
-  const queueHead = h("div", { class: "row spread", hidden: true }, h("strong", { class: "small" }, "Uploads"),
-    h("button", { type: "button", class: "link", onclick: () => { for (const j of jobs.filter((x) => ["done", "failed", "cancelled"].includes(x.status))) j.row.remove(); jobs = jobs.filter((x) => !["done", "failed", "cancelled"].includes(x.status)); queueHead.hidden = !jobs.length; } }, "Clear finished"));
-  let jobs = [], active = 0, uploadedAny = false;
-  const pump = () => {
-    while (active < 3) {
-      const j = jobs.find((x) => x.status === "queued");
-      if (!j) break;
-      run(j);
-    }
-    if (!active && !jobs.some((x) => x.status === "queued") && uploadedAny) { uploadedAny = false; refreshAfterUpload(); }
+  // ---- uploads: queue panel (collapsible, scrolls on its own), 3 at a time, per-file and overall progress ----
+  const STATE = { queued: "Waiting", uploading: "Uploading", saving: "Saving…", done: "Saved", failed: "Failed", cancelled: "Cancelled" };
+  let jobs = [], active = 0, savedSinceRefresh = 0;
+  const overall = h("progress", { max: 100, value: 0, class: "upload-progress" });
+  const overallText = h("span", { class: "small muted" });
+  const queueList = h("div", { class: "upload-queue" });
+  const collapseBtn = h("button", { type: "button", class: "link", "aria-expanded": "true", onclick: () => {
+    const open = collapseBtn.getAttribute("aria-expanded") !== "true"; collapseBtn.setAttribute("aria-expanded", String(open)); queueList.hidden = !open; collapseBtn.textContent = open ? "Hide" : "Show"; } }, "Hide");
+  const panel = h("section", { class: "upload-panel", hidden: true },
+    h("div", { class: "row spread" }, h("strong", {}, "Uploads"), overallText,
+      h("div", { class: "row" }, collapseBtn, h("button", { type: "button", class: "link", onclick: () => {
+        jobs = jobs.filter((j) => { const fin = ["done", "failed", "cancelled"].includes(j.status); if (fin) j.row.remove(); return !fin; }); drawOverall(); } }, "Clear finished"))),
+    overall, queueList);
+  const drawOverall = () => {
+    panel.hidden = !jobs.length;
+    const bytes = jobs.reduce((n, j) => n + j.file.size, 0) || 1;
+    const sent = jobs.reduce((n, j) => n + j.file.size * (j.status === "done" ? 1 : ["uploading", "saving"].includes(j.status) ? j.pct / 100 : 0), 0);
+    overall.value = Math.round((sent / bytes) * 100);
+    const c = (st) => jobs.filter((j) => j.status === st).length;
+    overallText.textContent = `${c("done")} saved · ${c("uploading") + c("saving")} in progress · ${c("queued")} waiting${c("failed") ? ` · ${c("failed")} failed` : ""}${c("cancelled") ? ` · ${c("cancelled")} cancelled` : ""}`;
   };
-  const draw = (j, ...parts) => j.row.replaceChildren(h("span", { class: "clip up-name" }, j.file.name), h("span", { class: "muted small" }, mb(j.file.size)), ...parts);
+  const draw = (j) => {
+    const bar = ["uploading", "saving"].includes(j.status) ? h("progress", { max: 100, value: j.status === "saving" ? 100 : j.pct, class: "upload-progress" }) : h("span");
+    const actions = j.status === "queued" ? h("button", { type: "button", class: "link danger", onclick: () => { if (j.status === "queued") { j.status = "cancelled"; draw(j); drawOverall(); } } }, "Remove")
+      : j.status === "uploading" ? h("button", { type: "button", class: "link danger", onclick: () => j.abort?.() }, "Cancel")
+      : ["failed", "cancelled"].includes(j.status) && !j.invalid ? h("button", { type: "button", onclick: (e) => { e.target.disabled = true; retry(j); } }, "Retry") : h("span");
+    j.row.replaceChildren(h("span", { class: "clip up-name", title: j.file.name }, j.file.name), h("span", { class: "muted small" }, mb(j.file.size)), bar,
+      h("span", { class: `small up-state ${j.status}` }, j.status === "done" ? `✓ ${j.savedAs}` : j.status === "failed" ? j.error : STATE[j.status]), actions);
+  };
   const run = (j) => {
-    j.status = "uploading"; active++;
-    const bar = h("progress", { max: 100, value: 0, class: "upload-progress" });
-    const up = startUpload(j.file, folder, (pct) => { bar.value = pct; });
+    j.status = "uploading"; j.pct = 0; active++; draw(j); drawOverall();
+    const up = startUpload(j.file, j.folder, (pct) => { j.pct = pct; const bar = j.row.querySelector("progress"); if (bar) bar.value = pct; drawOverall(); },
+      { uploadId: j.id, onSaving: () => { j.status = "saving"; draw(j); drawOverall(); } });
     j.abort = up.abort;
-    draw(j, bar, h("button", { type: "button", class: "link danger", onclick: () => up.abort() }, "Cancel"));
-    up.promise.then((r) => { j.status = "done"; uploadedAny = true; draw(j, h("span", { class: "ok-text" }, `✓ saved as ${r.name}`)); })
-      .catch((e) => { j.status = e.message === "Cancelled" ? "cancelled" : "failed";
-        draw(j, h("span", { class: "bad-text" }, e.message), h("button", { type: "button", onclick: () => { j.status = "queued"; draw(j, h("span", { class: "muted small" }, "Waiting…")); pump(); } }, "Retry")); })
-      .finally(() => { active--; pump(); });
+    up.promise.then((r) => { j.status = "done"; j.savedAs = r.name; if (!r.duplicate_retry) savedSinceRefresh++; })
+      .catch((e) => { j.status = e.message === "Cancelled" ? "cancelled" : "failed"; j.error = e.message; })
+      .finally(() => { active--; draw(j); drawOverall(); pump(); });
   };
+  const pump = () => {
+    while (active < 3) { const j = jobs.find((x) => x.status === "queued"); if (!j) break; run(j); }
+    if (!active && !jobs.some((x) => x.status === "queued") && savedSinceRefresh) { savedSinceRefresh = 0; afterUploads(); }
+  };
+  const retry = (j) => { if (!["failed", "cancelled"].includes(j.status)) return; j.status = "queued"; draw(j); drawOverall(); pump(); }; // same upload id: never a second copy
   const addFiles = (list) => {
     for (const file of [...list]) {
-      const j = { file, status: "queued", row: h("div", { class: "upload-row" }) };
+      const j = { file, folder, id: newUploadId(), status: "queued", pct: 0, row: h("div", { class: "upload-row" }) };
       const problem = checkUpload(file);
-      if (problem) { j.status = "failed"; draw(j, h("span", { class: "bad-text" }, problem)); }
-      else draw(j, h("span", { class: "muted small" }, "Waiting…"), h("button", { type: "button", class: "link danger", onclick: () => { if (j.status === "queued") { j.status = "cancelled"; draw(j, h("span", { class: "muted small" }, "Cancelled")); } } }, "Remove"));
-      jobs.push(j); queue.append(j.row);
+      if (problem) { j.status = "failed"; j.error = problem; j.invalid = true; }
+      jobs.push(j); queueList.append(j.row); draw(j);
     }
-    queueHead.hidden = !jobs.length;
-    pump();
+    drawOverall(); pump();
   };
   const input = h("input", { type: "file", accept: ACCEPT, multiple: true, hidden: true, onchange: (e) => { addFiles(e.target.files); e.target.value = ""; } });
-  const drop = h("div", { class: "dropzone", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
+  const drop = h("div", { class: "dropzone compact", ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); }, ondragleave: () => drop.classList.remove("over"),
     ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); addFiles(e.dataTransfer.files); } },
-    h("label", { class: "btn primary" }, "Upload photos or videos", input),
-    h("span", {}, "or drop files here — they go into ", h("strong", { class: "mono" }, folder)),
-    h("span", { class: "small muted" }, "JPEG, PNG, WebP, GIF, MP4, MOV, WebM · photos ≤ 10 MB, videos ≤ 50 MB · same names get “-2”, “-3”"));
+    h("label", { class: "btn primary" }, "Upload", input),
+    h("span", { class: "small" }, "or drop files — into ", h("strong", { class: "mono" }, folder)),
+    h("span", { class: "small muted" }, "photos ≤ 10 MB · videos ≤ 50 MB"));
 
   // ---- actions ----
   const removeKeys = async (keys) => {
-    if (!keys.length || !confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : keys.length + " files"} from storage? This cannot be undone.`)) return;
-    const r = await act(() => api("/api/media/delete", { method: "POST", body: { keys } }));
-    if (!r) return;
-    const bad = r.results.filter((x) => !x.ok), ok = r.results.length - bad.length;
-    if (bad.length) toast(`${ok} deleted. Not deleted: ${bad.map((x) => `${x.key.split("/").pop()} (${x.error})`).join(" · ")}`, true);
-    else toast(ok === 1 ? "Deleted" : `${ok} files deleted`);
-    route();
+    if (!keys.length || !confirm(`Permanently delete ${keys.length === 1 ? keys[0].split("/").pop() : num(keys.length) + " files"} from storage? This cannot be undone.`)) return;
+    let ok = 0; const bad = [];
+    for (let i = 0; i < keys.length; i += 100) {
+      const r = await act(() => api("/api/media/delete", { method: "POST", body: { keys: keys.slice(i, i + 100) } }));
+      if (!r) break;
+      for (const x of r.results) { if (x.ok) { ok++; selected.delete(x.key); } else bad.push(x); }
+    }
+    if (bad.length) toast(`${ok} deleted. Not deleted: ${bad.slice(0, 5).map((x) => `${x.key.split("/").pop()} (${x.error})`).join(" · ")}${bad.length > 5 ? ` and ${bad.length - 5} more` : ""}`, true);
+    else toast(ok === 1 ? "Deleted" : `${num(ok)} files deleted`);
+    syncSel(); refreshAll();
   };
-  const downloadMany = (keys) => keys.forEach((k, i) => setTimeout(() => { const a = h("a", { href: fileUrl(k, true), download: "" }); document.body.append(a); a.click(); a.remove(); }, i * 400));
+  const downloadMany = (keys) => keys.slice(0, 50).forEach((k, i) => setTimeout(() => { const a = h("a", { href: fileUrl(k, true), download: "" }); document.body.append(a); a.click(); a.remove(); }, i * 400));
   const moveDrawer = async (keys, copy = false) => {
     const folders = await api("/api/media/folders").catch(() => []);
     const target = h("select", {}, folders.map((f) => h("option", { value: f.path, selected: f.path === folder }, f.path)));
     const name = keys.length === 1 ? h("input", { value: keys[0].split("/").pop() }) : null;
-    drawer(copy ? "Copy to folder" : keys.length === 1 ? "Rename or move" : `Move ${keys.length} files`, h("form", { onsubmit: async (e) => {
-      e.preventDefault();
+    drawer(copy ? "Copy to folder" : keys.length === 1 ? "Rename or move" : `Move ${num(keys.length)} files`, h("form", { onsubmit: async (e) => {
+      e.preventDefault(); e.submitter.disabled = true;
       let ok = 0;
-      for (const k of keys) if (await act(() => api(copy ? "/api/media/copy" : "/api/media/move", { method: "POST", body: { from: k, to: `${target.value}/${name ? name.value.trim() : k.split("/").pop()}` } }))) ok++;
-      if (ok) { toast(`${ok} file${ok > 1 ? "s" : ""} ${copy ? "copied" : "moved"}`); closeDrawer(); route(); }
+      for (const k of keys) if (await act(() => api(copy ? "/api/media/copy" : "/api/media/move", { method: "POST", body: { from: k, to: `${target.value}/${name ? name.value.trim() : k.split("/").pop()}` } }))) { ok++; selected.delete(k); }
+      if (ok) { toast(`${ok} file${ok > 1 ? "s" : ""} ${copy ? "copied" : "moved"}`); closeDrawer(); syncSel(); refreshAll(); } else e.submitter.disabled = false;
     } }, field("Folder", target), name ? field("File name", name, "Letters, numbers, spaces and . _ - ( ) +") : null,
       h("p", { class: "small muted" }, "Scheduled and draft posts using a moved file are updated automatically. Public posts can't use VIP or paid-media files."),
       h("button", { class: "primary", type: "submit" }, copy ? "Copy" : "Save")));
   };
 
   const tile = (m) => {
-    const cb = h("input", { type: "checkbox", "aria-label": `Select ${m.name}`, onchange: (e) => { e.target.checked ? selected.add(m.key) : selected.delete(m.key); syncSel(); } });
+    const cb = h("input", { type: "checkbox", checked: selected.has(m.key), "aria-label": `Select ${m.name}`, onchange: (e) => { e.target.checked ? selected.add(m.key) : selected.delete(m.key); syncSel(); } });
     const ctx = { kind: m.kind === "video" ? "video" : m.kind === "gif" ? "animation" : "photo", target: m.key.startsWith("vip/") ? "vip" : "public" };
     const paid = m.key.startsWith("paid-media/");
     return h("div", { class: "media-tile" },
@@ -1307,22 +1371,41 @@ async function pageMedia(main) {
       ]));
   };
 
-  let offset = 0, shown = new Set();
+  // ---- listing: one server page at a time (cached index on the server; nothing else is downloaded) ----
   const since = days ? Math.floor(Date.now() / 1000) - Number(days) * 86400 : 0;
-  const listUrl = (off) => searching
-    ? `/api/media/files?recursive=1&q=${encodeURIComponent(q)}&kind=${kind}${since ? `&from=${since}` : ""}&limit=${PAGE}&offset=${off}`
-    : `/api/media/files?folder=${encodeURIComponent(folder)}&limit=${PAGE}&offset=${off}`;
-  const loadPage = async (first) => {
-    const r = await api(listUrl(offset));
-    if (first) gridBox.replaceChildren();
-    for (const m of r.items) if (!shown.has(m.key)) { shown.add(m.key); gridBox.append(tile(m)); }
-    offset = r.next ?? offset;
-    countBox.textContent = `${num(r.total)} file${r.total === 1 ? "" : "s"}`;
-    if (!r.total) gridBox.replaceChildren(h("p", { class: "empty" }, searching ? "No files match." : "No files here yet. Upload or drop some above."));
-    put(moreBox, r.next != null ? h("button", { onclick: async (e) => { e.target.disabled = true; await loadPage(false).catch((x) => toast(x.message, true)); } }, `Load more (${num(r.total - r.next)} left)`) : null);
-  };
-  const refreshAfterUpload = () => { offset = 0; shown = new Set(); loadPage(true).catch(() => {}); api("/api/media/status").then((s) => put(storageBox, storageBar(s))).catch(() => {}); refreshTree(); };
+  const listBase = () => searching ? `/api/media/files?recursive=1&q=${encodeURIComponent(q)}&kind=${kind}${since ? `&from=${since}` : ""}` : `/api/media/files?folder=${encodeURIComponent(folder)}`;
+  let loadSeq = 0;
+  async function loadPage(p, { keepScroll = false } = {}) {
+    const seq = ++loadSeq, top = scroller.scrollTop;
+    cancelThumbs();
+    if (!keepScroll) gridBox.replaceChildren(...skeletons(size));
+    let r;
+    try { r = await api(`${listBase()}&page=${p}&size=${size}`); }
+    catch (e) { if (seq === loadSeq) put(gridBox, h("div", { class: "banner bad" }, e.message, " ", h("button", { onclick: () => loadPage(p) }, "Retry"))); return; }
+    if (seq !== loadSeq) return; // a newer request (folder/page switch) won
+    ({ page, pages, total } = r); current = r.items;
+    gridBox.replaceChildren(...(current.length ? current.map(tile) : [h("p", { class: "empty" }, searching ? "No files match." : "No files here yet. Upload or drop some above.")]));
+    rangeBox.textContent = total ? `${num(r.from)}–${num(r.to)} of ${num(total)} file${total === 1 ? "" : "s"}` : "0 files";
+    pageCheck.checked = false;
+    drawPager();
+    scroller.scrollTop = keepScroll ? top : 0;
+  }
+  function drawPager() {
+    const nums = new Set([1, pages, page - 1, page, page + 1].filter((n) => n >= 1 && n <= pages));
+    const list = [...nums].sort((a, b) => a - b);
+    const items = [];
+    list.forEach((n, i) => {
+      if (i && n - list[i - 1] > 1) items.push(h("span", { class: "muted" }, "…"));
+      items.push(h("button", { type: "button", class: n === page ? "active" : "", "aria-current": n === page ? "page" : null, onclick: () => loadPage(n) }, String(n)));
+    });
+    put(pager, h("button", { type: "button", disabled: page <= 1, onclick: () => loadPage(page - 1) }, "‹ Previous"), ...items,
+      h("button", { type: "button", disabled: page >= pages, onclick: () => loadPage(page + 1) }, "Next ›"), sizeSel);
+  }
+  const refreshStatus = () => api("/api/media/status").then((s) => put(storageBox, storageBar(s))).catch((e) => put(storageBox, h("p", { class: "bad-text" }, e.message)));
+  const refreshAll = () => { loadPage(page, { keepScroll: true }); refreshStatus(); refreshTree(); };
+  const afterUploads = () => { loadPage(searching ? page : 1, { keepScroll: page !== 1 }); refreshStatus(); refreshTree(); };
 
+  const folderTools = h("div", { class: "row" });
   const drawTree = (folders) => {
     const open = treeOpen();
     const kids = (p) => folders.filter((f) => f.path.startsWith(p + "/") && f.path.split("/").length === p.split("/").length + 1);
@@ -1332,9 +1415,9 @@ async function pageMedia(main) {
       const sub = children.length ? h("div", { class: "tree-kids", hidden: !isOpen }, children.map(node)) : null;
       const caret = children.length ? h("button", { type: "button", class: "caret-btn", "aria-expanded": String(isOpen), "aria-label": `Show ${f.path}`, onclick: (e) => {
         e.preventDefault(); const now = e.currentTarget.getAttribute("aria-expanded") !== "true"; e.currentTarget.setAttribute("aria-expanded", String(now)); sub.hidden = !now; setTreeOpen(f.path, now); } }, "▸") : h("span", { class: "caret-sp" });
-      const total = folders.filter((x) => x.path === f.path || x.path.startsWith(f.path + "/")).reduce((n, x) => n + x.files, 0);
+      const totalHere = folders.filter((x) => x.path === f.path || x.path.startsWith(f.path + "/")).reduce((n, x) => n + x.files, 0);
       return h("div", {}, h("div", { class: "tree-row" + (f.path === folder && !searching ? " active" : "") }, caret,
-        h("a", { href: `#media?folder=${encodeURIComponent(f.path)}`, title: f.path }, h("span", {}, f.path.split("/").pop()), total ? h("span", { class: "count-muted" }, num(total)) : null)), sub);
+        h("a", { href: `#media?folder=${encodeURIComponent(f.path)}`, title: f.path }, h("span", {}, f.path.split("/").pop()), totalHere ? h("span", { class: "count-muted" }, num(totalHere)) : null)), sub);
     };
     put(treeBox, folders.filter((f) => !f.path.includes("/")).map(node));
     put(folderTools, h("button", { onclick: () => { const n = prompt(`New folder inside ${folder}/ (or a full path like campaigns/december):`); if (n) act(() => api("/api/media/folders", { method: "POST", body: { path: n.includes("/") ? n : `${folder}/${n}` } }), "Folder created").then((r) => r && go({ folder: r.path })); } }, "New folder"),
@@ -1342,26 +1425,22 @@ async function pageMedia(main) {
         h("button", { onclick: () => { const n = prompt("New folder path:", folder); if (n && n !== folder) act(() => api("/api/media/folders/rename", { method: "POST", body: { from: folder, to: n } }), "Folder renamed").then((r) => r && go({ folder: r.path })); } }, "Rename folder"),
         h("button", { class: "danger", onclick: () => { if (confirm(`Delete the empty folder ${folder}? Folders with files can't be deleted.`)) act(() => api("/api/media/folders/delete", { method: "POST", body: { path: folder } }), "Folder deleted").then((r) => r && go({ folder: "public/photos" })); } }, "Delete folder")] : null);
   };
-  const folderTools = h("div", { class: "row" });
   const refreshTree = () => api("/api/media/folders").then(drawTree).catch((e) => put(treeBox, h("p", { class: "small bad-text" }, e.message)));
 
-  put(main, head("Media library", "Private storage (Cloudflare R2): only signed-in admins can see these files; Telegram receives them as uploads."),
-    storageBox,
-    h("div", { class: "media-layout" },
-      h("section", { class: "card" }, h("h3", {}, "Folders"), treeBox),
-      h("section", { class: "card" },
-        h("form", { class: "row search-row", onsubmit: (e) => { e.preventDefault(); go({ q: search.value.trim() }); } }, search, kindSel, daySel, h("button", { type: "submit" }, "Search"),
-          searching ? h("button", { type: "button", onclick: () => (location.hash = `#media?folder=${encodeURIComponent(folder)}`) }, "Clear") : null),
-        h("div", { class: "row spread" }, h("div", {}, h("h2", {}, searching ? "Search results" : folder), countBox), h("div", { class: "row" }, folderTools, viewBtn)),
-        !searching ? drop : null, queueHead, queue,
-        h("div", { class: "row" }, h("label", { class: "inline" }, h("input", { type: "checkbox", onchange: (e) => {
-          main.querySelectorAll(".tile-check input").forEach((c) => { c.checked = e.target.checked; c.dispatchEvent(new Event("change")); }); } }), "Select all shown"), selCount, bulk),
-        gridBox, moreBox)));
-  await Promise.all([
-    api("/api/media/status").then((s) => put(storageBox, storageBar(s))).catch((e) => put(storageBox, h("p", { class: "bad-text" }, e.message))),
-    refreshTree(),
-    loadPage(true).catch((e) => put(gridBox, h("div", { class: "banner bad" }, e.message))),
-  ]);
+  put(main,
+    h("div", { class: "media-page" },
+      h("div", { class: "media-top" }, h("div", {}, h("h1", {}, "Media library"), h("p", { class: "muted small" }, "Private storage (Cloudflare R2): only signed-in admins can see these files.")), storageBox),
+      h("div", { class: "media-layout" },
+        h("section", { class: "card folder-card" }, h("h3", {}, "Folders"), treeBox),
+        h("section", { class: "card media-panel" },
+          h("div", { class: "media-toolbar" },
+            h("form", { class: "row search-row", onsubmit: (e) => { e.preventDefault(); go({ q: search.value.trim() }); } }, search, kindSel, daySel, h("button", { type: "submit" }, "Search"),
+              searching ? h("button", { type: "button", onclick: () => (location.hash = `#media?folder=${encodeURIComponent(folder)}`) }, "Clear") : null),
+            h("div", { class: "row spread" }, h("div", {}, h("h2", { class: "clip" }, searching ? "Search results" : folder), rangeBox), h("div", { class: "row" }, folderTools, viewBtn)),
+            !searching ? drop : null,
+            h("div", { class: "row sel-row" }, h("label", { class: "inline" }, pageCheck, "Select current page"), selectAllBtn, clearSel, selCount, bulk)),
+          panel, scroller, pager))));
+  await Promise.all([refreshStatus(), refreshTree(), loadPage(1)]);
 }
 
 async function pageAutomation(main) {
