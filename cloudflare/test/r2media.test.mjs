@@ -266,3 +266,30 @@ test("a folder summary built while a change happened is never reused (no stale c
   const f = (await call(e, s, "/api/media/folders")).body.find((x) => x.path === "public/photos");
   assert.equal(f.files, 2, "rebuilt, not the stale 99");
 });
+
+test("overlapping retries of one upload store one file; a failed attempt can be retried", async () => {
+  const { MediaStore } = await import("../src/r2media.js");
+  const e = env(); const ops = new Ops(e.DB);
+  const slowPut = e.MEDIA.put.bind(e.MEDIA);
+  e.MEDIA.put = async (k, b, o) => { await new Promise((r) => setTimeout(r, 30)); return slowPut(k, b, o); };
+  const store = new MediaStore(e.MEDIA, ops);
+  const results = await Promise.allSettled([store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123"), store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123")]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.match(results.find((r) => r.status === "rejected").reason.message, /still being saved/);
+  assert.equal([...e.MEDIA.store.keys()].filter((k) => k.startsWith("public/photos/a")).length, 1, "one file only");
+  assert.equal((await store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123")).duplicate_retry, true);
+  // a rejected file releases its id, so the user can retry with a corrected file under the same job
+  await assert.rejects(store.upload("public/photos", "x.heic", HEIC(), "t", {}, "other-id-456"));
+  assert.equal((await store.upload("public/photos", "x.jpg", JPEG(), "t", {}, "other-id-456")).key, "public/photos/x.jpg");
+});
+
+test("a listing taken in the middle of a move is not reused afterwards", async () => {
+  const { MediaStore } = await import("../src/r2media.js");
+  const e = env(); const ops = new Ops(e.DB);
+  const store = new MediaStore(e.MEDIA, ops);
+  await store.upload("public/photos", "m.jpg", JPEG(), "t");
+  const realDelete = e.MEDIA.delete.bind(e.MEDIA);
+  e.MEDIA.delete = async (k) => { if (k === "public/photos/m.jpg") await store.list({ folder: "public/photos", page: 1, size: 24 }); return realDelete(k); };
+  await store.move("public/photos/m.jpg", "archive/m.jpg", "t");
+  assert.equal((await store.list({ folder: "public/photos", page: 1, size: 24 })).total, 0, "the moved file is gone from its old folder");
+});

@@ -1296,7 +1296,7 @@ async function pageMedia(main) {
     const up = startUpload(j.file, j.folder, (pct) => { j.pct = pct; const bar = j.row.querySelector("progress"); if (bar) bar.value = pct; drawOverall(); },
       { uploadId: j.id, onSaving: () => { j.status = "saving"; draw(j); drawOverall(); } });
     j.abort = up.abort;
-    up.promise.then((r) => { j.status = "done"; j.savedAs = r.name; if (!r.duplicate_retry) savedSinceRefresh++; })
+    up.promise.then((r) => { j.status = "done"; j.savedAs = r.name; savedSinceRefresh++; }) // also after a retry that found the file already saved
       .catch((e) => { j.status = e.message === "Cancelled" ? "cancelled" : "failed"; j.error = e.message; })
       .finally(() => { active--; draw(j); drawOverall(); pump(); });
   };

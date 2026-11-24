@@ -234,11 +234,24 @@ export class MediaStore {
   // uploadId: the browser's id for this upload. A retry of an upload the server already saved (lost response)
   // returns the saved file instead of storing a second copy.
   async upload(folder, filename, bytes, actor, extra = {}, uploadId = "") {
+    // The id is reserved atomically (unique row) BEFORE any name is picked, so overlapping retries of one upload
+    // can never both store a file: the second either gets the saved file or is told to wait.
     const idKey = /^[A-Za-z0-9-]{8,64}$/.test(String(uploadId)) ? "r2up:" + uploadId : null;
     if (idKey) {
-      const done = await this.ops.getSetting(idKey);
-      if (done) { const o = await this.b.head(done); if (o) return { ...describe(o), duplicate_retry: true }; }
+      const claimed = await this.ops.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO NOTHING", idKey, "pending");
+      if (claimed.meta.changes !== 1) {
+        const done = await this.ops.getSetting(idKey);
+        if (done === "pending") throw new OpsError("This upload is still being saved. Wait a moment, then retry");
+        const o = done ? await this.b.head(done) : null;
+        if (o) return { ...describe(o), duplicate_retry: true };
+        await this.ops.setSetting(idKey, "pending"); // the earlier copy was deleted since: store it again
+      }
     }
+    try { return await this.#store(folder, filename, bytes, actor, extra, idKey); }
+    catch (e) { if (idKey) await this.ops.run("DELETE FROM settings WHERE key = ?", idKey); throw e; } // a failed attempt can be retried
+  }
+
+  async #store(folder, filename, bytes, actor, extra, idKey) {
     const f = cleanFolder(folder);
     if (!f) throw new OpsError("Choose a folder");
     const type = sniff(bytes);
@@ -320,6 +333,7 @@ export class MediaStore {
     await this.ops.run("UPDATE content_items SET media_url = ? WHERE media_url = ? AND status IN ('draft','scheduled','failed','cancelled')", "r2:" + b, "r2:" + a);
     await this.b.delete(a);
     await this.b.delete(`${THUMBS}/${a}`);
+    await this.dirty(); // again after the source is gone: a listing taken mid-move is never reused
     await this.ops.audit(actor, "media_move", `${a} -> ${b}`);
     return { key: b };
   }
