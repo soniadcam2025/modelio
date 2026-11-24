@@ -213,3 +213,83 @@ test("a fresh bucket: status before folders still shows the default folders", as
   const folders = (await call(e, s, "/api/media/folders")).body.map((f) => f.path);
   for (const f of DEFAULT_FOLDERS) assert.ok(folders.includes(f), f);
 });
+
+test("server-side pages from a cached index: few R2 calls, refreshed after changes, hidden, select-all keys", async () => {
+  const e = env(); const s = await login(e);
+  let lists = 0; const realList = e.MEDIA.list.bind(e.MEDIA); e.MEDIA.list = async (o) => { lists++; return realList(o); };
+  for (let i = 0; i < 60; i++) { const k = `public/photos/f${String(i).padStart(2, "0")}.jpg`; await e.MEDIA.put(k, JPEG(), { httpMetadata: { contentType: "image/jpeg" } }); e.MEDIA.store.get(k).uploaded = new Date(Date.now() - 86400000 + i * 1000); }
+  await new Ops(e.DB).setSetting("r2:gen", "1");
+  const p1 = (await call(e, s, "/api/media/files?folder=public/photos&page=1&size=24")).body;
+  assert.deepEqual([p1.items.length, p1.total, p1.page, p1.pages, p1.from, p1.to], [24, 60, 1, 3, 1, 24]);
+  const before = lists;
+  const p3 = (await call(e, s, "/api/media/files?folder=public/photos&page=3&size=24")).body;
+  assert.deepEqual([p3.items.length, p3.from, p3.to], [12, 49, 60]);
+  assert.equal(lists, before, "later pages come from the cached index (no R2 listing)");
+  assert.equal((await call(e, s, "/api/media/files?folder=public/photos&page=9&size=48")).body.page, 2, "page clamped");
+  assert.equal((await call(e, s, "/api/media/files?folder=public/photos&page=1&size=7")).body.size, 24, "only 24/48/96");
+  const pages = new Set([...p1.items, ...(await call(e, s, "/api/media/files?folder=public/photos&page=2&size=24")).body.items, ...p3.items].map((m) => m.key));
+  assert.equal(pages.size, 60, "pages don't overlap or skip");
+  // a change refreshes the index
+  await up(e, s, "public/photos", "new.jpg", JPEG());
+  const after = (await call(e, s, "/api/media/files?folder=public/photos&page=1&size=24")).body;
+  assert.equal(after.total, 61); assert.equal(after.items[0].name, "new.jpg", "newest first");
+  // select all matching: keys only
+  const k = (await call(e, s, "/api/media/files?folder=public/photos&keys=1")).body;
+  assert.equal(k.keys.length, 61); assert.equal(k.total, 61);
+  // the index is private and never shows up as a folder or file
+  assert.ok([...e.MEDIA.store.keys()].some((x) => x.startsWith("_index/")));
+  assert.ok(!(await call(e, s, "/api/media/folders")).body.some((f) => f.path.startsWith("_index")));
+  assert.ok(!(await call(e, s, "/api/media/files?recursive=1&page=1&size=96")).body.items.some((m) => m.key.startsWith("_index")));
+  assert.equal((await call(e, s, "/api/media/file?key=_index/public/photos.json")).status, 400);
+  assert.equal((await call(e, null, "/api/media/files?folder=public/photos&page=1")).status, 401);
+});
+
+test("a retried upload with the same upload id never stores a second copy", async () => {
+  const e = env(); const s = await login(e);
+  const send = (id) => worker.fetch(new Request(ORIGIN + "/api/media/upload?folder=public/photos&name=a.jpg", { method: "POST", body: JPEG(),
+    headers: { cookie: s.cookie, "x-csrf-token": s.csrf, "x-upload-id": id, "cf-connecting-ip": "7.7.7.7" } }), e).then((r) => r.json());
+  const first = await send("job-12345678"), again = await send("job-12345678"), other = await send("job-87654321");
+  assert.equal(first.key, "public/photos/a.jpg"); assert.equal(again.key, first.key); assert.equal(again.duplicate_retry, true);
+  assert.equal(other.key, "public/photos/a-2.jpg", "a different upload still gets its own name");
+  assert.equal([...e.MEDIA.store.keys()].filter((k) => k.startsWith("public/photos/a")).length, 2);
+});
+
+test("a folder summary built while a change happened is never reused (no stale counts)", async () => {
+  const e = env(); const s = await login(e);
+  await up(e, s, "public/photos", "a.jpg", JPEG());
+  // Simulate the race: a slow summary build lists the bucket, a change lands, then the slow build writes its result.
+  const ops = new Ops(e.DB);
+  const genBefore = await ops.getSetting("r2:gen");
+  const stale = { at: Math.floor(Date.now() / 1000), gen: genBefore, folders: [{ path: "public/photos", files: 99, bytes: 1, protected: true }], files: 99, bytes: 1 };
+  await up(e, s, "public/photos", "b.jpg", JPEG()); // bumps the generation and clears the cache
+  await ops.setSetting("r2:summary", JSON.stringify(stale)); // the slow build finishes afterwards
+  const f = (await call(e, s, "/api/media/folders")).body.find((x) => x.path === "public/photos");
+  assert.equal(f.files, 2, "rebuilt, not the stale 99");
+});
+
+test("overlapping retries of one upload store one file; a failed attempt can be retried", async () => {
+  const { MediaStore } = await import("../src/r2media.js");
+  const e = env(); const ops = new Ops(e.DB);
+  const slowPut = e.MEDIA.put.bind(e.MEDIA);
+  e.MEDIA.put = async (k, b, o) => { await new Promise((r) => setTimeout(r, 30)); return slowPut(k, b, o); };
+  const store = new MediaStore(e.MEDIA, ops);
+  const results = await Promise.allSettled([store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123"), store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123")]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.match(results.find((r) => r.status === "rejected").reason.message, /still being saved/);
+  assert.equal([...e.MEDIA.store.keys()].filter((k) => k.startsWith("public/photos/a")).length, 1, "one file only");
+  assert.equal((await store.upload("public/photos", "a.jpg", JPEG(), "t", {}, "same-id-123")).duplicate_retry, true);
+  // a rejected file releases its id, so the user can retry with a corrected file under the same job
+  await assert.rejects(store.upload("public/photos", "x.heic", HEIC(), "t", {}, "other-id-456"));
+  assert.equal((await store.upload("public/photos", "x.jpg", JPEG(), "t", {}, "other-id-456")).key, "public/photos/x.jpg");
+});
+
+test("a listing taken in the middle of a move is not reused afterwards", async () => {
+  const { MediaStore } = await import("../src/r2media.js");
+  const e = env(); const ops = new Ops(e.DB);
+  const store = new MediaStore(e.MEDIA, ops);
+  await store.upload("public/photos", "m.jpg", JPEG(), "t");
+  const realDelete = e.MEDIA.delete.bind(e.MEDIA);
+  e.MEDIA.delete = async (k) => { if (k === "public/photos/m.jpg") await store.list({ folder: "public/photos", page: 1, size: 24 }); return realDelete(k); };
+  await store.move("public/photos/m.jpg", "archive/m.jpg", "t");
+  assert.equal((await store.list({ folder: "public/photos", page: 1, size: 24 })).total, 0, "the moved file is gone from its old folder");
+});

@@ -407,14 +407,15 @@ function routes() {
   add("POST", "/api/media/folders/rename", async (c) => { const b = await body(c.request); return json(await media(c).renameFolder(b.from, b.to, c.actor)); });
   add("POST", "/api/media/folders/delete", async (c) => json(await media(c).deleteFolder((await body(c.request)).path, c.actor)));
   add("GET", "/api/media/files", async (c) => json(await media(c).list({ folder: qp(c, "folder"), recursive: qp(c, "recursive") === "1", q: qp(c, "q"),
-    kind: qp(c, "kind"), from: Number(qp(c, "from")) || null, to: Number(qp(c, "to")) || null, offset: Number(qp(c, "offset")) || 0, limit: Number(qp(c, "limit")) || 0 })));
+    kind: qp(c, "kind"), from: Number(qp(c, "from")) || null, to: Number(qp(c, "to")) || null, offset: Number(qp(c, "offset")) || 0, limit: Number(qp(c, "limit")) || 0,
+    page: Number(qp(c, "page")) || 0, size: Number(qp(c, "size")) || 0, keysOnly: qp(c, "keys") === "1" })));
   // Raw upload: the request body is the file. Checked by content (type) and Telegram's size limits before storing.
   add("POST", "/api/media/upload", async (c) => {
     const len = Number(c.request.headers.get("content-length") || 0);
     if (len > 52 * 1024 * 1024) throw new OpsError("Files can be at most 50 MB (Telegram's upload limit)");
     const bytes = new Uint8Array(await c.request.arrayBuffer());
     if (!bytes.byteLength) throw new OpsError("The file is empty");
-    return json(await media(c).upload(qp(c, "folder"), qp(c, "name"), bytes, c.actor));
+    return json(await media(c).upload(qp(c, "folder"), qp(c, "name"), bytes, c.actor, {}, c.request.headers.get("x-upload-id") || ""));
   });
   // File delivery for the signed-in admin only (thumbnails, previews, downloads). No public or signed links exist.
   add("GET", "/api/media/file", async (c) => {

@@ -13,6 +13,8 @@ const MARKER = ".folder";
 const THUMBS = "_thumbs";          // hidden: "_" can't start a folder name, so users can never address it
 const LOCK = "r2lock:";            // settings rows that reserve a key while it is being written
 const SUMMARY_KEY = "r2:summary", SUMMARY_TTL = 600;
+const INDEX = "_index";            // hidden: cached newest-first listings per folder (and "__all" for search)
+const GEN_KEY = "r2:gen";          // bumped on every change; an index built for an older generation is rebuilt
 
 export const FREE_TIER_BYTES = 10 * 1024 ** 3; // R2 free tier: 10 GB-month of storage
 export const LIMITS = { image: 10 * 1024 * 1024, video: 50 * 1024 * 1024 }; // Telegram Bot API upload limits
@@ -136,39 +138,35 @@ export class MediaStore {
   // Folder counts and storage usage need a full listing, so they are cached (10 min) and cleared on every change.
   async #summary() {
     await this.ensureDefaults(); // default folders exist before any summary is built or cached
+    // The change generation is read BEFORE listing: a summary that was being built while a change happened carries
+    // the older generation and is never reused, even if it is written after the change cleared the cache.
+    const gen = (await this.ops.getSetting(GEN_KEY)) || "0";
     try {
       const c = JSON.parse((await this.ops.getSetting(SUMMARY_KEY)) || "null");
-      if (c && this.ops.now() - c.at < SUMMARY_TTL) return c;
+      if (c && c.gen === gen && this.ops.now() - c.at < SUMMARY_TTL) return c;
     } catch { /* rebuild */ }
     const folders = await this.#buildFolders();
     let files = 0, bytes = 0;
     for (const f of folders) { files += f.files; bytes += f.bytes; }
-    const out = { at: this.ops.now(), folders, files, bytes };
+    const out = { at: this.ops.now(), gen, folders, files, bytes };
     await this.ops.setSetting(SUMMARY_KEY, JSON.stringify(out));
     return out;
   }
-  async dirty() { await this.ops.setSetting(SUMMARY_KEY, ""); }
-
-  async folders() { await this.ensureDefaults(); return (await this.#summary()).folders; }
-
-  async #buildFolders() {
-    const map = new Map();
-    const touch = (f) => { if (!map.has(f)) map.set(f, { path: f, files: 0, bytes: 0, protected: PROTECTED_FOLDERS.has(f) }); return map.get(f); };
-    for (const o of await this.#all()) {
-      if (o.key.startsWith(THUMBS + "/")) continue;
-      const folder = o.key.slice(0, o.key.lastIndexOf("/"));
-      if (!folder) continue;
-      folder.split("/").forEach((_, i, parts) => touch(parts.slice(0, i + 1).join("/")));
-      if (!o.key.endsWith("/" + MARKER)) { const f = touch(folder); f.files++; f.bytes += o.size; }
-    }
-    return [...map.values()].sort((a, b) => a.path.localeCompare(b.path));
+  async dirty() {
+    await this.ops.setSetting(SUMMARY_KEY, "");
+    await this.ops.setSetting(GEN_KEY, `${Date.now()}-${crypto.randomUUID()}`); // unique even for changes in the same millisecond
   }
 
-  // One folder (R2 delimiter listing: subfolders are not read) or, for search, everything. Newest first, paged.
-  async list({ folder = "", recursive = false, q = "", kind = "", from = null, to = null, offset = 0, limit = 0 } = {}) {
-    const f = cleanFolder(folder);
-    const prefix = f ? f + "/" : "";
-    const needle = String(q || "").toLowerCase();
+  // Newest-first listing of one folder (or of everything, for search), cached as a private R2 object and rebuilt
+  // only after a change. A page request then costs 1 settings read + 1 R2 read, however large the folder is.
+  async #index(folder, recursive) {
+    const gen = (await this.ops.getSetting(GEN_KEY)) || "0";
+    const name = `${INDEX}/${recursive ? "__all" + (folder ? "/" + folder : "") : folder || "__root"}.json`;
+    const cached = await this.b.get(name);
+    if (cached) {
+      try { const j = JSON.parse(await cached.text()); if (j.gen === gen) return j.items; } catch { /* rebuild */ }
+    }
+    const prefix = folder ? folder + "/" : "";
     let objs;
     if (recursive) objs = await this.#all(prefix);
     else {
@@ -181,11 +179,44 @@ export class MediaStore {
         cursor = page.cursor;
       }
     }
-    const all = objs.filter((o) => !o.key.endsWith("/" + MARKER) && !o.key.startsWith(THUMBS + "/") && (recursive || o.key.slice(prefix.length).indexOf("/") < 0))
+    const items = objs.filter((o) => !o.key.endsWith("/" + MARKER) && !o.key.startsWith(THUMBS + "/") && !o.key.startsWith(INDEX + "/")
+        && (recursive || o.key.slice(prefix.length).indexOf("/") < 0))
       .map(describe)
-      .filter((m) => (!needle || m.name.toLowerCase().includes(needle) || (m.original_name || "").toLowerCase().includes(needle))
-        && (!kind || m.kind === kind) && (!from || m.uploaded >= from) && (!to || m.uploaded < to))
       .sort((a, b) => (b.uploaded || 0) - (a.uploaded || 0) || a.key.localeCompare(b.key));
+    await this.b.put(name, JSON.stringify({ gen, items }), { httpMetadata: { contentType: "application/json" } });
+    return items;
+  }
+
+  async folders() { await this.ensureDefaults(); return (await this.#summary()).folders; }
+
+  async #buildFolders() {
+    const map = new Map();
+    const touch = (f) => { if (!map.has(f)) map.set(f, { path: f, files: 0, bytes: 0, protected: PROTECTED_FOLDERS.has(f) }); return map.get(f); };
+    for (const o of await this.#all()) {
+      if (o.key.startsWith(THUMBS + "/") || o.key.startsWith(INDEX + "/")) continue;
+      const folder = o.key.slice(0, o.key.lastIndexOf("/"));
+      if (!folder) continue;
+      folder.split("/").forEach((_, i, parts) => touch(parts.slice(0, i + 1).join("/")));
+      if (!o.key.endsWith("/" + MARKER)) { const f = touch(folder); f.files++; f.bytes += o.size; }
+    }
+    return [...map.values()].sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  // One folder (R2 delimiter listing: subfolders are not read) or, for search, everything. Newest first, paged.
+  // page/size: server-side pages (sizes 24/48/96, max 200). keysOnly: every matching key (for "select all matching").
+  async list({ folder = "", recursive = false, q = "", kind = "", from = null, to = null, offset = 0, limit = 0, page = 0, size = 0, keysOnly = false } = {}) {
+    const f = cleanFolder(folder);
+    const needle = String(q || "").toLowerCase();
+    const all = (await this.#index(f, recursive))
+      .filter((m) => (!needle || m.name.toLowerCase().includes(needle) || (m.original_name || "").toLowerCase().includes(needle))
+        && (!kind || m.kind === kind) && (!from || m.uploaded >= from) && (!to || m.uploaded < to));
+    if (keysOnly) return { keys: all.map((m) => m.key).slice(0, 5000), total: all.length };
+    if (page || size) {
+      const per = [24, 48, 96].includes(Number(size)) ? Number(size) : 24;
+      const pages = Math.max(1, Math.ceil(all.length / per));
+      const p = Math.min(Math.max(1, Number(page) || 1), pages);
+      return { items: all.slice((p - 1) * per, p * per), total: all.length, page: p, size: per, pages, from: all.length ? (p - 1) * per + 1 : 0, to: Math.min(p * per, all.length) };
+    }
     if (!limit) return all;
     const start = Math.max(0, Number(offset) || 0), lim = Math.min(200, Math.max(1, Number(limit)));
     return { items: all.slice(start, start + lim), total: all.length, next: start + lim < all.length ? start + lim : null };
@@ -200,7 +231,27 @@ export class MediaStore {
   }
 
   // Upload: the bytes are checked (type and Telegram size limit) before anything is stored.
-  async upload(folder, filename, bytes, actor, extra = {}) {
+  // uploadId: the browser's id for this upload. A retry of an upload the server already saved (lost response)
+  // returns the saved file instead of storing a second copy.
+  async upload(folder, filename, bytes, actor, extra = {}, uploadId = "") {
+    // The id is reserved atomically (unique row) BEFORE any name is picked, so overlapping retries of one upload
+    // can never both store a file: the second either gets the saved file or is told to wait.
+    const idKey = /^[A-Za-z0-9-]{8,64}$/.test(String(uploadId)) ? "r2up:" + uploadId : null;
+    if (idKey) {
+      const claimed = await this.ops.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO NOTHING", idKey, "pending");
+      if (claimed.meta.changes !== 1) {
+        const done = await this.ops.getSetting(idKey);
+        if (done === "pending") throw new OpsError("This upload is still being saved. Wait a moment, then retry");
+        const o = done ? await this.b.head(done) : null;
+        if (o) return { ...describe(o), duplicate_retry: true };
+        await this.ops.setSetting(idKey, "pending"); // the earlier copy was deleted since: store it again
+      }
+    }
+    try { return await this.#store(folder, filename, bytes, actor, extra, idKey); }
+    catch (e) { if (idKey) await this.ops.run("DELETE FROM settings WHERE key = ?", idKey); throw e; } // a failed attempt can be retried
+  }
+
+  async #store(folder, filename, bytes, actor, extra, idKey) {
     const f = cleanFolder(folder);
     if (!f) throw new OpsError("Choose a folder");
     const type = sniff(bytes);
@@ -218,6 +269,7 @@ export class MediaStore {
       const check = await this.b.head(key);
       if (!check || check.size !== bytes.byteLength) throw new OpsError("The upload could not be verified in storage; please retry");
     } finally { await this.#release(key); }
+    if (idKey) await this.ops.setSetting(idKey, key);
     await this.dirty();
     await this.ops.audit(actor, "media_upload", `${key} (${bytes.byteLength} bytes)`);
     return describe({ key, size: bytes.byteLength, httpMetadata: { contentType: type }, uploaded: new Date(), customMetadata: { original_name: filename, ...extra } });
@@ -281,6 +333,7 @@ export class MediaStore {
     await this.ops.run("UPDATE content_items SET media_url = ? WHERE media_url = ? AND status IN ('draft','scheduled','failed','cancelled')", "r2:" + b, "r2:" + a);
     await this.b.delete(a);
     await this.b.delete(`${THUMBS}/${a}`);
+    await this.dirty(); // again after the source is gone: a listing taken mid-move is never reused
     await this.ops.audit(actor, "media_move", `${a} -> ${b}`);
     return { key: b };
   }

@@ -5,7 +5,7 @@ export function makeR2() {
     const data = range ? v.data.slice(range.offset, range.length ? range.offset + range.length : undefined) : v.data;
     return { key, size: v.data.byteLength, uploaded: v.uploaded, httpMetadata: v.httpMetadata, customMetadata: v.customMetadata,
       range: range ? { offset: range.offset, length: data.byteLength } : undefined,
-      body: new Blob([data]).stream(), arrayBuffer: async () => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) };
+      body: new Blob([data]).stream(), arrayBuffer: async () => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength), text: async () => new TextDecoder().decode(data) };
   };
   return {
     store,
@@ -17,9 +17,10 @@ export function makeR2() {
     },
     async delete(k) { store.delete(k); },
     async list({ prefix = "", cursor } = {}) {
-      const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
-      const start = cursor ? Number(cursor) : 0, page = keys.slice(start, start + 1000);
-      return { objects: page.map((k) => obj(k, store.get(k))), truncated: start + 1000 < keys.length, cursor: String(start + 1000) };
+      // Like R2: the cursor continues after the last key returned (stable while other keys are added).
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix) && (!cursor || k > cursor)).sort();
+      const page = keys.slice(0, 1000);
+      return { objects: page.map((k) => obj(k, store.get(k))), truncated: keys.length > 1000, cursor: page.length ? page[page.length - 1] : cursor };
     },
   };
 }
