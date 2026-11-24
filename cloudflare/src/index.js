@@ -228,7 +228,7 @@ function routes() {
   });
   add("PUT", "/api/account/email", async (c) => {
     const b = await body(c.request);
-    return json(await sensitive(c, () => account(c).changeEmail(b, c.actor)));
+    return json(await sensitive(c, () => account(c).changeEmail({ ...b, redirect_to: c.url.origin }, c.actor)));
   });
   add("POST", "/api/account/signout-others", async (c) => {
     const b = await body(c.request);

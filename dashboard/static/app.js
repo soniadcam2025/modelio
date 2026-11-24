@@ -1466,7 +1466,7 @@ async function pageAccount(main) {
     try {
       const r = await api("/api/account/email", { method: "PUT", body: { new_email: newEmail.value, current_password: emPw.input.value } });
       emailForm.reset();
-      msg(emMsg, `Check ${r.pending_email} (and possibly your current inbox) for a confirmation link from Supabase. Until you confirm, keep signing in with your current email.`);
+      msg(emMsg, `Supabase sent a confirmation link to ${r.pending_email}. Open it to finish; until then keep signing in with your current email. Then sign in with the new email.`);
     } catch (ex) { msg(emMsg, ex.message, true); } finally { btn.disabled = false; }
   } }, field("New email", newEmail), emPw.node, emMsg, h("button", { class: "primary", type: "submit" }, "Change email")) : null;
   // Sign out other sessions
@@ -1488,7 +1488,16 @@ async function pageAccount(main) {
       a.note ? h("p", { class: "small muted" }, a.note) : null),
     h("div", { class: "grid two" },
       h("section", { class: "card" }, h("h2", {}, "Change password"), h("p", { class: "small muted" }, "At least 12 characters mixing letters, numbers and symbols, or 16+ characters. Other sessions are signed out afterwards."), pwForm),
-      emailForm ? h("section", { class: "card" }, h("h2", {}, "Change email"), h("p", { class: "small muted" }, "Supabase emails a confirmation link to the new address. Nothing changes until you click it, so you can't be locked out by a typo."), emailForm) : null),
+      emailForm ? h("section", { class: "card" }, h("h2", {}, "Change email"),
+        h("p", { class: "small muted" }, "Supabase emails a confirmation link to the new address. Nothing changes until you click it, so you can't be locked out by a typo, and your account (same user, same admin rights) is kept."),
+        a.email_is_placeholder ? h("div", { class: "banner warn" },
+          h("strong", {}, "Your current email is a placeholder that can't receive mail. "),
+          "Before changing it, in your Supabase project (free settings):",
+          h("ol", {},
+            h("li", {}, "Authentication → Sign In / Providers → Email: switch off “Secure email change” for now, so only the new address has to confirm. Switch it back on afterwards."),
+            h("li", {}, "Authentication → Emails → SMTP Settings: add your mail provider's SMTP, or invite the new address to the Supabase project. Supabase's built-in mailer only delivers to project members."),
+            h("li", {}, `Authentication → URL Configuration → Redirect URLs: add ${location.origin}/** so the confirmation link brings you back here.`))) : null,
+        emailForm) : null),
     h("section", { class: "card" }, h("h2", {}, "Sessions"), h("p", { class: "small muted" }, "Sign out every other browser or device that is signed in to this dashboard."), soForm),
     h("p", { class: "small muted" }, "Forgot your password? Reset it in Supabase (Authentication → Users → your user → Send password recovery) or ask your developer; nothing here sends passwords by email."));
 }

@@ -81,15 +81,56 @@ test("Supabase mode: password via admin API (app_metadata kept), email via verif
   await acc.changePassword({ current_password: OLD, new_password: NEW, confirm_password: NEW }, "admin");
   const put = calls.find((c) => c.url === "/auth/v1/admin/users/u-1");
   assert.deepEqual(Object.keys(put.body), ["password"], "only the password is sent; app_metadata is untouched");
-  await assert.rejects(acc.changeEmail({ current_password: OLD, new_email: "new@example.com" }, "admin"), /incorrect/, "old password no longer valid");
-  await assert.rejects(acc.changeEmail({ current_password: NEW, new_email: "not-an-email" }, "admin"), /valid email/);
-  assert.deepEqual(await acc.changeEmail({ current_password: NEW, new_email: "new@example.com" }, "admin"), { pending_email: "new@example.com" });
+  await assert.rejects(acc.changeEmail({ current_password: OLD, new_email: "new@mailbox.io" }, "admin"), /incorrect/, "old password no longer valid");
+  await assert.rejects(acc.changeEmail({ current_password: NEW, new_email: "not-an-email" }, "admin"), /real email/);
+  assert.deepEqual(await acc.changeEmail({ current_password: NEW, new_email: "new@mailbox.io" }, "admin"), { pending_email: "new@mailbox.io", current_is_placeholder: true });
   const emailCall = calls.find((c) => c.url === "/auth/v1/user");
-  assert.equal(emailCall.body.email, "new@example.com");
+  assert.equal(emailCall.body.email, "new@mailbox.io");
   assert.equal(emailCall.auth, "Bearer user-access-token", "Supabase's own (verified) email-change flow, as the signed-in user");
   const after = await acc.view();
-  assert.deepEqual([after.email, after.pending_email], ["admin@example.com", "new@example.com"], "current email keeps working until confirmed");
+  assert.deepEqual([after.email, after.pending_email], ["admin@example.com", "new@mailbox.io"], "current email keeps working until confirmed");
   const everything = JSON.stringify([v, after, await ops.auditEntries()]);
   for (const secret of [OLD, NEW, "user-access-token", "sb_secret_x"]) assert.ok(!everything.includes(secret), secret);
-  assert.ok(!JSON.stringify(await ops.auditEntries()).includes("new@example.com"), "the audit log masks the new email");
+  assert.ok(!JSON.stringify(await ops.auditEntries()).includes("new@mailbox.io"), "the audit log masks the new email");
+});
+
+test("email change: Supabase's real reason is shown (sanitized), confirmation link returns to the dashboard, placeholders flagged", async () => {
+  const { AdminAccount, supabaseReason, PLACEHOLDER } = await import("../src/account.js");
+  assert.ok(PLACEHOLDER.test("owner@shakhira-admin.invalid"));
+  assert.ok(!PLACEHOLDER.test("admin@shakhira.com"));
+  // mapping of Supabase errors
+  const m = (status, data) => supabaseReason({ status, data }).message;
+  assert.match(m(422, { error_code: "email_exists" }), /already used/);
+  assert.match(m(429, { error_code: "over_email_send_rate_limit" }), /limit/);
+  assert.match(m(400, { error_code: "email_address_not_authorized", msg: "Email address not authorized" }), /SMTP/);
+  assert.match(m(500, { error_code: "unexpected_failure", msg: "Error sending email change email" }), /couldn't send/);
+  assert.match(m(503, {}), /unavailable/);
+  assert.match(m(401, {}), /expired/);
+
+  const admin = { id: "u-1", email: "owner@shakhira-admin.invalid", app_metadata: { shakhira_admin: true } };
+  let mode = "smtp_refused"; const calls = [];
+  const fake = async (url, init = {}) => {
+    url = String(url); calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    if (url.includes("/token?grant_type=password")) return new Response(JSON.stringify({ access_token: "tok", user: admin }));
+    if (url.includes("/admin/users?")) return new Response(JSON.stringify({ users: [admin] }));
+    if (url.includes("/auth/v1/user")) return mode === "smtp_refused"
+      ? new Response(JSON.stringify({ code: 500, error_code: "unexpected_failure", msg: "Error sending email change email" }), { status: 500 })
+      : new Response(JSON.stringify({ ...admin, new_email: "admin@shakhira.com" }));
+    throw new Error(url);
+  };
+  const ops = new Ops(makeD1());
+  const acc = new AdminAccount({ SUPABASE_URL: "https://p.supabase.co", SUPABASE_SECRET_KEY: "sb_secret_x" }, ops, "supabase", fake);
+  assert.equal((await acc.view()).email_is_placeholder, true);
+  await assert.rejects(acc.changeEmail({ current_password: OLD, new_email: "someone@new.invalid" }, "a"), /real email/);
+  const logs = []; const warn = console.warn; console.warn = (...a) => logs.push(a.join(" "));
+  try { await assert.rejects(acc.changeEmail({ current_password: OLD, new_email: "admin@shakhira.com", redirect_to: "https://shakhira-admin.example.workers.dev" }, "a"), /couldn't send the confirmation email/); }
+  finally { console.warn = warn; }
+  assert.ok(logs.join().includes("unexpected_failure") && !logs.join().includes("admin@shakhira.com") && !logs.join().includes("tok"), "log has the code, not addresses or tokens");
+  const put = calls.find((c) => c.url.includes("/auth/v1/user"));
+  assert.ok(put.url.endsWith("?redirect_to=" + encodeURIComponent("https://shakhira-admin.example.workers.dev/#account")));
+  mode = "ok";
+  const r = await acc.changeEmail({ current_password: OLD, new_email: "admin@shakhira.com", redirect_to: "https://shakhira-admin.example.workers.dev" }, "a");
+  assert.deepEqual(r, { pending_email: "admin@shakhira.com", current_is_placeholder: true });
+  assert.ok(!calls.some((c) => c.url.includes("/admin/users/u-1")), "the email is never forced through the admin API");
+  assert.ok(JSON.stringify(await ops.auditEntries()).includes("account_email_failed"));
 });
