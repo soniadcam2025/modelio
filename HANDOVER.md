@@ -54,7 +54,7 @@ Staging: https://shakhira-admin-staging.adminhkg-ofc.workers.dev (Worker `shakhi
 
 ## Cutover of the 5 AM / 10 PM posts to R2 (needs owner approval)
 
-- **Today:** the GitHub poster (`post-to-channel.yml`, `poster/`) still runs and reads Cloudinary. Cloudinary refuses its downloads ("action is disabled"), so its runs are expected to fail.
+- **Done 24 Nov 2026:** the GitHub schedule is off (`post-to-channel.yml`); the owner completes steps 2–3 in the dashboard.
 - **Before the switch:** upload a few photos to `public/auto-post`.
 
 **Switch steps (all in one sitting):**

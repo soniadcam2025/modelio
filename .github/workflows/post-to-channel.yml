@@ -1,11 +1,12 @@
 name: Post to public channel
 
 on:
-  # Automatic posting is ON (enabled after the manual tests in README.md "Step 3" passed).
-  # GitHub cron uses UTC. India Standard Time = UTC + 5:30. Start times are approximate.
-  schedule:
-    - cron: "30 16 * * *"  # 16:30 UTC = 10:00 PM IST
-    - cron: "30 23 * * *"  # 23:30 UTC = 5:00 AM IST (next day in India)
+  # Automatic posting is OFF (24 Nov 2026, owner-approved cutover): the 5 AM / 10 PM IST posts now come from the
+  # dashboard Worker's R2 automatic posts (public/auto-post). Cloudinary had disabled this account, so every run
+  # here failed. Rollback: restore the two lines below and untick "GitHub auto-poster switched off" in the dashboard.
+  #   schedule:
+  #     - cron: "30 16 * * *"  # 16:30 UTC = 10:00 PM IST
+  #     - cron: "30 23 * * *"  # 23:30 UTC = 5:00 AM IST
   # Manual runs, and the optional on-time external trigger (README: "On-time posting").
   workflow_dispatch:
     inputs:
