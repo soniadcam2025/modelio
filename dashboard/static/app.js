@@ -1488,13 +1488,11 @@ async function mediaSourcesCard() {
     const c = d.autopost[t] || {};
     const times = h("input", { value: (c.times_utc || []).join(", "), placeholder: t === "public" ? "default 16:30, 23:30 (5 AM / 10 PM IST)" : "e.g. 14:30 (UTC)" });
     const on = h("input", { type: "checkbox", checked: !!c.enabled });
-    const retired = t === "public" ? h("input", { type: "checkbox", checked: d.github_poster_retired }) : null;
     return h("form", { class: "card inner", onsubmit: async (e) => { e.preventDefault();
-      if (await act(() => api(`/api/media/autopost/${t}`, { method: "PUT", body: { enabled: on.checked, times_utc: times.value, ...(retired ? { github_poster_retired: retired.checked } : {}) } }), "Saved")) route(); } },
+      if (await act(() => api(`/api/media/autopost/${t}`, { method: "PUT", body: { enabled: on.checked, times_utc: times.value } }), "Saved")) route(); } },
       h("h3", {}, label), h("label", { class: "inline field" }, on, `Post automatically from ${d.sources[`${t}_auto`]}`),
       field("Times (UTC, comma-separated)", times, c.times_utc?.length ? `India time: ${c.times_utc.map(toIst).join(", ")}` : "Empty = the same 5 AM / 10 PM IST slots as before."),
-      retired ? h("label", { class: "inline field" }, retired, "The old GitHub auto-poster is switched off (required, so the same slot is never posted twice)") : null,
-      h("p", { class: "small muted" }, "New files first, then the file posted longest ago after a 30-day cooldown. One post per time slot. Also needs “Automatic posts from R2” in Features & settings."),
+      h("p", { class: "small muted" }, t === "public" ? "On by default once “Automatic posts from R2” is switched on in Features & settings. New files first, then the file posted longest ago after a 30-day cooldown. One post per time slot." : "Needs this switch and “Automatic posts from R2” in Features & settings. New files first, then the longest-ago file after a 30-day cooldown. One post per time slot."),
       h("button", { type: "submit" }, "Save"));
   };
   return h("section", { class: "card" }, h("h2", {}, "Media sources"),

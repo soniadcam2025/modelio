@@ -2,8 +2,8 @@ import { botAllows } from "./bots.js";
 import { syncLiveBot } from "./live.js";
 // Send-only automation, run by the Worker's cron trigger. A port of shakhira_bot/scheduler.py.
 // Every part is off until its feature flag is on. A post is claimed before it is sent and is never re-sent
-// after an uncertain result. Media comes from the private R2 library; the GitHub Actions poster's slots are
-// only taken over by R2 automatic posts after it is retired, so the two never post the same slot.
+// after an uncertain result. Media comes from the private R2 library; the old GitHub Actions poster's schedule
+// was removed (PR #17), so the R2 automatic posts own the 5 AM / 10 PM IST slots.
 
 import { TelegramError } from "./telegram.js";
 import { cleanKey, loadForTelegram, mediaKind, mediaSources, zoneAllowed } from "./r2media.js";
@@ -118,6 +118,7 @@ export async function publishDue(tg, ops, config, now, alert = async () => {}, b
       continue;
     }
     const status = result?.simulated ? "simulated" : "posted";
+    console.log("post_sent", JSON.stringify({ post: item.id, kind: item.kind, target: item.target, status, message_id: result?.message_id ?? null, source: item.source || null }));
     if (item.repeat_json) await ops.scheduleNextOccurrence(item, now);
     await ops.run("UPDATE content_items SET status=?, message_id=?, posted_at=?, last_error=?, text=?, updated_at=? WHERE id=?",
       status, result?.message_id ?? null, now, result?.simulated ? "Simulated in staging: nothing was sent to Telegram" : "", text, now, item.id);
@@ -278,20 +279,30 @@ async function listR2(bucket, folder) {
 // longest ago once its 30-day cooldown has passed; nothing qualifies → skip and alert. Each slot is claimed
 // first (auto_paid_runs, key "auto-<target>:<slot>"), so a slot can never create two posts.
 export const AUTOPOST_COOLDOWN = 30 * 86400;
-export async function queueR2AutoPosts(ops, now, bucket, slotTimes, alert = async () => {}) {
-  if (!bucket) return [];
+// report: why each target did or didn't post this minute (logged with every cycle, so a skip is never silent).
+// The public channel is ON by default once "Automatic posts from R2" is switched on (the GitHub schedule was removed
+// from the repository in PR #17, so there is nothing to double up with); it can be switched off in Media sources.
+// VIP needs its own explicit switch. testSlot: a one-off extra slot "YYYY-MM-DDTHH:MM" (UTC) set at deploy time.
+export async function queueR2AutoPosts(ops, now, bucket, slotTimes, alert = async () => {}, report = {}, testSlot = "") {
+  if (!bucket) { report.reason = "no media bucket"; return []; }
   const sources = await mediaSources(ops);
   const queued = [];
   for (const target of ["public", "vip"]) {
     let cfg;
-    try { cfg = JSON.parse(await ops.getSetting(`autopost:${target}`, "{}")); } catch { cfg = {}; }
-    if (!cfg.enabled) continue;
-    // The public channel's 5 AM / 10 PM posts belong to the GitHub poster until it is retired, so they can't double up.
-    if (target === "public" && (await ops.getSetting("github_poster_retired")) !== "1") continue;
-    const times = cfg.times_utc?.length ? cfg.times_utc : slotTimes.map(([h, m]) => `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
-    for (const { slot } of dueSlots(times, now)) {
+    try { cfg = JSON.parse(await ops.getSetting(`autopost:${target}`, "null")); } catch { cfg = null; }
+    const enabled = cfg && typeof cfg.enabled === "boolean" ? cfg.enabled : target === "public";
+    if (!enabled) { report[target] = "off (Automation → Media sources)"; continue; }
+    const times = cfg?.times_utc?.length ? cfg.times_utc : slotTimes.map(([h, m]) => `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
+    const slots = dueSlots(times, now);
+    const t = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})$/.exec(String(testSlot || ""));
+    if (target === "public" && t) {
+      const at = Date.UTC(+t[1].slice(0, 4), +t[1].slice(5, 7) - 1, +t[1].slice(8, 10), +t[2], +t[3]) / 1000;
+      if (now >= at && now - at <= 30 * 60) slots.push({ slot: `test-${t[1]}T${t[2]}${t[3]}Z`, at });
+    }
+    if (!slots.length) { report[target] = `waiting for ${times.join(", ")} UTC`; continue; }
+    for (const { slot } of slots) {
       const claim = await ops.run("INSERT INTO auto_paid_runs (slot, created_at) VALUES (?, ?) ON CONFLICT DO NOTHING", `auto-${target}:${slot}`, now);
-      if (claim.meta.changes !== 1) continue;
+      if (claim.meta.changes !== 1) { report[target] = `slot ${slot} already handled`; continue; }
       const folder = sources[`${target}_auto`];
       let history = {};
       try { history = JSON.parse(await ops.getSetting(`autopost_history:${target}`, "{}")); } catch { /* fresh */ }
@@ -302,6 +313,7 @@ export async function queueR2AutoPosts(ops, now, bucket, slotTimes, alert = asyn
       if (!next) {
         await ops.run("UPDATE auto_paid_runs SET note=? WHERE slot=?", `no file qualifies in ${folder}`, `auto-${target}:${slot}`);
         await alert(`Automatic ${target} post skipped: no new file in ${folder} and every file was posted in the last 30 days.`, "autopost");
+        report[target] = `slot ${slot}: no eligible file in ${folder}`;
         continue;
       }
       const mk = mediaKind(next.httpMetadata.contentType);
@@ -312,6 +324,8 @@ export async function queueR2AutoPosts(ops, now, bucket, slotTimes, alert = asyn
       await ops.setSetting(`autopost_history:${target}`, JSON.stringify(history));
       await ops.run("UPDATE auto_paid_runs SET public_id=?, content_id=? WHERE slot=?", "r2:" + next.key, item.id, `auto-${target}:${slot}`);
       queued.push(item.id);
+      report[target] = `slot ${slot}: queued post #${item.id} (${next.key})`;
+      console.log("autopost_queued", JSON.stringify({ target, slot, post: item.id, file: next.key }));
     }
   }
   return queued;
@@ -363,7 +377,11 @@ export async function runCycle(tg, ops, config, now, alert, { liveDb = null, bot
   await ops.run("DELETE FROM login_failures WHERE at < ?", now - 86400);
   await ops.run("DELETE FROM forwarded_updates WHERE received_at < ?", now - 2 * 86400);
   if (on("auto_paid_media")) summary.auto_paid_queued = (await queueAutoPaidMedia(ops, now, bucket)).length;
-  if (on("r2_autopost")) summary.auto_posts_queued = (await queueR2AutoPosts(ops, now, bucket, config.slotTimes, alert)).length;
+  if (on("r2_autopost")) {
+    const report = {};
+    summary.auto_posts_queued = (await queueR2AutoPosts(ops, now, bucket, config.slotTimes, alert, report, config.autopostTestSlot)).length;
+    summary.autopost = report;
+  } else summary.autopost = { off: "Features & settings → Automatic posts from R2 is off" };
   if (paused) { summary.paused = true; return summary; }
   // Primary bot (@ShakhiraVIPBot): runs unless it is registered with its automation switched off.
   const primary = bots.find((b) => Number(b.is_primary));
