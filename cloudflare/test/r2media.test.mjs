@@ -145,12 +145,18 @@ test("automatic R2 posts: rotation, cooldown, one post per slot, public waits fo
   let now = Date.UTC(2026, 10, 23, 16, 31) / 1000;
   for (const n of ["old", "new"]) await e.MEDIA.put(`public/auto-post/${n}.jpg`, JPEG(), { httpMetadata: { contentType: "image/jpeg" } });
   await e.MEDIA.put("vip/photos/secret.jpg", JPEG(), { httpMetadata: { contentType: "image/jpeg" } });
-  await ops.setSetting("autopost:public", JSON.stringify({ enabled: true }));
   await ops.setSetting("autopost_history:public", JSON.stringify({ "public/auto-post/old.jpg": now - 40 * 86400 }));
   const slots = [[16, 30], [23, 30]];
-  assert.deepEqual(await queueR2AutoPosts(ops, now, e.MEDIA, slots), []); // GitHub poster not retired yet
-  await ops.setSetting("github_poster_retired", "1");
-  const first = await queueR2AutoPosts(ops, now, e.MEDIA, slots);
+  // Explicitly switched off in Media sources: nothing, and the reason is reported (never a silent skip)
+  await ops.setSetting("autopost:public", JSON.stringify({ enabled: false }));
+  const off = {};
+  assert.deepEqual(await queueR2AutoPosts(ops, now, e.MEDIA, slots, undefined, off), []);
+  assert.match(off.public, /^off/);
+  // Default (no setting saved): the public channel posts once the feature is on — no hidden extra switch
+  await ops.setSetting("autopost:public", "");
+  const rep = {};
+  const first = await queueR2AutoPosts(ops, now, e.MEDIA, slots, undefined, rep);
+  assert.match(rep.public, /queued post #/); assert.match(rep.vip, /^off/, "VIP still needs its own switch");
   assert.equal(first.length, 1);
   assert.equal((await ops.content(first[0])).media_url, "r2:public/auto-post/new.jpg"); // never-posted first
   assert.deepEqual(await queueR2AutoPosts(ops, now + 60, e.MEDIA, slots), []); // same slot: no second post
@@ -292,4 +298,22 @@ test("a listing taken in the middle of a move is not reused afterwards", async (
   e.MEDIA.delete = async (k) => { if (k === "public/photos/m.jpg") await store.list({ folder: "public/photos", page: 1, size: 24 }); return realDelete(k); };
   await store.move("public/photos/m.jpg", "archive/m.jpg", "t");
   assert.equal((await store.list({ folder: "public/photos", page: 1, size: 24 })).total, 0, "the moved file is gone from its old folder");
+});
+
+
+test("autopost: outside a slot the report says what it waits for; a one-off test slot posts exactly once", async () => {
+  const e = env(); const ops = new Ops(e.DB);
+  await e.MEDIA.put("public/auto-post/t.jpg", JPEG(), { httpMetadata: { contentType: "image/jpeg" } });
+  const slots = [[16, 30], [23, 30]];
+  const at = Date.UTC(2026, 10, 25, 7, 0) / 1000;
+  const r1 = {};
+  assert.deepEqual(await queueR2AutoPosts(ops, at - 3600, e.MEDIA, slots, undefined, r1, "2026-11-25T07:00"), []);
+  assert.match(r1.public, /waiting for 16:30, 23:30 UTC/);
+  const r2 = {};
+  const q = await queueR2AutoPosts(ops, at + 60, e.MEDIA, slots, undefined, r2, "2026-11-25T07:00");
+  assert.equal(q.length, 1); assert.match(r2.public, /test-2026-11-25T0700Z: queued/);
+  const r3 = {};
+  assert.deepEqual(await queueR2AutoPosts(ops, at + 120, e.MEDIA, slots, undefined, r3, "2026-11-25T07:00"), [], "the test slot posts once");
+  assert.match(r3.public, /already handled/);
+  assert.deepEqual(await queueR2AutoPosts(ops, at + 3 * 3600, e.MEDIA, slots, undefined, {}, "2026-11-25T07:00"), [], "expired test slot does nothing");
 });

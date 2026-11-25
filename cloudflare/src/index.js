@@ -110,6 +110,8 @@ export function loadConfig(env) {
     trialPrice: 49,
     // Daily backup minute (UTC "HH:MM"); 21:40 UTC = 03:10 IST, away from the 5 AM / 10 PM IST posts.
     backupAt: String(env.BACKUP_AT_UTC || "21:40"),
+    // One-off extra public auto-post slot "YYYY-MM-DDTHH:MM" (UTC) for a controlled test; empty normally.
+    autopostTestSlot: String(env.AUTOPOST_TEST_SLOT_UTC || "").trim(),
   };
   // The private R2 media bucket. Not enumerable, so it never appears in JSON or logs.
   Object.defineProperty(cfg, "media", { value: env.MEDIA || null, enumerable: false });
@@ -449,8 +451,10 @@ function routes() {
     return json({ results: await media(c).remove(keys.filter(Boolean), c.actor) });
   });
   add("GET", "/api/media/sources", async (c) => json({ sources: await mediaSources(c.ops), labels: SOURCE_LABELS,
-    autopost: Object.fromEntries(await Promise.all(["public", "vip"].map(async (t) => [t, JSON.parse(await c.ops.getSetting(`autopost:${t}`, "{}") || "{}")]))),
-    github_poster_retired: (await c.ops.getSetting("github_poster_retired")) === "1" }));
+    autopost: Object.fromEntries(await Promise.all(["public", "vip"].map(async (t) => {
+      let cfg = null; try { cfg = JSON.parse(await c.ops.getSetting(`autopost:${t}`, "null")); } catch { /* default */ }
+      return [t, { times_utc: cfg?.times_utc || [], enabled: cfg && typeof cfg.enabled === "boolean" ? cfg.enabled : t === "public" }];
+    }))) }));
   add("PUT", "/api/media/sources", async (c) => json(await setMediaSources(c.ops, (await body(c.request)).sources, c.actor)));
   add("PUT", "/api/media/autopost/(public|vip)", async (c, m) => {
     const b = await body(c.request);
@@ -459,7 +463,6 @@ function routes() {
     if (times.length > 6) throw new OpsError("At most 6 automatic posts a day");
     const cfg = { enabled: !!b.enabled, times_utc: times };
     await c.ops.setSetting(`autopost:${m[1]}`, JSON.stringify(cfg));
-    if (m[1] === "public" && b.github_poster_retired !== undefined) await c.ops.setSetting("github_poster_retired", b.github_poster_retired ? "1" : "0");
     await c.ops.audit(c.actor, "autopost", `${m[1]}: ${cfg.enabled ? "on" : "off"} ${times.join(",")}`);
     return json(cfg);
   });
